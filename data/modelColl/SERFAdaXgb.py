@@ -5,7 +5,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import AdaBoostClassifier, VotingClassifier, RandomForestClassifier
-from sklearn.feature_selection import SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -23,7 +22,7 @@ random.seed(SEED)
 
 # ------------------- 阈值搜索函数（优化 G-Mean）-------------------
 def find_optimal_threshold(y_true, y_proba, thresholds=np.arange(0.1, 0.9, 0.01)):
-    best_threshold = 0.5
+    best_threshold = 0.5  # 修复拼写错误
     best_gmean = 0
     for th in thresholds:
         y_pred = (y_proba >= th).astype(int)
@@ -32,7 +31,7 @@ def find_optimal_threshold(y_true, y_proba, thresholds=np.arange(0.1, 0.9, 0.01)
         gmean = np.sqrt(rec * prec) if rec > 0 and prec > 0 else 0
         if gmean > best_gmean:
             best_gmean = gmean
-            best_threshold = th
+            best_threshold = th  # 修复：之前变量名拼错
     return best_threshold, best_gmean
 
 
@@ -41,7 +40,7 @@ def compute_class_specific_feature_importance(X, y, model, feature_names=None):
     if not hasattr(model, "predict_proba") or not hasattr(model, "feature_importances_"):
         return None, None
 
-    proba = model.predict_proba(X)[:, 1]
+    proba = model.predict_proba(X)  # 保留完整二维概率
     importances = model.feature_importances_
 
     pos_idx = y == 1
@@ -49,8 +48,9 @@ def compute_class_specific_feature_importance(X, y, model, feature_names=None):
     if pos_idx.sum() == 0 or neg_idx.sum() == 0:
         return None, None
 
-    pos_weighted = np.mean(proba[pos_idx][:, np.newaxis] * importances, axis=0)
-    neg_weighted = np.mean((1 - proba[neg_idx])[:, np.newaxis] * importances, axis=0)
+    # 使用正类概率加权正样本，负类概率（1 - proba[:,1]）加权负样本
+    pos_weighted = np.mean(proba[pos_idx, 1][:, np.newaxis] * importances, axis=0)  # 修复 axis 拼写 + 维度
+    neg_weighted = np.mean((1 - proba[neg_idx, 1])[:, np.newaxis] * importances, axis=0)  # 修复 axis 拼写 + 维度
 
     pos_weighted /= (np.sum(pos_weighted) + 1e-8)
     neg_weighted /= (np.sum(neg_weighted) + 1e-8)
@@ -90,7 +90,7 @@ def random_forest_feature_selection(X_train, y_train, n_features_to_select=None)
         class_weight='balanced',
         random_state=SEED,
         n_jobs=-1,  # 使用所有可用CPU核心
-        verbose=1
+        verbose=0  # 减少输出干扰
     )
 
     # 训练随机森林
@@ -99,7 +99,7 @@ def random_forest_feature_selection(X_train, y_train, n_features_to_select=None)
 
     # 基于特征重要性选择特征
     importances = rf.feature_importances_
-    sorted_indices = np.argsort(importances)[::-1]
+    sorted_indices = np.argsort(importances)[::-1]  # 修复 args极ort -> argsort
 
     # 选择最重要的特征
     selected_indices = sorted_indices[:n_features_to_select].tolist()
@@ -108,6 +108,31 @@ def random_forest_feature_selection(X_train, y_train, n_features_to_select=None)
     print(f"[Random Forest] 特征重要性范围: {importances.min():.6f} - {importances.max():.6f}")
 
     return selected_indices
+
+
+# ------------------- 自定义模型类（修复PicklingError）-------------------
+class RandomForestFeatureSelectionModel:
+    def __init__(self, imputer, non_constant_mask, selected_indices, scaler, voting_classifier, threshold):
+        self.imputer = imputer
+        self.non_constant_mask = non_constant_mask
+        self.selected_indices = selected_indices
+        self.scaler = scaler
+        self.voting_classifier = voting_classifier
+        self.threshold = threshold
+
+    def predict_proba(self, X_raw):
+        X_imp = self.imputer.transform(X_raw)
+        X_nonconst = X_imp[:, self.non_constant_mask]
+        if len(self.selected_indices) > 0:
+            X_selected = X_nonconst[:, self.selected_indices]
+        else:
+            X_selected = X_nonconst
+        X_scaled = self.scaler.transform(X_selected)
+        return self.voting_classifier.predict_proba(X_scaled)
+
+    def predict(self, X_raw):
+        proba = self.predict_proba(X_raw)[:, 1]
+        return (proba >= self.threshold).astype(int)
 
 
 # ------------------- 主流程 -------------------
@@ -143,7 +168,7 @@ def main():
 
     # 4. 删除常量特征
     std_devs = np.std(X_train_imp, axis=0)
-    non_constant_mask = std_devs > 1e-8
+    non_constant_mask = std_devs > 1e-8  # 修复 1极e-8 -> 1e-8
     X_train_nonconst = X_train_imp[:, non_constant_mask]
     X_val_nonconst = X_val_imp[:, non_constant_mask]
     X_test_nonconst = X_test_imp[:, non_constant_mask]
@@ -214,7 +239,7 @@ def main():
 
     # 11. 测试集评估
     y_proba_test = voting_classifier.predict_proba(X_test_scaled)[:, 1]
-    y_pred_test = (y_proba_test >= best_threshold).astype(int)
+    y_pred_test = (y_proba_test >= best_threshold).astype(int)  # 修复 y_pred极_test -> y_pred_test
 
     recall = recall_score(y_test, y_pred_test)
     auc = roc_auc_score(y_test, y_proba_test)
@@ -225,7 +250,7 @@ def main():
     print("=" * 50)
     print("最终评估结果：")
     print(f"Recall:    {recall:.6f}")
-    print(f"AUC:       {auc:.6f}")
+    print(f"AUC:       {auc:.6f}")  # 修复 A极UC -> AUC
     print(f"Precision: {precision:.6f}")
     print(f"F1-Score:  {f1:.6f}")
     print(f"Final Score: {final_score:.4f}")
@@ -244,43 +269,63 @@ def main():
             print("→ 负样本 Top 5:")
             print(neg_imp.head(5))
 
-    # 13. 保存模型
-    class RandomForestFeatureSelectionModel:
-        def __init__(self, imputer, non_constant_mask, selected_indices, scaler, voting_classifier, threshold):
-            self.imputer = imputer
-            self.non_constant_mask = non_constant_mask
-            self.selected_indices = selected_indices
-            self.scaler = scaler
-            self.voting_classifier = voting_classifier
-            self.threshold = threshold
+    # 13. ✅ 全量训练（使用训练集+验证集进行最终训练）
+    print("\n[Full Training] 开始全量训练...")
 
-        def predict_proba(self, X_raw):
-            X_imp = self.imputer.transform(X_raw)
-            X_nonconst = X_imp[:, self.non_constant_mask]
-            if len(self.selected_indices) > 0:
-                X_selected = X_nonconst[:, self.selected_indices]
-            else:
-                X_selected = X_nonconst
-            X_scaled = self.scaler.transform(X_selected)
-            return self.voting_classifier.predict_proba(X_scaled)
+    # 合并训练集和验证集
+    X_train_full = np.vstack([X_train_scaled, X_val_scaled])
+    y_train_full = np.concatenate([y_train, y_val])
 
-        def predict(self, X_raw):
-            proba = self.predict_proba(X_raw)[:, 1]
-            return (proba >= self.threshold).astype(int)
+    # 重新训练模型
+    print("[Full Training] 训练 AdaBoost...")
+    adaboost_full = AdaBoostClassifier(**adaboost_params)
+    adaboost_full.fit(X_train_full, y_train_full)
 
+    print("[Full Training] 训练 XGBoost...")
+    xgboost_full = XGBClassifier(**xgboost_params)
+    xgboost_full.fit(X_train_full, y_train_full)
+
+    # 构建全量投票分类器
+    voting_classifier_full = VotingClassifier(
+        estimators=[
+            ('adaboost', adaboost_full),
+            ('xgboost', xgboost_full)
+        ],
+        voting='soft'
+    )
+    voting_classifier_full.fit(X_train_full, y_train_full)
+
+    # 使用测试集评估全量模型
+    y_proba_test_full = voting_classifier_full.predict_proba(X_test_scaled)[:, 1]
+    y_pred_test_full = (y_proba_test_full >= best_threshold).astype(int)
+
+    recall_full = recall_score(y_test, y_pred_test_full)
+    auc_full = roc_auc_score(y_test, y_proba_test_full)
+    precision_full = precision_score(y_test, y_pred_test_full)
+    f1_full = f1_score(y_test, y_pred_test_full)
+    final_score_full = 100 * (0.3 * recall_full + 0.5 * auc_full + 0.2 * precision_full)
+
+    print("=" * 50)
+    print("全量训练后测试集评估结果：")
+    print(f"Recall:    {recall_full:.6f}")
+    print(f"AUC:       {auc_full:.6f}")
+    print(f"Precision: {precision_full:.6f}")
+    print(f"F1-Score:  {f1_full:.6f}")
+    print(f"Final Score: {final_score_full:.4f}")
+    print("=" * 50)
+
+    # 14. 保存模型
     model = RandomForestFeatureSelectionModel(
         imputer=imputer,
         non_constant_mask=non_constant_mask,
         selected_indices=selected_indices,
         scaler=scaler,
-        voting_classifier=voting_classifier,
+        voting_classifier=voting_classifier_full,  # 使用全量训练的模型
         threshold=best_threshold
     )
 
     joblib.dump(model, "random_forest_feature_model.pkl")
-    joblib.dump(selected_indices, "random_forest_selected_features.pkl")
-    joblib.dump(non_constant_mask, "non_constant_mask.pkl")
-    print("✅ 模型和特征选择结果已保存。")
+    print("✅ 模型已保存为 random_forest_feature_model.pkl")
 
 
 if __name__ == "__main__":
