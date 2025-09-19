@@ -1,246 +1,418 @@
 import os
 import random
-
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.cluster import DBSCAN
-from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier, VotingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
+from imblearn.over_sampling import ADASYN
+from sklearn.ensemble import AdaBoostClassifier
 from xgboost import XGBClassifier
+from sklearn.metrics import recall_score, precision_score, roc_auc_score
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+import torch.cuda.amp as amp  # 混合精度
 
 # 设置随机种子
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["LOKY_MAX_CPU_COUNT"] = "8"
+os.environ["LOKY_MAX_CPU_COUNT"] = "16"  # 根据 CPU 核心数调整
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = False  # 为了性能关闭 determinism
+    torch.backends.cudnn.benchmark = True  # 启用 cuDNN 自动调优
+torch.set_num_threads(16)
 
-# ------------------- 阈值搜索函数（优化 G-Mean）-------------------
-def find_optimal_threshold(y_true, y_proba, thresholds=np.arange(0.1, 0.9, 0.01)):
-    best_threshold = 0.5
-    best_gmean = 0
-    for th in thresholds:
-        y_pred = (y_proba >= th).astype(int)
-        rec = recall_score(y_true, y_pred)
-        prec = precision_score(y_true, y_pred)
-        gmean = np.sqrt(rec * prec) if rec > 0 and prec > 0 else 0
-        if gmean > best_gmean:
-            best_gmean = gmean
-            best_threshold = th
-    return best_threshold, best_gmean
 
-# ------------------- 类别特异性特征重要性（近似）-------------------
-def compute_class_specific_feature_importance(X, y, model, feature_names=None):
-    if not hasattr(model, "predict_proba") or not hasattr(model, "feature_importances_"):
-        return None, None
+# ------------------- 自适应激活函数 -------------------
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
 
-    proba = model.predict_proba(X)[:, 1]
-    importances = model.feature_importances_
 
-    pos_idx = y == 1
-    neg_idx = y == 0
-    if pos_idx.sum() == 0 or neg_idx.sum() == 0:
-        return None, None
+class Mish(nn.Module):
+    def forward(self, x):
+        return x * torch.tanh(F.softplus(x))
 
-    pos_weighted = np.mean(proba[pos_idx][:, np.newaxis] * importances, axis=0)
-    neg_weighted = np.mean((1 - proba[neg_idx])[:, np.newaxis] * importances, axis=0)
 
-    pos_weighted /= (np.sum(pos_weighted) + 1e-8)
-    neg_weighted /= (np.sum(neg_weighted) + 1e-8)
+# ------------------- 残差块 -------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, dropout_rate=0.1, activation='swish'):
+        super().__init__()
+        self.activation_fn = Swish() if activation == 'swish' else Mish()
 
-    if feature_names is not None:
-        pos_df = pd.DataFrame({'feature': feature_names, 'importance': pos_weighted}).sort_values('importance', ascending=False)
-        neg_df = pd.DataFrame({'feature': feature_names, 'importance': neg_weighted}).sort_values('importance', ascending=False)
-        return pos_df, neg_df
-    return pos_weighted, neg_weighted
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
+            self.activation_fn,
+            nn.Dropout(dropout_rate),
+            nn.Linear(dim, dim),
+            nn.BatchNorm1d(dim),
+            nn.Dropout(dropout_rate)
+        )
+        self.skip_connection = nn.Linear(dim, dim) if dim != dim else nn.Identity()
 
-# ------------------- 模块1：MDWA —— 基于马氏距离与DBSCAN的特征权重计算（简化版）-------------------
-def estimate_epsilon_with_k_distance(X, k=5):
-    """使用 k-distance 曲线估计 DBSCAN 的 ε 参数"""
-    nbrs = NearestNeighbors(n_neighbors=k+1).fit(X)
-    distances, _ = nbrs.kneighbors(X)
-    k_distances = distances[:, k]
-    k_distances_sorted = np.sort(k_distances)
-    # 取第90百分位作为ε（避免噪声影响）
-    epsilon = np.percentile(k_distances_sorted, 90)
-    return max(epsilon, 1e-3)  # 避免过小
+    def forward(self, x):
+        residual = self.skip_connection(x)
+        out = self.block(x)
+        return self.activation_fn(out + residual)  # 残差连接
 
-def get_dbscan_neighbors(x, samples, epsilon, min_samples=3):
-    """使用 DBSCAN 获取 x 在 samples 中的密度可达邻居"""
-    if len(samples) < min_samples:
-        return []
-    clustering = DBSCAN(eps=epsilon, min_samples=min_samples, metric='euclidean').fit(samples)
-    labels = clustering.labels_
-    core_samples_mask = np.zeros_like(labels, dtype=bool)
-    core_samples_mask[clustering.core_sample_indices_] = True
 
-    # 找到与 x 同簇的样本（包括边界点）
-    if len(samples) == 0:
-        return []
-    x_reshaped = x.reshape(1, -1)
-    x_label = clustering.fit_predict(x_reshaped)[0]
-    if x_label == -1:  # x 是噪声点
-        return []
-    neighbors_mask = labels == x_label
-    neighbors = samples[neighbors_mask]
-    return neighbors.tolist()
+# ------------------- 增强型多头自注意力模块 -------------------
+class EnhancedMultiHeadAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        assert dim % num_heads == 0, "dim 必须能被 num_heads 整除"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
-def MDWA(X, y, N=500):
-    """
-    计算每个特征的 Relief-F 改进权重（使用马氏距离 + DBSCAN）
-    X: (n_samples, n_features)
-    y: (n_samples,)
-    N: 抽样次数，默认为 500
-    """
-    n_samples, n_features = X.shape
-    if N is None:
-        N = max(1, int(0.15 * n_samples))
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Dropout(dropout)
+        )
 
-    # 按类别划分样本
-    classes = np.unique(y)
-    class_samples = {c: X[y == c] for c in classes}
+        # 添加相对位置编码（虽然对于单点特征不是必须，但可以增强表达能力）
+        self.relative_position_bias = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
 
-    # 初始化权重
-    weights = np.zeros(n_features)
+        # 添加层归一化
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
 
-    # 为每个类别预计算协方差逆矩阵（加正则化）
-    cov_inv_dict = {}
-    reg = 1e-6
-    for c in classes:
-        samples_c = class_samples[c]
-        if len(samples_c) < 2:
-            cov_inv_dict[c] = np.eye(n_features)
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            Swish(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        B, N, C = x.shape  # B: batch, N: seq_len=1, C: dim
+        x = self.norm1(x)
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each: (B, H, N, D)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn + self.relative_position_bias  # 添加相对位置偏置
+        attn = attn.softmax(dim=-1)
+        attn = F.dropout(attn, p=0.1, training=self.training)
+
+        x_attn = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_attn = self.proj(x_attn)
+
+        # 残差连接
+        x = x + F.dropout(x_attn, p=0.1, training=self.training)
+
+        # FFN + 残差连接
+        x = x + self.ffn(self.norm2(x))
+
+        return x.squeeze(1)  # 回到 (B, C)
+
+
+# ------------------- 特征交互模块 -------------------
+class FeatureInteraction(nn.Module):
+    def __init__(self, input_dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = input_dim // 2
+
+        self.bilinear = nn.Bilinear(input_dim, input_dim, hidden_dim)
+        self.linear = nn.Linear(input_dim, hidden_dim)
+        self.combine = nn.Linear(hidden_dim * 2, input_dim)
+        self.activation = Swish()
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        # 双线性交互
+        bilinear_out = self.bilinear(x, x)
+        # 线性变换
+        linear_out = self.linear(x)
+        # 合并
+        combined = torch.cat([bilinear_out, linear_out], dim=-1)
+        out = self.activation(self.combine(combined))
+        return self.dropout(out)
+
+
+# ------------------- Focal Loss（添加 epsilon 防止数值下溢） -------------------
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, epsilon=1e-8):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, inputs, targets):
+        BCE_loss = self.bce(inputs, targets)
+        pt = torch.exp(-BCE_loss.clamp(max=50))
+        F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        return F_loss.mean()
+
+
+# ------------------- 增强版特征提取网络 -------------------
+class EnhancedFeatureNet(nn.Module):
+    def __init__(self, input_dim, weight_decay=1e-4, dropout_rate=0.3):
+        super().__init__()
+        self.input_dim = input_dim
+        hidden_dim = input_dim * 2  # 增加隐藏层维度
+
+        # 输入层
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            Swish(),
+            nn.Dropout(dropout_rate)
+        )
+
+        # 注意力模块
+        self.attention = EnhancedMultiHeadAttention(hidden_dim, num_heads=8, dropout=dropout_rate)
+
+        # 特征交互模块
+        self.feature_interaction = FeatureInteraction(hidden_dim)
+
+        # 深度残差网络
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, dropout_rate=dropout_rate, activation='swish'),
+            ResidualBlock(hidden_dim, dropout_rate=dropout_rate, activation='swish'),
+            ResidualBlock(hidden_dim, dropout_rate=dropout_rate, activation='swish')
+        ])
+
+        # 输出层
+        self.classifier = nn.Linear(hidden_dim, 1)
+        self.weight_decay = weight_decay
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # 输入投影
+        x = self.input_proj(x)
+
+        # 注意力机制
+        x_attn = self.attention(x.unsqueeze(1))  # (B, C) -> (B, 1, C) for attention
+
+        # 特征交互
+        x_inter = self.feature_interaction(x_attn)
+
+        # 深度残差网络
+        x_deep = x_inter
+        for block in self.res_blocks:
+            x_deep = block(x_deep)
+
+        # 分类器
+        logits = self.classifier(x_deep).squeeze(-1)
+        return logits, x_deep
+
+
+# ------------------- 特征提取器（支持混合精度训练）-------------------
+class FeatureExtractor:
+    def __init__(self, input_dim, epochs=2000, lr=1e-3, batch_size=4096,  # <<< 增大 batch_size
+                 weight_decay=1e-4, device=None, verbose=True):
+        self.input_dim = input_dim
+        self.epochs = epochs
+        self.lr = lr
+        self.batch_size = batch_size
+        self.weight_decay = weight_decay
+        self.device = device or (torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu'))
+        self.verbose = verbose
+
+        self.net = EnhancedFeatureNet(input_dim=input_dim, weight_decay=weight_decay).to(self.device)
+        self.optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+                                           betas=(0.9, 0.999))
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=20, verbose=self.verbose)
+        self.criterion = FocalLoss()
+        self.early_stopper = EarlyStopping(patience=50, min_delta=1e-4, monitor='loss')
+        self.classes_ = np.array([0, 1])
+        self.is_fitted_ = False
+        self.scaler = amp.GradScaler()  # 混合精度梯度缩放器
+
+        if self.device.type == 'cuda':
+            print(f"[FeatureExtractor] 模型已加载到 GPU {self.device}")
+            print(f"[FeatureExtractor] 显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
         else:
-            cov = np.cov(samples_c, rowvar=False)
-            cov_reg = cov + reg * np.eye(n_features)
-            try:
-                cov_inv_dict[c] = np.linalg.inv(cov_reg)
-            except np.linalg.LinAlgError:
-                cov_inv_dict[c] = np.eye(n_features)
+            print("[FeatureExtractor] 模型将使用 CPU")
 
-    # 开始抽样
-    for _ in range(N):
-        idx = np.random.randint(0, n_samples)
-        x = X[idx]
-        y_x = y[idx]
+        if self.verbose:
+            print(f"[FeatureExtractor] 模型参数设备: {next(self.net.parameters()).device}")
 
-        # 获取同类近邻（使用DBSCAN）
-        same_class_samples = class_samples[y_x]
-        if len(same_class_samples) < 3:
-            same_neighbors = []
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+
+        dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True,
+                            drop_last=False, num_workers=8, pin_memory=True)  # <<< 多进程 + pin_memory
+
+        for epoch in range(self.epochs):
+            self.net.train()
+            epoch_loss = 0.0
+            count = 0
+            for xb, yb in loader:
+                xb = xb.to(self.device, non_blocking=True)  # 异步传输
+                yb = yb.to(self.device, non_blocking=True)
+
+                self.optimizer.zero_grad()
+
+                # 混合精度训练
+                with amp.autocast():
+                    logits, _ = self.net(xb)
+                    loss = self.criterion(logits, yb)
+
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)  # 为梯度裁剪做准备
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)  # 防止梯度爆炸
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+                epoch_loss += loss.item() * xb.size(0)
+                count += xb.size(0)
+
+            avg_loss = epoch_loss / max(1, count)
+
+            # 使用 ReduceLROnPlateau 调度器
+            self.scheduler.step(avg_loss)
+
+            if self.verbose and (epoch % 10 == 0 or epoch == self.epochs - 1):
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(
+                    f"[FeatureExtractor] Epoch {epoch + 1}/{self.epochs}, loss = {avg_loss:.6f}, lr = {current_lr:.2e}")
+
+            if self.early_stopper.step(avg_loss):
+                if self.verbose:
+                    print(f"[FeatureExtractor] Early stopping at epoch {epoch + 1}, loss={avg_loss:.6f}")
+                break
+
+        self.is_fitted_ = True
+        return self
+
+    def transform(self, X):
+        if not self.is_fitted_:
+            raise RuntimeError("FeatureExtractor 尚未 fit，请先 fit 后再 transform。")
+        X = np.asarray(X, dtype=np.float32)
+        dataset = TensorDataset(torch.from_numpy(X))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
+                            num_workers=8, pin_memory=True)  # <<< 加速推理
+
+        embeddings = []
+        self.net.eval()
+        with torch.no_grad():
+            for batch in loader:
+                xb = batch[0].to(self.device, non_blocking=True)
+                with amp.autocast():  # 推理也用混合精度
+                    _, emb = self.net(xb)
+                embeddings.append(emb.cpu().numpy())
+        embeddings = np.vstack(embeddings)
+        return embeddings
+
+
+# ------------------- EarlyStopping -------------------
+class EarlyStopping:
+    def __init__(self, patience=50, min_delta=1e-4, monitor='loss'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.monitor = monitor
+        self.best = np.inf if monitor == 'loss' else -np.inf
+        self.wait = 0
+        self.stopped_epoch = 0
+
+    def step(self, value):
+        stop = False
+        improved = False
+
+        if self.monitor == 'loss':
+            if (self.best - value) > self.min_delta:
+                self.best = value
+                self.wait = 0
+                improved = True
+            else:
+                self.wait += 1
+                if self.wait >= self.patience:
+                    stop = True
+                    self.stopped_epoch = self.wait
         else:
-            epsilon = estimate_epsilon_with_k_distance(same_class_samples, k=5)
-            same_neighbors = get_dbscan_neighbors(x, same_class_samples, epsilon)
+            if (value - self.best) > self.min_delta:
+                self.best = value
+                self.wait = 0
+                improved = True
+            else:
+                self.wait += 1
+                if self.wait >= self.patience:
+                    stop = True
+                    self.stopped_epoch = self.wait
 
-        # 获取异类近邻（每类分别处理）
-        diff_neighbors_all = []
-        for c in classes:
-            if c == y_x:
-                continue
-            diff_samples = class_samples[c]
-            if len(diff_samples) < 3:
-                continue
-            epsilon = estimate_epsilon_with_k_distance(diff_samples, k=5)
-            diff_neighbors = get_dbscan_neighbors(x, diff_samples, epsilon)
-            diff_neighbors_all.extend(diff_neighbors)
+        return stop
 
-        # 更新每个特征的权重
-        for i in range(n_features):
-            penalty = 0.0
-            reward = 0.0
 
-            # 同类样本差异惩罚
-            for neighbor in same_neighbors:
-                penalty += abs(x[i] - neighbor[i])
+# ------------------- 级联模型类 -------------------
+class CascadedModel:
+    def __init__(self, imputer, non_constant_features, selector, scaler, feature_extractor, emb_imputer, classifiers):
+        self.imputer = imputer
+        self.non_constant_features = non_constant_features
+        self.selector = selector
+        self.scaler = scaler
+        self.feature_extractor = feature_extractor
+        self.emb_imputer = emb_imputer  # <<< 新增：嵌入层插补器
+        self.classifiers = classifiers
 
-            # 异类样本差异奖励
-            for neighbor in diff_neighbors_all:
-                reward += abs(x[i] - neighbor[i])
+    def _preprocess(self, X_raw):
+        X_arr = np.asarray(X_raw)
+        X_imp = self.imputer.transform(X_arr)
+        X_masked = X_imp[:, self.non_constant_features]
+        X_sel = self.selector.transform(X_masked)
+        X_scaled = self.scaler.transform(X_sel)
+        return X_scaled
 
-            # 平均更新
-            n_same = len(same_neighbors) if len(same_neighbors) > 0 else 1
-            n_diff = len(diff_neighbors_all) if len(diff_neighbors_all) > 0 else 1
-            weights[i] += (reward / n_diff - penalty / n_same) / N
+    def predict(self, X_raw):
+        X_scaled = self._preprocess(X_raw)
+        emb = self.feature_extractor.transform(X_scaled)
+        emb_clean = self.emb_imputer.transform(emb)  # <<< 插补 NaN
+        preds = [clf.predict(emb_clean) for clf in self.classifiers]
+        final_pred = np.round(np.mean(preds, axis=0)).astype(int)
+        return final_pred.ravel()
 
-    return weights
+    def predict_proba(self, X_raw):
+        X_scaled = self._preprocess(X_raw)
+        emb = self.feature_extractor.transform(X_scaled)
+        emb_clean = self.emb_imputer.transform(emb)  # <<< 插补 NaN
+        probas = [clf.predict_proba(emb_clean)[:, 1] for clf in self.classifiers]
+        final_proba = np.mean(probas, axis=0)
+        return np.column_stack([1 - final_proba, final_proba])
 
-# ------------------- 模块3：SSFS —— 分层抽样 + Gini 评分最终筛选（简化版）-------------------
-def random_subset(X, y, sample_ratio=0.7, feature_ratio=0.9):
-    """随机抽取样本和特征的子集"""
-    n_samples, n_features = X.shape
-    sample_size = max(1, int(sample_ratio * n_samples))
-    feature_size = max(1, int(feature_ratio * n_features))
-
-    sample_indices = np.random.choice(n_samples, size=sample_size, replace=False)
-    feature_indices = np.random.choice(n_features, size=feature_size, replace=False)
-
-    X_sub = X[sample_indices][:, feature_indices]
-    y_sub = y[sample_indices]
-    return X_sub, y_sub, feature_indices  # 返回特征映射
-
-def random_forest_gini_importance(X, y, n_estimators=50, max_depth=7):
-    """训练随机森林并返回 Gini 重要性"""
-    if X.shape[1] == 0:
-        return np.array([])
-    rf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=SEED, n_jobs=-1)
-    rf.fit(X, y)
-    return rf.feature_importances_
-
-def SSFS_simplified(X, y, n1=3, gini_percentile=40):
-    """
-    简化版 SSFS 主算法：多轮随机子集 + Gini 筛选
-    X: (n_samples, n_features)
-    y: (n_samples,)
-    n1: 子表数量
-    gini_percentile: Gini 阈值百分位数（默认中位数50）
-    """
-    n_features = X.shape[1]
-    R_combined = set()
-
-    for i in range(n1):
-        # 生成随机子表
-        X_sub, y_sub, feat_map = random_subset(X, y, sample_ratio=0.7, feature_ratio=0.9)
-
-        # 在子表上运行 MDWA
-        weights_sub = MDWA(X_sub, y_sub, N=500)
-        selected_sub_indices = np.argsort(weights_sub)[-10:]  # 保留 Top 10 特征（局部索引）
-
-        # 映射回全局特征索引
-        selected_global = [feat_map[idx] for idx in selected_sub_indices]
-        R_combined.update(selected_global)
-
-        # 转为列表用于训练
-        R_list = list(R_combined)
-        if len(R_list) == 0:
-            continue
-
-        # 计算 Gini 重要性
-        X_selected = X[:, R_list]
-        gini_scores = random_forest_gini_importance(X_selected, y, n_estimators=30, max_depth=5)
-
-        if len(gini_scores) == 0:
-            continue
-
-        # 应用 Gini 阈值（百分位数）
-        threshold = np.percentile(gini_scores, gini_percentile)
-        keep_mask = gini_scores >= threshold
-        R_combined = set(np.array(R_list)[keep_mask])
-
-        print(f"SSFS 轮次 {i+1}/{n1}: 当前特征数 = {len(R_combined)}")
-
-    return list(R_combined)
 
 # ------------------- 主流程 -------------------
 def main():
-    print("开始执行简化版 SSFS 特征选择 + 集成分类流程...")
+    print("CUDA 可用性:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("当前 CUDA 设备:", torch.cuda.current_device())
+        print("CUDA 设备名称:", torch.cuda.get_device_name(0))
+        print(f"显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
+        print(f"显存已分配: {torch.cuda.memory_allocated(0) / 1024 ** 3:.2f} GB")
+    else:
+        print("CUDA 不可用，将使用 CPU 训练。")
 
-    # 1. 数据加载
-    data = pd.read_csv("clean.csv")
+    data = pd.read_csv("data/clean.csv")
     if "company_id" in data.columns:
         data = data.drop(columns=["company_id"])
     if "target" not in data.columns:
@@ -249,155 +421,116 @@ def main():
     X = data.drop(columns=["target"]).values
     y = data["target"].values
 
-    # 2. 划分数据集
     X_train_all, X_test, y_train_all, y_test = train_test_split(X, y, test_size=0.1, random_state=SEED, stratify=y)
-    X_train, X_val, y_train, y_val = train_test_split(X_train_all, y_train_all, test_size=0.2, random_state=SEED, stratify=y_train_all)
 
-    # 3. 缺失值填补
     imputer = SimpleImputer(strategy="mean")
-    X_train_imp = imputer.fit_transform(X_train)
-    X_val_imp = imputer.transform(X_val)
-    X_test_imp = imputer.transform(X_test)
+    X_train_imp = imputer.fit_transform(X_train_all)
 
-    # 4. 删除常量特征
     std_devs = np.std(X_train_imp, axis=0)
-    non_constant_mask = std_devs > 1e-8
-    X_train_nonconst = X_train_imp[:, non_constant_mask]
-    X_val_nonconst = X_val_imp[:, non_constant_mask]
-    X_test_nonconst = X_test_imp[:, non_constant_mask]
+    non_constant_features = std_devs > 0
+    X_train_non_constant = X_train_imp[:, non_constant_features]
 
-    print(f"删除常量特征后维度: {X_train_nonconst.shape[1]}")
+    selector = VarianceThreshold()
+    X_train_selected = selector.fit_transform(X_train_non_constant)
 
-    # 5. ✅ 执行简化版 SSFS 特征选择（在训练集上）
-    print("\n[SSFS] 开始执行简化版特征选择...")
-    selected_indices = SSFS_simplified(X_train_nonconst, y_train, n1=3, gini_percentile=40)
-    print(f"[SSFS] 最终选择特征数量: {len(selected_indices)}")
+    adasyn = ADASYN(random_state=SEED, n_neighbors=5)
+    X_resampled, y_resampled = adasyn.fit_resample(X_train_selected, y_train_all)
 
-    if len(selected_indices) == 0:
-        print("⚠️  未选择任何特征，使用全部非恒定特征")
-        selected_indices = list(range(X_train_nonconst.shape[1]))
-
-    X_train_selected = X_train_nonconst[:, selected_indices]
-    X_val_selected = X_val_nonconst[:, selected_indices]
-    X_test_selected = X_test_nonconst[:, selected_indices]
-
-    # 6. 标准化
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_selected)
-    X_val_scaled = scaler.transform(X_val_selected)
-    X_test_scaled = scaler.transform(X_test_selected)
+    X_resampled_scaled = scaler.fit_transform(X_resampled)
 
-    # 7. 定义分类器参数
-    adaboost_params = {
-        'n_estimators': 200,
-        'learning_rate': 0.1,
-        'random_state': SEED
-    }
-
-    xgboost_params = {
-        'n_estimators': 300,
-        'max_depth': 6,
-        'learning_rate': 0.05,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': SEED,
-        'n_jobs': -1,
-        'eval_metric': 'logloss'
-    }
-
-    # 8. 训练基分类器
-    print("\n[Training] 训练 AdaBoost...")
-    adaboost = AdaBoostClassifier(**adaboost_params)
-    adaboost.fit(X_train_scaled, y_train)
-
-    print("[Training] 训练 XGBoost...")
-    xgboost = XGBClassifier(**xgboost_params)
-    xgboost.fit(X_train_scaled, y_train)
-
-    # 9. 构建投票分类器（仅 AdaBoost + XGBoost）
-    voting_classifier = VotingClassifier(
-        estimators=[
-            ('adaboost', adaboost),
-            ('xgboost', xgboost)
-        ],
-        voting='soft'
+    input_dim = X_resampled_scaled.shape[1]
+    feature_extractor = FeatureExtractor(
+        input_dim=input_dim,
+        batch_size=4096,  # <<< 关键：增大 batch_size 吃满显存
+        lr=5e-4,  # 降低学习率以获得更稳定的训练
+        weight_decay=1e-5,  # 适当降低权重衰减
+        verbose=True
     )
-    voting_classifier.fit(X_train_scaled, y_train)  # 仅用于接口一致
+    feature_extractor.fit(X_resampled_scaled, y_resampled)
 
-    # 10. 阈值优化
-    y_proba_val = voting_classifier.predict_proba(X_val_scaled)[:, 1]
-    best_threshold, best_gmean = find_optimal_threshold(y_val, y_proba_val)
-    print(f"\n[Threshold] 最佳阈值: {best_threshold:.4f}, G-Mean: {best_gmean:.6f}")
+    X_emb_train = feature_extractor.transform(X_resampled_scaled)
 
-    # 11. 测试集评估
-    y_proba_test = voting_classifier.predict_proba(X_test_scaled)[:, 1]
-    y_pred_test = (y_proba_test >= best_threshold).astype(int)
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # ✅ 新增：训练嵌入层插补器（在训练集嵌入上拟合）
+    emb_imputer = SimpleImputer(strategy='constant', fill_value=0.0)
+    X_emb_train_clean = emb_imputer.fit_transform(X_emb_train)  # 拟合并转换
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-    recall = recall_score(y_test, y_pred_test)
-    auc = roc_auc_score(y_test, y_proba_test)
-    precision = precision_score(y_test, y_pred_test)
-    f1 = f1_score(y_test, y_pred_test)
+    adaboost = AdaBoostClassifier(
+        n_estimators=150,
+        learning_rate=0.1,
+        random_state=SEED
+    )
+    adaboost.fit(X_emb_train_clean, y_resampled)  # <<< 使用清洗后的嵌入训练
+
+    xgboost = XGBClassifier(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=SEED,
+        n_jobs=-1,
+        eval_metric='logloss'
+    )
+    xgboost.fit(X_emb_train_clean, y_resampled)  # <<< 使用清洗后的嵌入训练
+
+    # 测试阶段预处理
+    X_test_imp = imputer.transform(X_test)
+    X_test_non_constant = X_test_imp[:, non_constant_features]
+    X_test_selected = selector.transform(X_test_non_constant)
+    X_test_scaled = scaler.transform(X_test_selected)
+    X_emb_test = feature_extractor.transform(X_test_scaled)
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # ✅ 新增：对测试嵌入进行插补
+    X_emb_test_clean = emb_imputer.transform(X_emb_test)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    y_proba_adaboost = adaboost.predict_proba(X_emb_test_clean)[:, 1]  # <<< 使用清洗后的嵌入预测
+    y_proba_xgboost = xgboost.predict_proba(X_emb_test_clean)[:, 1]  # <<< 使用清洗后的嵌入预测
+    y_proba = (y_proba_adaboost + y_proba_xgboost) / 2
+    y_pred = (y_proba >= 0.5).astype(int)
+
+    recall = recall_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_proba)
+    precision = precision_score(y_test, y_pred)
     final_score = 100 * (0.3 * recall + 0.5 * auc + 0.2 * precision)
 
-    print("=" * 50)
-    print("最终评估结果：")
-    print(f"Recall:    {recall:.6f}")
-    print(f"AUC:       {auc:.6f}")
+    print(f"Recall: {recall:.6f}")
+    print(f"AUC: {auc:.6f}")
     print(f"Precision: {precision:.6f}")
-    print(f"F1-Score:  {f1:.6f}")
     print(f"Final Score: {final_score:.4f}")
-    print(f"使用阈值: {best_threshold:.4f}")
-    print("=" * 50)
 
-    # 12. 类别特异性重要性分析（仅 AdaBoost 和 XGBoost）
-    feature_names = [f"Feature_{i}" for i in range(X_train_scaled.shape[1])]
-
-    for name, model in [("AdaBoost", adaboost), ("XGBoost", xgboost)]:
-        print(f"\n[{name}] 类别特异性特征重要性:")
-        pos_imp, neg_imp = compute_class_specific_feature_importance(X_val_scaled, y_val, model, feature_names)
-        if pos_imp is not None:
-            print("→ 正样本 Top 5:")
-            print(pos_imp.head(5))
-            print("→ 负样本 Top 5:")
-            print(neg_imp.head(5))
-
-    # 13. 保存模型
-    class SSFSModel:
-        def __init__(self, imputer, non_constant_mask, selected_indices, scaler, voting_classifier, threshold):
-            self.imputer = imputer
-            self.non_constant_mask = non_constant_mask
-            self.selected_indices = selected_indices
-            self.scaler = scaler
-            self.voting_classifier = voting_classifier
-            self.threshold = threshold
-
-        def predict_proba(self, X_raw):
-            X_imp = self.imputer.transform(X_raw)
-            X_nonconst = X_imp[:, self.non_constant_mask]
-            if len(self.selected_indices) > 0:
-                X_selected = X_nonconst[:, self.selected_indices]
-            else:
-                X_selected = X_nonconst
-            X_scaled = self.scaler.transform(X_selected)
-            return self.voting_classifier.predict_proba(X_scaled)
-
-        def predict(self, X_raw):
-            proba = self.predict_proba(X_raw)[:, 1]
-            return (proba >= self.threshold).astype(int)
-
-    model = SSFSModel(
+    cascaded = CascadedModel(
         imputer=imputer,
-        non_constant_mask=non_constant_mask,
-        selected_indices=selected_indices,
+        non_constant_features=non_constant_features,
+        selector=selector,
         scaler=scaler,
-        voting_classifier=voting_classifier,
-        threshold=best_threshold
+        feature_extractor=feature_extractor,
+        emb_imputer=emb_imputer,  # <<< 保存插补器
+        classifiers=[adaboost, xgboost]
     )
 
-    joblib.dump(model, "ssfs_cascaded_model.pkl")
-    joblib.dump(selected_indices, "ssfs_selected_features.pkl")
-    joblib.dump(non_constant_mask, "non_constant_mask.pkl")
-    print("✅ 模型和特征选择结果已保存。")
+    joblib.dump(cascaded, "best_cascaded_model.pkl")
+    joblib.dump(imputer, "imputer.pkl")
+    joblib.dump(selector, "variance_threshold_selector.pkl")
+    joblib.dump(non_constant_features, "non_constant_features.pkl")
+    joblib.dump(scaler, "scaler.pkl")
+    joblib.dump(adasyn, "adasyn_sampler.pkl")
+    joblib.dump(adaboost, "adaboost.pkl")
+    joblib.dump(xgboost, "xgboost.pkl")
+    joblib.dump(emb_imputer, "emb_imputer.pkl")  # <<< 保存插补器
+
+    print("模型和预处理器已保存。")
+
+    if torch.cuda.is_available():
+        print("[Final Model] 模型是否在 GPU 上:", next(feature_extractor.net.parameters()).is_cuda)
+        print(f"[Final Model] 显存已分配: {torch.cuda.memory_allocated(0) / 1024 ** 3:.2f} GB")
+        print(f"[Final Model] 显存峰值: {torch.cuda.max_memory_allocated(0) / 1024 ** 3:.2f} GB")
+    else:
+        print("[Final Model] 当前不支持 GPU")
 
 
 if __name__ == "__main__":
