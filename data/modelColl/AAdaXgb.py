@@ -353,7 +353,7 @@ def main():
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     y_proba = (y_proba_adaboost + y_proba_xgboost) / 2
-    y_pred = (y_proba >= 0.1).astype(int)
+    y_pred = (y_proba >= 0.5).astype(int)
 
     recall = recall_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
