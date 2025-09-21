@@ -20,6 +20,10 @@ from sklearn.metrics import recall_score, precision_score, roc_auc_score
 from scipy.spatial.distance import cdist
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split  # 重新引入，因为实际使用了
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# 新增：引入 BalancedRandomForestClassifier
+from imblearn.ensemble import BalancedRandomForestClassifier
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # 设置随机种子
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0" # 已注释，因为不再使用GPU
@@ -167,12 +171,14 @@ class ImprovedKMeans:
 
 # ------------------- 级联模型类 (修改后) -------------------
 # 移除了与 FeatureExtractor 和 emb_imputer 相关的属性和逻辑
+# 添加了 brf_selector 属性
 class CascadedModel:
-    def __init__(self, imputer, non_constant_features, selector, inter_intra_selector, kmeans, scaler, classifiers):
+    def __init__(self, imputer, non_constant_features, selector, inter_intra_selector, brf_selector, kmeans, scaler, classifiers):
         self.imputer = imputer
         self.non_constant_features = non_constant_features
         self.selector = selector
         self.inter_intra_selector = inter_intra_selector
+        self.brf_selector = brf_selector # <<< 新增
         self.kmeans = kmeans
         self.scaler = scaler
         self.classifiers = classifiers
@@ -183,10 +189,17 @@ class CascadedModel:
         X_masked = X_imp[:, self.non_constant_features]
         X_sel = self.selector.transform(X_masked)
         X_inter_intra = self.inter_intra_selector.transform(X_sel)
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # 新增：应用 BRF 特征选择
+        X_brf_selected = self.brf_selector.transform(X_inter_intra)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         # 注意：K-means聚类主要用于识别离群点，这里我们不直接用它变换数据，
         # 而是假设它在训练时帮助识别了离群点并进行了处理（例如过滤或加权）。
         # 如果需要在预测时也应用聚类，逻辑会更复杂。
-        X_scaled = self.scaler.transform(X_inter_intra)
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # 修改：使用 BRF 选择后的数据进行标准化
+        X_scaled = self.scaler.transform(X_brf_selected)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         return X_scaled
 
     def predict(self, X_raw):
@@ -249,7 +262,36 @@ def main():
     inter_intra_selector = InterIntraDistanceSelector(threshold=0.001)  # 可调整阈值
     X_train_inter_intra_selected = inter_intra_selector.fit_transform(X_train_selected, y_train_all)
     print(
-        f"[Feature Selection] 原始特征数: {X_train_selected.shape[1]}, 选择后特征数: {X_train_inter_intra_selected.shape[1]}")
+        f"[Feature Selection] 原始特征数: {X_train_selected.shape[1]}, 选择后特征数 (类间类内): {X_train_inter_intra_selected.shape[1]}")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # 新增：使用 Balanced Random Forest 进行特征重要性评估和选择
+    print("[Feature Selection] 训练 Balanced Random Forest 以获取特征重要性...")
+    brf = BalancedRandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
+    brf.fit(X_train_inter_intra_selected, y_train_all)
+
+    # 方法1：选择重要性大于平均值的特征
+    # feature_importances = brf.feature_importances_
+    # threshold_brf = np.mean(feature_importances)
+    # brf_selected_features_mask = feature_importances > threshold_brf
+
+    # 方法2：选择前 N 个最重要的特征 (例如，前 80% 的特征)
+    feature_importances = brf.feature_importances_
+    num_features_to_select = max(1, int(0.8 * X_train_inter_intra_selected.shape[1])) # 至少保留1个特征
+    sorted_indices = np.argsort(feature_importances)[::-1] # 降序索引
+    top_indices = sorted_indices[:num_features_to_select]
+    brf_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
+    brf_selected_features_mask[top_indices] = True
+
+    X_train_brf_selected = X_train_inter_intra_selected[:, brf_selected_features_mask]
+    print(f"[Feature Selection] 类间类内选择后特征数: {X_train_inter_intra_selected.shape[1]}, BRF 选择后特征数: {X_train_brf_selected.shape[1]}")
+
+    # 保存 BRF 选择器的逻辑（使用布尔掩码）
+    brf_selector = type('BrfSelector', (), {
+        'selected_features_': brf_selected_features_mask,
+        'transform': lambda self, X: X[:, self.selected_features_]
+    })()
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -258,7 +300,7 @@ def main():
     kmeans = ImprovedKMeans(n_clusters=2, random_state=SEED)
     # 假设我们先用原始数据拟合K-means来识别离群点
     # 或者用选择后的特征拟合
-    cluster_labels = kmeans.fit_predict(X_train_inter_intra_selected)
+    cluster_labels = kmeans.fit_predict(X_train_brf_selected) # <<< 使用 BRF 选择后的数据
     print(f"[KMeans] 聚类中心:\n{kmeans.cluster_centers_}")
     # 这里可以添加逻辑来处理离群点，例如：
     # 1. 找到每个簇的马氏距离
@@ -270,14 +312,16 @@ def main():
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # 数据标准化 (在 ADASYN 之前)
     pre_scaler = StandardScaler()
-    X_train_inter_intra_selected_scaled = pre_scaler.fit_transform(X_train_inter_intra_selected)
+    # X_train_inter_intra_selected_scaled = pre_scaler.fit_transform(X_train_inter_intra_selected) # <<< 修改：使用 BRF 选择后的数据
+    X_train_brf_selected_scaled = pre_scaler.fit_transform(X_train_brf_selected) # <<< 修改：使用 BRF 选择后的数据
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     adasyn = ADASYN(random_state=SEED, n_neighbors=5)
     # X_resampled, y_resampled = adasyn.fit_resample(X_train_inter_intra_selected, y_train_all)
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # 修改：对标准化后的数据进行 ADASYN
-    X_resampled_scaled, y_resampled = adasyn.fit_resample(X_train_inter_intra_selected_scaled, y_train_all)
+    # X_resampled_scaled, y_resampled = adasyn.fit_resample(X_train_inter_intra_selected_scaled, y_train_all) # <<< 修改：使用 BRF 选择并标准化后的数据
+    X_resampled_scaled, y_resampled = adasyn.fit_resample(X_train_brf_selected_scaled, y_train_all) # <<< 修改：使用 BRF 选择并标准化后的数据
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -331,11 +375,16 @@ def main():
     X_test_non_constant = X_test_imp[:, non_constant_features]
     X_test_selected = selector.transform(X_test_non_constant)
     X_test_inter_intra_selected = inter_intra_selector.transform(X_test_selected)  # <<< 新增：测试集特征选择
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # 新增：应用 BRF 特征选择到测试集
+    X_test_brf_selected = brf_selector.transform(X_test_inter_intra_selected)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     # 注意：测试集不应用 K-means 聚类处理
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # X_test_scaled = scaler.transform(X_test_inter_intra_selected)
     # 修改：使用与训练集相同的 scaler (pre_scaler) 进行标准化
-    X_test_scaled = scaler.transform(X_test_inter_intra_selected)
+    # X_test_scaled = scaler.transform(X_test_inter_intra_selected) # <<< 修改：使用 BRF 选择后的数据
+    X_test_scaled = scaler.transform(X_test_brf_selected) # <<< 修改：使用 BRF 选择后的数据
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -372,6 +421,7 @@ def main():
         non_constant_features=non_constant_features,
         selector=selector,
         inter_intra_selector=inter_intra_selector,  # <<< 保存选择器
+        brf_selector=brf_selector, # <<< 保存 BRF 选择器
         kmeans=kmeans,  # <<< 保存聚类器
         scaler=scaler,  # <<< 保存 scaler (即 pre_scaler)
         classifiers=[adaboost, xgboost]
@@ -382,6 +432,10 @@ def main():
     joblib.dump(imputer, "imputer.pkl")
     joblib.dump(selector, "variance_threshold_selector.pkl")
     joblib.dump(inter_intra_selector, "inter_intra_distance_selector.pkl")  # <<< 保存选择器
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # 保存 BRF 选择器 (保存掩码即可)
+    joblib.dump(brf_selected_features_mask, "brf_selected_features_mask.pkl")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     joblib.dump(kmeans, "kmeans_model.pkl")  # <<< 保存聚类器
     joblib.dump(non_constant_features, "non_constant_features.pkl")
     joblib.dump(scaler, "scaler.pkl")  # <<< 保存 scaler (即 pre_scaler)
