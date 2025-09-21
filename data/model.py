@@ -35,7 +35,7 @@ class XGBRFE_FeatureSelector:
 
     def fit(self, X, y):
         xgb = XGBClassifier(
-            n_estimators=700,
+            n_estimators=500,
             max_depth=15,
             learning_rate=0.001,
             subsample=0.8,
@@ -161,30 +161,8 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
     print("\n=== 测试集评估 ===")
     y_proba = ensemble.predict_proba(X_test_processed)
 
-    # 动态选择最佳阈值（基于验证集）
-    X_train_final, X_val, y_train_final, y_val = train_test_split(
-        X_train_processed, y_train, test_size=0.05, random_state=SEED, stratify=y_train
-    )
-
-    # 在验证集上寻找最佳阈值
-    val_proba = ensemble.predict_proba(X_val)
-    thresholds = np.linspace(0.1, 0.5, 50)
-    best_auc = -1
-    best_thresh = 0.2
-
-    for thresh in thresholds:
-        y_pred = (val_proba >= thresh).astype(int)
-        auc = roc_auc_score(y_val, val_proba)
-        recall = recall_score(y_val, y_pred)
-        # 优先优化AUC和Recall的组合指标
-        score = 0.7 * auc + 0.3 * recall
-
-        if score > best_auc:
-            best_auc = score
-            best_thresh = thresh
-
-    # 应用最佳阈值
-    y_pred = (y_proba >= best_thresh).astype(int)
+    # 固定阈值0.2进行分类
+    y_pred = (y_proba >= 0.1).astype(int)
 
     # 评估指标
     recall = recall_score(y_test, y_pred)
@@ -193,7 +171,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
     f1 = f1_score(y_test, y_pred)
 
     print("\n=== 评估结果 ===")
-    print(f"最佳阈值: {best_thresh:.4f}")
+    print(f"固定阈值: 0.2")
     print(f"Recall: {recall:.4f}")
     print(f"AUC: {auc:.4f}")
     print(f"Precision: {precision:.4f}")
@@ -205,7 +183,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
         'precision': precision,
         'f1': f1,
         'y_proba': y_proba,
-        'best_threshold': best_thresh
+        'y_pred': y_pred
     }
 
 
@@ -241,12 +219,19 @@ def main():
 
     # 数据划分
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.1, random_state=SEED, stratify=y
+        X, y, test_size=0.05, random_state=SEED, stratify=y
     )
     print(f"\n数据划分: 训练集={X_train.shape[0]}, 测试集={X_test.shape[0]}")
 
     # 训练和评估
     results = train_and_evaluate(X_train, y_train, X_test, y_test)
+
+    # 保存预测结果
+    pd.DataFrame({
+        'true_label': y_test,
+        'pred_prob': results['y_proba'],
+        'pred_label': results['y_pred']
+    }).to_csv("predictions.csv", index=False)
 
 
 if __name__ == "__main__":
