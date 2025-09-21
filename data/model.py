@@ -40,7 +40,7 @@ XGB_BEST_PARAMS = {
 FIXED_PARAMS = {
     'inter_intra_threshold': 0.001,  # 固定 InterIntraDistanceSelector 阈值
     # 'adasyn_n_neighbors': 5,         # 移除 ADASYN 参数
-    'lgb_top_ratio': 0.8             # 固定 LightGBM 选择特征比例
+    'lgb_top_ratio': 0.5            # 固定 LightGBM 选择特征比例
 }
 
 # --- 显式指定的最终分类概率阈值 ---
