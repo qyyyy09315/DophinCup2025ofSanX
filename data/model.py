@@ -11,9 +11,7 @@ from sklearn.ensemble import AdaBoostClassifier
 from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score
-from sklearn.model_selection import train_test_split, KFold
-from sklearn.linear_model import LogisticRegression
-from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 import warnings
 
@@ -24,20 +22,6 @@ os.environ["LOKY_MAX_CPU_COUNT"] = "32"
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
-
-
-class ProbabilityCalibrator:
-    """Isotonic Regression概率校准器"""
-
-    def __init__(self):
-        self.calibrator = IsotonicRegression(out_of_bounds='clip')
-
-    def fit(self, y_prob, y_true):
-        self.calibrator.fit(y_prob, y_true)
-        return self
-
-    def calibrate(self, y_prob):
-        return self.calibrator.transform(y_prob)
 
 
 class XGBRFE_FeatureSelector:
@@ -76,184 +60,150 @@ class XGBRFE_FeatureSelector:
     def transform(self, X):
         return self.selector.transform(X)
 
-    def get_feature_mask(self):
-        return self.feature_mask_
 
+class TwoStageEnsemble:
+    """两阶段集成模型（XGB+AdaBoost -> CatBoost）"""
 
-class ModelStacker:
-    """Stacking集成学习器"""
+    def __init__(self):
+        self.xgb_model = None
+        self.ada_model = None
+        self.cat_model = None
+        self.feature_selector = None
+        self.scaler = None
 
-    def __init__(self, base_models, meta_model, n_folds=5):
-        self.base_models = base_models
-        self.meta_model = meta_model
-        self.n_folds = n_folds
-        self.calibrators = {}
+    def fit(self, X, y):
+        # 第一阶段：特征选择
+        print("\n[Stage 1] 特征选择...")
+        self.feature_selector = XGBRFE_FeatureSelector()
+        X_selected = self.feature_selector.fit(X, y).transform(X)
 
-    def fit_base_models(self, X, y):
-        """训练基模型并生成元特征"""
-        kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=SEED)
-        meta_features = np.zeros((X.shape[0], len(self.base_models)))
+        # 标准化
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X_selected)
 
-        print("\n[Stacking] 生成交叉验证元特征...")
-        for i, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train = y[train_idx]
+        # 处理类别不平衡
+        smote_tomek = SMOTETomek(random_state=SEED)
+        X_resampled, y_resampled = smote_tomek.fit_resample(X_scaled, y)
 
-            for j, (name, model) in enumerate(self.base_models.items()):
-                model.fit(X_train, y_train)
-                meta_features[val_idx, j] = model.predict_proba(X_val)[:, 1]
-
-        # 完整训练基模型
-        print("[Stacking] 完整训练基模型...")
-        for name, model in self.base_models.items():
-            model.fit(X, y)
-
-        return meta_features
-
-    def calibrate_probabilities(self, X, y, test_size=0.2):
-        """训练概率校准器"""
-        print("\n[Calibration] 训练概率校准器...")
-        X_train, X_cal, y_train, y_cal = train_test_split(
-            X, y, test_size=test_size, random_state=SEED
+        # 第二阶段：训练初级模型
+        print("\n[Stage 2] 训练初级模型...")
+        # XGBoost模型（优化AUC）
+        self.xgb_model = XGBClassifier(
+            n_estimators=500,
+            max_depth=9,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1]),
+            random_state=SEED,
+            n_jobs=-1,
+            eval_metric='auc'
         )
+        self.xgb_model.fit(X_resampled, y_resampled)
 
-        # 训练基模型在校准集上的预测
-        cal_probs = np.zeros((X_cal.shape[0], len(self.base_models)))
-        for j, (name, model) in enumerate(self.base_models.items()):
-            model.fit(X_train, y_train)
-            cal_probs[:, j] = model.predict_proba(X_cal)[:, 1]
-
-        # 训练元模型在校准集上的预测
-        self.meta_model.fit(
-            self.fit_base_models(X_train, y_train),
-            y_train
+        # AdaBoost模型（优化召回率）
+        self.ada_model = AdaBoostClassifier(
+            n_estimators=200,
+            learning_rate=0.5,
+            random_state=SEED
         )
-        meta_probs = self.meta_model.predict_proba(cal_probs)[:, 1]
+        self.ada_model.fit(X_resampled, y_resampled)
 
-        # 训练校准器
-        self.calibrator = ProbabilityCalibrator()
-        self.calibrator.fit(meta_probs, y_cal)
+        # 生成初级模型预测概率作为新特征
+        print("\n[Stage 3] 生成中级特征...")
+        xgb_proba = self.xgb_model.predict_proba(X_resampled)[:, 1].reshape(-1, 1)
+        ada_proba = self.ada_model.predict_proba(X_resampled)[:, 1].reshape(-1, 1)
+        X_meta = np.hstack([X_resampled, xgb_proba, ada_proba])
+
+        # 第三阶段：训练CatBoost最终模型
+        print("\n[Stage 4] 训练CatBoost最终模型...")
+        self.cat_model = CatBoostClassifier(
+            iterations=1000,
+            depth=8,
+            learning_rate=0.05,
+            loss_function='Logloss',
+            eval_metric='AUC',
+            random_seed=SEED,
+            verbose=100
+        )
+        self.cat_model.fit(X_meta, y_resampled)
 
     def predict_proba(self, X):
-        """生成校准后的概率预测"""
-        # 基模型预测
-        base_preds = np.column_stack([
-            model.predict_proba(X)[:, 1]
-            for name, model in self.base_models.items()
-        ])
+        """预测概率（只返回正类概率）"""
+        X_selected = self.feature_selector.transform(X)
+        X_scaled = self.scaler.transform(X_selected)
 
-        # 元模型预测
-        meta_preds = self.meta_model.predict_proba(base_preds)[:, 1]
+        # 生成初级模型预测
+        xgb_proba = self.xgb_model.predict_proba(X_scaled)[:, 1].reshape(-1, 1)
+        ada_proba = self.ada_model.predict_proba(X_scaled)[:, 1].reshape(-1, 1)
+        X_meta = np.hstack([X_scaled, xgb_proba, ada_proba])
 
-        # 概率校准
-        if hasattr(self, 'calibrator'):
-            return self.calibrator.calibrate(meta_preds)
-        return meta_preds
+        # 最终预测
+        return self.cat_model.predict_proba(X_meta)[:, 1]
 
 
-def train_and_evaluate_optimized(X_train, y_train, X_test, y_test):
-    """优化后的训练评估流程"""
-    print("\n=== 数据预处理 ===")
-    # 1. 缺失值填充和标准化
-    pipeline = Pipeline([
+def train_and_evaluate(X_train, y_train, X_test, y_test):
+    """训练评估流程"""
+    # 数据预处理管道
+    preprocessor = Pipeline([
         ('imputer', SimpleImputer(strategy='mean')),
         ('scaler', StandardScaler())
     ])
-    X_train_processed = pipeline.fit_transform(X_train)
-    X_test_processed = pipeline.transform(X_test)
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
 
-    # 2. 特征选择
-    print("\n=== 特征选择 ===")
-    feature_selector = XGBRFE_FeatureSelector(n_features=None, step=0.1)
-    X_train_selected = feature_selector.fit(X_train_processed, y_train).transform(X_train_processed)
-    X_test_selected = feature_selector.transform(X_test_processed)
-    print(f"特征选择完成: {X_train_selected.shape[1]}个特征被保留")
+    # 训练两阶段集成模型
+    print("\n=== 训练两阶段集成模型 ===")
+    ensemble = TwoStageEnsemble()
+    ensemble.fit(X_train_processed, y_train)
 
-    # 3. 处理类别不平衡
-    print("\n=== 处理类别不平衡 ===")
-    smote_tomek = SMOTETomek(random_state=SEED)
-    X_resampled, y_resampled = smote_tomek.fit_resample(X_train_selected, y_train)
-    print(f"过采样后数据形状: {X_resampled.shape}")
+    # 测试集预测
+    print("\n=== 测试集评估 ===")
+    y_proba = ensemble.predict_proba(X_test_processed)
 
-    # 4. 定义基模型
-    base_models = {
-        'AdaBoost': AdaBoostClassifier(
-            n_estimators=393,
-            learning_rate=0.426,
-            random_state=SEED
-        ),
-        'XGBoost': XGBClassifier(
-            n_estimators=356,
-            max_depth=11,
-            learning_rate=0.173,
-            subsample=0.92,
-            colsample_bytree=0.712,
-            random_state=SEED,
-            n_jobs=-1
-        ),
-        'CatBoost': CatBoostClassifier(
-            iterations=500,
-            depth=13,
-            learning_rate=0.8,
-            random_seed=SEED,
-            verbose=0
-        )
-    }
-
-    # 5. 定义元模型
-    meta_model = LogisticRegression(
-        penalty='l2',
-        C=0.1,
-        random_state=SEED,
-        max_iter=1000
+    # 动态选择最佳阈值（基于验证集）
+    X_train_final, X_val, y_train_final, y_val = train_test_split(
+        X_train_processed, y_train, test_size=0.2, random_state=SEED, stratify=y_train
     )
 
-    # 6. 训练Stacking集成模型
-    print("\n=== 训练Stacking模型 ===")
-    stacker = ModelStacker(base_models, meta_model, n_folds=5)
-    stacker.fit_base_models(X_resampled, y_resampled)
-    stacker.calibrate_probabilities(X_resampled, y_resampled, test_size=0.2)
-
-    # 7. 测试集预测
-    print("\n=== 测试集评估 ===")
-    y_proba = stacker.predict_proba(X_test_selected)
-
-    # 8. 动态阈值选择 (基于验证集)
-    thresholds = np.linspace(0.1, 0.5, 20)
-    best_score = -1
+    # 在验证集上寻找最佳阈值
+    val_proba = ensemble.predict_proba(X_val)
+    thresholds = np.linspace(0.1, 0.5, 50)
+    best_auc = -1
     best_thresh = 0.2
 
     for thresh in thresholds:
-        y_pred = (y_proba >= thresh).astype(int)
-        score = 0.3 * recall_score(y_test, y_pred) + 0.5 * roc_auc_score(y_test, y_proba) + 0.2 * precision_score(
-            y_test, y_pred)
-        if score > best_score:
-            best_score = score
+        y_pred = (val_proba >= thresh).astype(int)
+        auc = roc_auc_score(y_val, val_proba)
+        recall = recall_score(y_val, y_pred)
+        # 优先优化AUC和Recall的组合指标
+        score = 0.7 * auc + 0.3 * recall
+
+        if score > best_auc:
+            best_auc = score
             best_thresh = thresh
 
+    # 应用最佳阈值
     y_pred = (y_proba >= best_thresh).astype(int)
 
-    # 9. 评估指标
+    # 评估指标
     recall = recall_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
     precision = precision_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred)
-    final_score = 100 * (0.3 * recall + 0.5 * auc + 0.2 * precision)
 
     print("\n=== 评估结果 ===")
-    print(f"最优阈值: {best_thresh:.4f}")
+    print(f"最佳阈值: {best_thresh:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"AUC: {auc:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"F1-score: {f1:.4f}")
-    print(f"Final Score: {final_score:.4f}")
 
     return {
         'recall': recall,
         'auc': auc,
         'precision': precision,
         'f1': f1,
-        'final_score': final_score,
         'y_proba': y_proba,
         'best_threshold': best_thresh
     }
@@ -291,19 +241,12 @@ def main():
 
     # 数据划分
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=SEED, stratify=y
+        X, y, test_size=0.1, random_state=SEED, stratify=y
     )
     print(f"\n数据划分: 训练集={X_train.shape[0]}, 测试集={X_test.shape[0]}")
 
     # 训练和评估
-    results = train_and_evaluate_optimized(X_train, y_train, X_test, y_test)
-
-    # 保存概率预测结果
-    pd.DataFrame({
-        'true_label': y_test,
-        'pred_prob': results['y_proba'],
-        'pred_label': (results['y_proba'] >= results['best_threshold']).astype(int)
-    }).to_csv("predictions.csv", index=False)
+    results = train_and_evaluate(X_train, y_train, X_test, y_test)
 
 
 if __name__ == "__main__":
