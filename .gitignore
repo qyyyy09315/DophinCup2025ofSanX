@@ -211,3 +211,4 @@ AnoData/accepted_2007_to_2018Q4.csv
 .pkl
 *.pkl
 /data/catboost_info
+/data/catboost_info

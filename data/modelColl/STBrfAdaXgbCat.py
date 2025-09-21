@@ -13,11 +13,10 @@ from xgboost import XGBClassifier
 from catboost import CatBoostClassifier # 导入 CatBoost
 from sklearn.metrics import recall_score, precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-# 导入 LightGBM
-import lightgbm as lgb
+from imblearn.ensemble import BalancedRandomForestClassifier
 
 # 设置环境变量 (根据你的实际CPU核心数调整)
-os.environ["LOKY_MAX_CPU_COUNT"] = "16"  # 假设你使用的是32核CPU
+os.environ["LOKY_MAX_CPU_COUNT"] = "32"  # 假设你使用的是32核CPU
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
@@ -39,7 +38,8 @@ XGB_BEST_PARAMS = {
 # --- 固定的预处理和模型参数 ---
 FIXED_PARAMS = {
     'inter_intra_threshold': 0.001,  # 固定 InterIntraDistanceSelector 阈值
-    'lgb_top_ratio': 0.8             # 固定 LightGBM 选择特征比例
+    # 'adasyn_n_neighbors': 5,         # 移除 ADASYN 参数
+    'brf_top_ratio': 0.8             # 固定 BRF 选择特征比例
 }
 
 # --- 显式指定的最终分类概率阈值 ---
@@ -91,8 +91,8 @@ class InterIntraDistanceSelector:
         return self.transform(X)
 
 
-class FeatureSelector: # 重命名类以反映通用性
-    """用于包装特征选择掩码的标准类"""
+class BrfSelector:
+    """用于包装 Balanced Random Forest 选择的特征掩码的标准类"""
 
     def __init__(self, selected_features_mask):
         self.selected_features_ = selected_features_mask
@@ -129,38 +129,31 @@ def train_and_evaluate_fixed_params(X_train_all, y_train_all, X_test, y_test):
     if X_train_inter_intra_selected.shape[1] < 2:
         raise ValueError("InterIntraDistanceSelector 选择的特征数过少 (<2)，无法继续。")
 
-    # --- 3. 应用 LightGBM 特征选择 (使用固定参数) ---
-    print(f"[Feature Selection] 应用 LightGBM 特征选择 (top_ratio={FIXED_PARAMS['lgb_top_ratio']})...")
-    # 使用 LightGBM 进行特征重要性评估
-    lgb_model = lgb.LGBMClassifier(
-        n_estimators=100,
-        random_state=SEED,
-        verbose=-1 # 静默训练
-        # 可以根据需要添加更多 LightGBM 参数
-    )
-    lgb_model.fit(X_train_inter_intra_selected, y_train_all)
-    feature_importances = lgb_model.feature_importances_
-    num_features_to_select = max(1, int(FIXED_PARAMS['lgb_top_ratio'] * X_train_inter_intra_selected.shape[1]))
+    # --- 3. 应用 BalancedRandomForest 特征选择 (使用固定参数) ---
+    print(f"[Feature Selection] 应用 BalancedRandomForest 特征选择 (top_ratio={FIXED_PARAMS['brf_top_ratio']})...")
+    brf = BalancedRandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
+    brf.fit(X_train_inter_intra_selected, y_train_all)
+    feature_importances = brf.feature_importances_
+    num_features_to_select = max(1, int(FIXED_PARAMS['brf_top_ratio'] * X_train_inter_intra_selected.shape[1]))
     sorted_indices = np.argsort(feature_importances)[::-1]
     top_indices = sorted_indices[:num_features_to_select]
-    lgb_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
-    lgb_selected_features_mask[top_indices] = True
-    # 使用通用的 FeatureSelector 类
-    feature_selector = FeatureSelector(lgb_selected_features_mask)
+    brf_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
+    brf_selected_features_mask[top_indices] = True
+    brf_selector = BrfSelector(brf_selected_features_mask)
 
-    X_train_lgb_selected = feature_selector.transform(X_train_inter_intra_selected)
-    print(f"[Feature Selection] LightGBM 选择后特征数: {X_train_lgb_selected.shape[1]}")
+    X_train_brf_selected = brf_selector.transform(X_train_inter_intra_selected)
+    print(f"[Feature Selection] BRF 选择后特征数: {X_train_brf_selected.shape[1]}")
 
     # --- 4. 标准化 ---
     print("[Preprocessing] 标准化特征...")
     scaler = StandardScaler()
-    X_train_lgb_selected_scaled = scaler.fit_transform(X_train_lgb_selected)
+    X_train_brf_selected_scaled = scaler.fit_transform(X_train_brf_selected)
 
     # --- 5. 过采样 (SMOTETomek) ---
     print(f"[Resampling] 应用 SMOTETomek 过采样...")
     # 使用 SMOTETomek 进行过采样和欠采样
     smote_tomek = SMOTETomek(random_state=SEED)
-    X_resampled_scaled, y_resampled = smote_tomek.fit_resample(X_train_lgb_selected_scaled, y_train_all)
+    X_resampled_scaled, y_resampled = smote_tomek.fit_resample(X_train_brf_selected_scaled, y_train_all)
     print(f"[Resampling] SMOTETomek 采样后样本数: {X_resampled_scaled.shape[0]}")
 
     # --- 6. 模型训练 ---
@@ -209,11 +202,11 @@ def train_and_evaluate_fixed_params(X_train_all, y_train_all, X_test, y_test):
     # 应用 InterIntraDistanceSelector
     X_test_inter_intra_selected = inter_intra_selector.transform(X_test_selected)
 
-    # 应用 LightGBM 特征选择
-    X_test_lgb_selected = feature_selector.transform(X_test_inter_intra_selected)
+    # 应用 BalancedRandomForest 特征选择
+    X_test_brf_selected = brf_selector.transform(X_test_inter_intra_selected)
 
     # 标准化
-    X_test_scaled = scaler.transform(X_test_lgb_selected)
+    X_test_scaled = scaler.transform(X_test_brf_selected)
 
     # --- 8. 测试集预测 ---
     print("[Evaluation] 在测试集上进行预测...")
