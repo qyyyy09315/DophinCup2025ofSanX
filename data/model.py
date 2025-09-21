@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 import lightgbm as lgb
 
 # 设置环境变量 (根据你的实际CPU核心数调整)
-os.environ["LOKY_MAX_CPU_COUNT"] = "16"  # 假设你使用的是32核CPU
+os.environ["LOKY_MAX_CPU_COUNT"] = "32"  # 假设你使用的是32核CPU
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
@@ -39,6 +39,7 @@ XGB_BEST_PARAMS = {
 # --- 固定的预处理和模型参数 ---
 FIXED_PARAMS = {
     'inter_intra_threshold': 0.001,  # 固定 InterIntraDistanceSelector 阈值
+    # 'adasyn_n_neighbors': 5,         # 移除 ADASYN 参数
     'lgb_top_ratio': 0.8             # 固定 LightGBM 选择特征比例
 }
 
@@ -133,10 +134,10 @@ def train_and_evaluate_fixed_params(X_train_all, y_train_all, X_test, y_test):
     print(f"[Feature Selection] 应用 LightGBM 特征选择 (top_ratio={FIXED_PARAMS['lgb_top_ratio']})...")
     # 使用 LightGBM 进行特征重要性评估
     lgb_model = lgb.LGBMClassifier(
-        n_estimators=100,
+        n_estimators=500,
         random_state=SEED,
-        verbose=-1 # 静默训练
-        # 可以根据需要添加更多 LightGBM 参数
+        verbose=-1, # 静默训练
+        max_depth=10
     )
     lgb_model.fit(X_train_inter_intra_selected, y_train_all)
     feature_importances = lgb_model.feature_importances_
@@ -295,3 +296,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
