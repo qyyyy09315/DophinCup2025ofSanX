@@ -10,39 +10,35 @@ from sklearn.feature_selection import VarianceThreshold
 from imblearn.over_sampling import ADASYN
 from sklearn.ensemble import AdaBoostClassifier
 from xgboost import XGBClassifier
-from sklearn.metrics import recall_score, precision_score, roc_auc_score, make_scorer
+from sklearn.metrics import recall_score, precision_score, roc_auc_score
 from scipy.spatial.distance import cdist
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from scipy.stats import randint, uniform
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from imblearn.ensemble import BalancedRandomForestClassifier
 
-
-os.environ["LOKY_MAX_CPU_COUNT"] = "16"
+# 设置环境变量 (根据你的实际CPU核心数调整)
+os.environ["LOKY_MAX_CPU_COUNT"] = "32"  # 假设你使用的是32核CPU
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
 
+# --- 硬编码的最佳超参数 ---
+# 来自 AdaBoost 随机搜索的最佳参数
+ADA_BEST_PARAMS = {
+    'learning_rate': 0.4262213204002109,
+    'n_estimators': 393
+}
 
-def custom_score_func(y_true, y_proba):
-    """计算自定义的加权分数: 0.3 * Recall + 0.5 * AUC + 0.2 * Precision"""
-    y_pred = (y_proba >= 0.1).astype(int)
-    recall = recall_score(y_true, y_pred)
-    auc = roc_auc_score(y_true, y_proba)
-    precision = precision_score(y_true, y_pred)
-    final_score = 0.3 * recall + 0.5 * auc + 0.2 * precision
-    return final_score
+# 来自 XGBoost 随机搜索的最佳参数
+XGB_BEST_PARAMS = {
+    'colsample_bytree': 0.7123738038749523,
+    'learning_rate': 0.17280882494747454,
+    'max_depth': 11,
+    'n_estimators': 356,
+    'subsample': 0.9208787923016158
+}
 
-# 修复 v2: 修正函数签名以匹配 make_scorer(needs_proba=True) 的调用方式
-# make_scorer 当 needs_proba=True 时，会调用 scorer_func(y_true, y_proba, ...)
-def scorer_func(y_true, y_proba, **kwargs):
-    """适配 make_scorer(needs_proba=True) 的函数签名"""
-    # y_true 是真实的标签
-    # y_proba 是模型预测的概率 (对于二分类，通常是正类的概率)
-    # **kwargs 用于接收并忽略 scikit-learn 可能传递的其他参数
-    return custom_score_func(y_true, y_proba)
 
-# 使用 needs_proba=True 创建评分器
-custom_scorer = make_scorer(scorer_func, needs_proba=True)
+# --------------------------
 
 
 class InterIntraDistanceSelector:
@@ -88,69 +84,9 @@ class InterIntraDistanceSelector:
         return self.transform(X)
 
 
-class ImprovedKMeans:
-    def __init__(self, n_clusters=2, max_iter=300, tol=1e-4, random_state=None):
-        self.n_clusters = n_clusters
-        self.max_iter = max_iter
-        self.tol = tol
-        self.random_state = random_state
-        self.cluster_centers_ = None
-        self.labels_ = None
-
-    def fit(self, X, y=None):
-        X = np.asarray(X)
-        np.random.seed(self.random_state)
-
-        n_samples, n_features = X.shape
-        centers = []
-        centers.append(X[np.random.randint(n_samples)])
-
-        for _ in range(1, self.n_clusters):
-            distances = np.array([min([np.linalg.norm(x - c) ** 2 for c in centers]) for x in X])
-            probabilities = distances / distances.sum()
-            cumulative_probabilities = probabilities.cumsum()
-            r = np.random.rand()
-
-            for j, p in enumerate(cumulative_probabilities):
-                if r < p:
-                    centers.append(X[j])
-                    break
-        centers = np.array(centers)
-
-        for iteration in range(self.max_iter):
-            distances = cdist(X, centers, metric='euclidean')
-            labels = np.argmin(distances, axis=1)
-
-            new_centers = np.array([X[labels == i].mean(axis=0) for i in range(self.n_clusters)])
-
-            center_shift = np.linalg.norm(new_centers - centers)
-
-            centers = new_centers
-
-            if center_shift < self.tol:
-                print(f"K-means 收敛于第 {iteration + 1} 次迭代")
-                break
-        else:
-            print(f"K-means 达到最大迭代次数 {self.max_iter}")
-
-        self.cluster_centers_ = centers
-        self.labels_ = labels
-        return self
-
-    def predict(self, X):
-        if self.cluster_centers_ is None:
-            raise RuntimeError("KMeans has not been fitted yet.")
-        X = np.asarray(X)
-        distances = cdist(X, self.cluster_centers_, metric='euclidean')
-        return np.argmin(distances, axis=1)
-
-    def fit_predict(self, X, y=None):
-        self.fit(X, y)
-        return self.labels_
-
-
 class BrfSelector:
     """用于包装 Balanced Random Forest 选择的特征掩码的标准类"""
+
     def __init__(self, selected_features_mask):
         self.selected_features_ = selected_features_mask
 
@@ -158,38 +94,256 @@ class BrfSelector:
         return X[:, self.selected_features_]
 
 
-class CascadedModel:
-    def __init__(self, imputer, non_constant_features, selector, inter_intra_selector, brf_selector, kmeans, scaler, classifiers):
-        self.imputer = imputer
-        self.non_constant_features = non_constant_features
-        self.selector = selector
-        self.inter_intra_selector = inter_intra_selector
-        self.brf_selector = brf_selector
-        self.kmeans = kmeans
-        self.scaler = scaler
-        self.classifiers = classifiers
+def perform_grid_search(X_train_all, y_train_all, X_test, y_test, param_grid, cv_folds=3):
+    """
+    对 ADASYN 和特征选择器进行网格搜索。
+    """
+    print(f"[Grid Search] 开始网格搜索，参数网格: {param_grid}")
+    best_score = -np.inf
+    best_params = None
 
-    def _preprocess(self, X_raw):
-        X_arr = np.asarray(X_raw)
-        X_imp = self.imputer.transform(X_arr)
-        X_masked = X_imp[:, self.non_constant_features]
-        X_sel = self.selector.transform(X_masked)
-        X_inter_intra = self.inter_intra_selector.transform(X_sel)
-        X_brf_selected = self.brf_selector.transform(X_inter_intra)
-        X_scaled = self.scaler.transform(X_brf_selected)
-        return X_scaled
+    # --- 第一步：预处理 (在整个训练集上执行一次) ---
+    print("[Preprocessing] 执行初始预处理步骤...")
+    imputer = SimpleImputer(strategy="mean")
+    X_train_imp = imputer.fit_transform(X_train_all)
 
-    def predict(self, X_raw):
-        X_scaled = self._preprocess(X_raw)
-        preds = [clf.predict(X_scaled) for clf in self.classifiers]
-        final_pred = np.round(np.mean(preds, axis=0)).astype(int)
-        return final_pred.ravel()
+    std_devs = np.std(X_train_imp, axis=0)
+    non_constant_features = std_devs > 0
+    X_train_non_constant = X_train_imp[:, non_constant_features]
 
-    def predict_proba(self, X_raw):
-        X_scaled = self._preprocess(X_raw)
-        probas = [clf.predict_proba(X_scaled)[:, 1] for clf in self.classifiers]
-        final_proba = np.mean(probas, axis=0)
-        return np.column_stack([1 - final_proba, final_proba])
+    selector = VarianceThreshold()
+    X_train_selected = selector.fit_transform(X_train_non_constant)
+    print(f"[Preprocessing] 初始预处理完成。特征数: {X_train_selected.shape[1]}")
+
+    # --- 网格搜索主循环 ---
+    # 遍历 InterIntraDistanceSelector 的 threshold
+    for inter_intra_threshold in param_grid['inter_intra_threshold']:
+        print(f"\n[Grid Search] 尝试 InterIntraDistanceSelector.threshold = {inter_intra_threshold}")
+        inter_intra_selector = InterIntraDistanceSelector(threshold=inter_intra_threshold)
+        try:
+            X_train_inter_intra_selected = inter_intra_selector.fit_transform(X_train_selected, y_train_all)
+        except Exception as e:
+            print(f"[Grid Search] InterIntraDistanceSelector 失败 (threshold={inter_intra_threshold}): {e}")
+            continue
+
+        print(f"[Grid Search] InterIntraDistanceSelector 选择后特征数: {X_train_inter_intra_selected.shape[1]}")
+        if X_train_inter_intra_selected.shape[1] < 2:
+            print("[Grid Search] 特征数过少 (<2)，跳过此阈值。")
+            continue
+
+        # 遍历 ADASYN n_neighbors 和 BRF top_ratio
+        for n_neighbors in param_grid['adasyn_n_neighbors']:
+            for top_ratio in param_grid['brf_top_ratio']:
+                print(f"  -> 尝试 ADASYN.n_neighbors = {n_neighbors}, BRF top_ratio = {top_ratio}")
+
+                # --- 交叉验证 ---
+                skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=SEED)
+                fold_scores = []
+
+                for fold, (train_index, val_index) in enumerate(skf.split(X_train_inter_intra_selected, y_train_all)):
+                    # print(f"    -> Fold {fold+1}/{cv_folds}")
+
+                    X_fold_train = X_train_inter_intra_selected[train_index]
+                    y_fold_train = y_train_all[train_index]
+                    X_fold_val = X_train_inter_intra_selected[val_index]
+                    y_fold_val = y_train_all[val_index]
+
+                    # --- 特征选择 (BalancedRandomForest) ---
+                    try:
+                        brf = BalancedRandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
+                        brf.fit(X_fold_train, y_fold_train)
+                        feature_importances = brf.feature_importances_
+                        num_features_to_select = max(1, int(top_ratio * X_fold_train.shape[1]))
+                        sorted_indices = np.argsort(feature_importances)[::-1]
+                        top_indices = sorted_indices[:num_features_to_select]
+                        brf_selected_features_mask = np.zeros(X_fold_train.shape[1], dtype=bool)
+                        brf_selected_features_mask[top_indices] = True
+                        brf_selector = BrfSelector(brf_selected_features_mask)
+
+                        X_fold_train_brf = brf_selector.transform(X_fold_train)
+                        X_fold_val_brf = brf_selector.transform(X_fold_val)
+                    except Exception as e:
+                        # print(f"      -> BRF 特征选择失败: {e}")
+                        fold_scores.append(0)  # 或者跳过此 fold
+                        continue
+
+                    # --- 标准化 ---
+                    try:
+                        scaler = StandardScaler()
+                        X_fold_train_scaled = scaler.fit_transform(X_fold_train_brf)
+                        X_fold_val_scaled = scaler.transform(X_fold_val_brf)
+                    except Exception as e:
+                        # print(f"      -> 标准化失败: {e}")
+                        fold_scores.append(0)
+                        continue
+
+                    # --- 过采样 (ADASYN) ---
+                    try:
+                        adasyn = ADASYN(random_state=SEED, n_neighbors=n_neighbors)
+                        X_fold_resampled_scaled, y_fold_resampled = adasyn.fit_resample(X_fold_train_scaled,
+                                                                                        y_fold_train)
+                    except Exception as e:
+                        # print(f"      -> ADASYN 过采样失败: {e}")
+                        fold_scores.append(0)
+                        continue
+
+                    # --- 模型训练与预测 ---
+                    try:
+                        # AdaBoost
+                        adaboost = AdaBoostClassifier(
+                            n_estimators=ADA_BEST_PARAMS['n_estimators'],
+                            learning_rate=ADA_BEST_PARAMS['learning_rate'],
+                            random_state=SEED
+                        )
+                        adaboost.fit(X_fold_resampled_scaled, y_fold_resampled)
+                        y_proba_adaboost = adaboost.predict_proba(X_fold_val_scaled)[:, 1]
+
+                        # XGBoost
+                        xgboost = XGBClassifier(
+                            n_estimators=XGB_BEST_PARAMS['n_estimators'],
+                            max_depth=XGB_BEST_PARAMS['max_depth'],
+                            learning_rate=XGB_BEST_PARAMS['learning_rate'],
+                            subsample=XGB_BEST_PARAMS['subsample'],
+                            colsample_bytree=XGB_BEST_PARAMS['colsample_bytree'],
+                            random_state=SEED,
+                            n_jobs=-1,
+                            eval_metric='logloss'
+                        )
+                        xgboost.fit(X_fold_resampled_scaled, y_fold_resampled)
+                        y_proba_xgboost = xgboost.predict_proba(X_fold_val_scaled)[:, 1]
+
+                        # 平均概率
+                        y_proba_fold = (y_proba_adaboost + y_proba_xgboost) / 2
+
+                        # 计算 AUC
+                        fold_auc = roc_auc_score(y_fold_val, y_proba_fold)
+                        fold_scores.append(fold_auc)
+                        # print(f"      -> Fold {fold+1} AUC: {fold_auc:.4f}")
+
+                    except Exception as e:
+                        # print(f"      -> 模型训练或预测失败: {e}")
+                        fold_scores.append(0)
+                        continue
+
+                # --- 计算平均得分 ---
+                if fold_scores:
+                    avg_score = np.mean(fold_scores)
+                    print(f"  -> 平均 AUC (CV): {avg_score:.6f}")
+                else:
+                    avg_score = -np.inf
+                    print(f"  -> 所有 folds 失败，平均 AUC: {avg_score}")
+
+                # --- 更新最佳参数 ---
+                if avg_score > best_score:
+                    best_score = avg_score
+                    best_params = {
+                        'inter_intra_threshold': inter_intra_threshold,
+                        'adasyn_n_neighbors': n_neighbors,
+                        'brf_top_ratio': top_ratio
+                    }
+                    print(f"  -> [New Best] AUC: {best_score:.6f}, Params: {best_params}")
+
+    print(f"\n[Grid Search] 网格搜索完成。")
+    print(f"[Grid Search] 最佳 AUC (CV): {best_score:.6f}")
+    print(f"[Grid Search] 最佳参数: {best_params}")
+
+    # --- 使用最佳参数在完整训练集上训练并评估 ---
+    if best_params:
+        print(f"\n[Evaluation] 使用最佳参数在完整训练集上训练最终模型并评估...")
+        final_auc, final_recall, final_precision, final_score = evaluate_with_best_params(
+            X_train_all, y_train_all, X_test, y_test, best_params, imputer, non_constant_features, selector
+        )
+        print(f"\n[Final Evaluation] 测试集结果:")
+        print(f"Recall: {final_recall:.6f}")
+        print(f"AUC: {final_auc:.6f}")
+        print(f"Precision: {final_precision:.6f}")
+        print(f"Final Score: {final_score:.4f}")
+
+    return best_params, best_score
+
+
+def evaluate_with_best_params(X_train_all, y_train_all, X_test, y_test, best_params, imputer, non_constant_features,
+                              selector):
+    """
+    使用最佳参数在完整训练集上训练模型，并在测试集上评估。
+    """
+    # --- 1. 应用初始预处理 ---
+    X_train_imp = imputer.transform(X_train_all)
+    X_train_non_constant = X_train_imp[:, non_constant_features]
+    X_train_selected = selector.transform(X_train_non_constant)
+
+    X_test_imp = imputer.transform(X_test)
+    X_test_non_constant = X_test_imp[:, non_constant_features]
+    X_test_selected = selector.transform(X_test_non_constant)
+
+    # --- 2. 应用 InterIntraDistanceSelector ---
+    inter_intra_selector = InterIntraDistanceSelector(threshold=best_params['inter_intra_threshold'])
+    X_train_inter_intra_selected = inter_intra_selector.fit_transform(X_train_selected, y_train_all)
+    X_test_inter_intra_selected = inter_intra_selector.transform(X_test_selected)
+
+    # --- 3. 应用 BalancedRandomForest 特征选择 ---
+    brf = BalancedRandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
+    brf.fit(X_train_inter_intra_selected, y_train_all)
+    feature_importances = brf.feature_importances_
+    num_features_to_select = max(1, int(best_params['brf_top_ratio'] * X_train_inter_intra_selected.shape[1]))
+    sorted_indices = np.argsort(feature_importances)[::-1]
+    top_indices = sorted_indices[:num_features_to_select]
+    brf_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
+    brf_selected_features_mask[top_indices] = True
+    brf_selector = BrfSelector(brf_selected_features_mask)
+
+    X_train_brf_selected = brf_selector.transform(X_train_inter_intra_selected)
+    X_test_brf_selected = brf_selector.transform(X_test_inter_intra_selected)
+
+    # --- 4. 标准化 ---
+    scaler = StandardScaler()
+    X_train_brf_selected_scaled = scaler.fit_transform(X_train_brf_selected)
+    X_test_scaled = scaler.transform(X_test_brf_selected)
+
+    # --- 5. 过采样 (ADASYN) ---
+    adasyn = ADASYN(random_state=SEED, n_neighbors=best_params['adasyn_n_neighbors'])
+    X_resampled_scaled, y_resampled = adasyn.fit_resample(X_train_brf_selected_scaled, y_train_all)
+
+    # --- 6. 模型训练 ---
+    adaboost = AdaBoostClassifier(
+        n_estimators=ADA_BEST_PARAMS['n_estimators'],
+        learning_rate=ADA_BEST_PARAMS['learning_rate'],
+        random_state=SEED
+    )
+    adaboost.fit(X_resampled_scaled, y_resampled)
+
+    xgboost = XGBClassifier(
+        n_estimators=XGB_BEST_PARAMS['n_estimators'],
+        max_depth=XGB_BEST_PARAMS['max_depth'],
+        learning_rate=XGB_BEST_PARAMS['learning_rate'],
+        subsample=XGB_BEST_PARAMS['subsample'],
+        colsample_bytree=XGB_BEST_PARAMS['colsample_bytree'],
+        random_state=SEED,
+        n_jobs=-1,
+        eval_metric='logloss'
+    )
+    xgboost.fit(X_resampled_scaled, y_resampled)
+
+    # --- 7. 测试集预测与评估 ---
+    y_proba_adaboost = adaboost.predict_proba(X_test_scaled)[:, 1]
+    y_proba_xgboost = xgboost.predict_proba(X_test_scaled)[:, 1]
+    y_proba = (y_proba_adaboost + y_proba_xgboost) / 2
+    y_pred = (y_proba >= 0.15).astype(int)  # 使用您原始代码中的阈值
+
+    recall = recall_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_proba)
+    precision = precision_score(y_test, y_pred)
+    final_score = 100 * (0.3 * recall + 0.5 * auc + 0.2 * precision)
+
+    # --- 8. 保存模型 (可选) ---
+    # 这里可以添加保存最终模型的代码，类似于原始 main 函数中的 joblib.dump 部分
+    # 例如:
+    # joblib.dump(imputer, "best_imputer.pkl")
+    # joblib.dump(selector, "best_variance_threshold_selector.pkl")
+    # ... 为所有组件保存带有 'best_' 前缀的文件
+    # print("\n[Model Saving] 最佳模型和预处理器已保存。")
+
+    return auc, recall, precision, final_score
 
 
 def main():
@@ -202,6 +356,10 @@ def main():
     else:
         print("CUDA 不可用，将使用 CPU 训练。")
 
+    # 打印并行设置
+    print(f"设置 LOKY_MAX_CPU_COUNT 为: {os.environ.get('LOKY_MAX_CPU_COUNT', '未设置')}")
+
+    # --- 数据加载 ---
     data = pd.read_csv("clean.csv")
     if "company_id" in data.columns:
         data = data.drop(columns=["company_id"])
@@ -218,149 +376,23 @@ def main():
         y = y[mask]
         print(f"移除 NaN 后，数据集大小: X={X.shape}, y={y.shape}")
 
+    # --- 数据划分 ---
     X_train_all, X_test, y_train_all, y_test = train_test_split(X, y, test_size=0.1, random_state=SEED, stratify=y)
+    print(f"数据集划分完成: 训练集 {X_train_all.shape}, 测试集 {X_test.shape}")
 
-    imputer = SimpleImputer(strategy="mean")
-    X_train_imp = imputer.fit_transform(X_train_all)
-
-    std_devs = np.std(X_train_imp, axis=0)
-    non_constant_features = std_devs > 0
-    X_train_non_constant = X_train_imp[:, non_constant_features]
-
-    selector = VarianceThreshold()
-    X_train_selected = selector.fit_transform(X_train_non_constant)
-
-    inter_intra_selector = InterIntraDistanceSelector(threshold=0.001)
-    X_train_inter_intra_selected = inter_intra_selector.fit_transform(X_train_selected, y_train_all)
-    print(f"[Feature Selection] 原始特征数: {X_train_selected.shape[1]}, 选择后特征数 (类间类内): {X_train_inter_intra_selected.shape[1]}")
-
-    print("[Feature Selection] 训练 Balanced Random Forest 以获取特征重要性...")
-    brf = BalancedRandomForestClassifier(n_estimators=100, random_state=SEED, n_jobs=-1)
-    brf.fit(X_train_inter_intra_selected, y_train_all)
-
-    feature_importances = brf.feature_importances_
-    num_features_to_select = max(1, int(0.8 * X_train_inter_intra_selected.shape[1]))
-    sorted_indices = np.argsort(feature_importances)[::-1]
-    top_indices = sorted_indices[:num_features_to_select]
-    brf_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
-    brf_selected_features_mask[top_indices] = True
-
-    X_train_brf_selected = X_train_inter_intra_selected[:, brf_selected_features_mask]
-    print(f"[Feature Selection] 类间类内选择后特征数: {X_train_inter_intra_selected.shape[1]}, BRF 选择后特征数: {X_train_brf_selected.shape[1]}")
-
-    brf_selector = BrfSelector(brf_selected_features_mask)
-
-    kmeans = ImprovedKMeans(n_clusters=2, random_state=SEED)
-    cluster_labels = kmeans.fit_predict(X_train_brf_selected)
-    print(f"[KMeans] 聚类中心:\n{kmeans.cluster_centers_}")
-
-    pre_scaler = StandardScaler()
-    X_train_brf_selected_scaled = pre_scaler.fit_transform(X_train_brf_selected)
-    scaler = pre_scaler
-
-    adasyn = ADASYN(random_state=SEED, n_neighbors=5)
-    X_resampled_scaled, y_resampled = adasyn.fit_resample(X_train_brf_selected_scaled, y_train_all)
-
-    print("[Hyperparameter Tuning] 开始随机搜索超参数...")
-
-    print("[Hyperparameter Tuning] 调优 AdaBoost...")
-    ada_param_dist = {
-        'n_estimators': randint(100, 500),
-        'learning_rate': uniform(0.01, 0.5),
+    # --- 定义参数网格 ---
+    param_grid = {
+        'inter_intra_threshold': [0.0001, 0.001, 0.0005],  # 示例网格，可根据需要调整
+        'adasyn_n_neighbors': [3, 5, 7],  # 示例网格，可根据需要调整
+        'brf_top_ratio': [0.7, 0.8, 0.9]  # 选择 60%, 80%, 100% 的特征
     }
-    ada_base = AdaBoostClassifier(random_state=SEED)
-    ada_search = RandomizedSearchCV(
-        estimator=ada_base,
-        param_distributions=ada_param_dist,
-        n_iter=20,
-        scoring=custom_scorer, # 使用修复后的自定义评分器
-        cv=3,
-        n_jobs=-1,
-        random_state=SEED,
-        verbose=1
-    )
-    ada_search.fit(X_resampled_scaled, y_resampled)
-    best_adaboost = ada_search.best_estimator_
-    print(f"[Hyperparameter Tuning] AdaBoost 最佳参数: {ada_search.best_params_}")
-    print(f"[Hyperparameter Tuning] AdaBoost 最佳分数: {ada_search.best_score_:.4f}")
 
-    print("[Hyperparameter Tuning] 调优 XGBoost...")
-    xgb_param_dist = {
-        'n_estimators': randint(200, 600),
-        'max_depth': randint(3, 12),
-        'learning_rate': uniform(0.01, 0.3),
-        'subsample': uniform(0.6, 0.4),
-        'colsample_bytree': uniform(0.6, 0.4),
-    }
-    xgb_base = XGBClassifier(random_state=SEED, n_jobs=-1, eval_metric='logloss')
-    xgb_search = RandomizedSearchCV(
-        estimator=xgb_base,
-        param_distributions=xgb_param_dist,
-        n_iter=30,
-        scoring=custom_scorer, # 使用修复后的自定义评分器
-        cv=3,
-        n_jobs=-1,
-        random_state=SEED,
-        verbose=1
-    )
-    xgb_search.fit(X_resampled_scaled, y_resampled)
-    best_xgboost = xgb_search.best_estimator_
-    print(f"[Hyperparameter Tuning] XGBoost 最佳参数: {xgb_search.best_params_}")
-    print(f"[Hyperparameter Tuning] XGBoost 最佳分数: {xgb_search.best_score_:.4f}")
-
-    adaboost = best_adaboost
-    xgboost = best_xgboost
-
-    X_test_imp = imputer.transform(X_test)
-    X_test_non_constant = X_test_imp[:, non_constant_features]
-    X_test_selected = selector.transform(X_test_non_constant)
-    X_test_inter_intra_selected = inter_intra_selector.transform(X_test_selected)
-    X_test_brf_selected = brf_selector.transform(X_test_inter_intra_selected)
-    X_test_scaled = scaler.transform(X_test_brf_selected)
-
-    y_proba_adaboost = adaboost.predict_proba(X_test_scaled)[:, 1]
-    y_proba_xgboost = xgboost.predict_proba(X_test_scaled)[:, 1]
-
-    y_proba = (y_proba_adaboost + y_proba_xgboost) / 2
-    y_pred = (y_proba >= 0.2).astype(int)
-
-    recall = recall_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_proba)
-    precision = precision_score(y_test, y_pred)
-    final_score = 100 * (0.3 * recall + 0.5 * auc + 0.2 * precision)
-
-    print(f"Recall: {recall:.6f}")
-    print(f"AUC: {auc:.6f}")
-    print(f"Precision: {precision:.6f}")
-    print(f"Final Score: {final_score:.4f}")
-
-    cascaded = CascadedModel(
-        imputer=imputer,
-        non_constant_features=non_constant_features,
-        selector=selector,
-        inter_intra_selector=inter_intra_selector,
-        brf_selector=brf_selector,
-        kmeans=kmeans,
-        scaler=scaler,
-        classifiers=[adaboost, xgboost]
-    )
-
-    joblib.dump(cascaded, "best_cascaded_model.pkl")
-    joblib.dump(imputer, "imputer.pkl")
-    joblib.dump(selector, "variance_threshold_selector.pkl")
-    joblib.dump(inter_intra_selector, "inter_intra_distance_selector.pkl")
-    joblib.dump(brf_selector, "brf_selector.pkl")
-    joblib.dump(kmeans, "kmeans_model.pkl")
-    joblib.dump(non_constant_features, "non_constant_features.pkl")
-    joblib.dump(scaler, "scaler.pkl")
-    joblib.dump(adasyn, "adasyn_sampler.pkl")
-    joblib.dump(adaboost, "adaboost.pkl")
-    joblib.dump(xgboost, "xgboost.pkl")
-
-    print("模型和预处理器已保存。")
-    print("[Final Model] 模型训练完成 (未使用深度网络和 GPU)，已进行超参数调优")
-
+    # --- 执行网格搜索 ---
+    best_params, best_score = perform_grid_search(X_train_all, y_train_all, X_test, y_test, param_grid, cv_folds=3)
 
 
 if __name__ == "__main__":
     main()
+
+
+
