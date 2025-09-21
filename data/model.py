@@ -35,9 +35,9 @@ class XGBRFE_FeatureSelector:
 
     def fit(self, X, y):
         xgb = XGBClassifier(
-            n_estimators=150,
-            max_depth=7,
-            learning_rate=0.1,
+            n_estimators=700,
+            max_depth=15,
+            learning_rate=0.001,
             subsample=0.8,
             colsample_bytree=0.8,
             random_state=SEED,
@@ -89,9 +89,9 @@ class TwoStageEnsemble:
         print("\n[Stage 2] 训练初级模型...")
         # XGBoost模型（优化AUC）
         self.xgb_model = XGBClassifier(
-            n_estimators=500,
-            max_depth=9,
-            learning_rate=0.1,
+            n_estimators=356,
+            max_depth=11,
+            learning_rate=0.172808,
             subsample=0.8,
             colsample_bytree=0.8,
             scale_pos_weight=len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1]),
@@ -103,8 +103,8 @@ class TwoStageEnsemble:
 
         # AdaBoost模型（优化召回率）
         self.ada_model = AdaBoostClassifier(
-            n_estimators=200,
-            learning_rate=0.5,
+            n_estimators=393,
+            learning_rate=0.4262,
             random_state=SEED
         )
         self.ada_model.fit(X_resampled, y_resampled)
@@ -118,7 +118,7 @@ class TwoStageEnsemble:
         # 第三阶段：训练CatBoost最终模型
         print("\n[Stage 4] 训练CatBoost最终模型...")
         self.cat_model = CatBoostClassifier(
-            iterations=1000,
+            iterations=500,
             depth=8,
             learning_rate=0.05,
             loss_function='Logloss',
@@ -163,7 +163,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
 
     # 动态选择最佳阈值（基于验证集）
     X_train_final, X_val, y_train_final, y_val = train_test_split(
-        X_train_processed, y_train, test_size=0.2, random_state=SEED, stratify=y_train
+        X_train_processed, y_train, test_size=0.05, random_state=SEED, stratify=y_train
     )
 
     # 在验证集上寻找最佳阈值
