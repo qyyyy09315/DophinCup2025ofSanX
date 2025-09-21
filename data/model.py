@@ -5,297 +5,306 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import VarianceThreshold
-# 从 combine 模块导入 SMOTETomek
-from imblearn.combine import SMOTETomek # 或者 from imblearn.combine import SMOTEENN
+from sklearn.feature_selection import RFE
+from imblearn.combine import SMOTETomek
 from sklearn.ensemble import AdaBoostClassifier
 from xgboost import XGBClassifier
-from catboost import CatBoostClassifier # 导入 CatBoost
-from sklearn.metrics import recall_score, precision_score, roc_auc_score
-from sklearn.model_selection import train_test_split
-# 导入 LightGBM
-import lightgbm as lgb
+from catboost import CatBoostClassifier
+from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
+from sklearn.pipeline import Pipeline
+import warnings
 
-# 设置环境变量 (根据你的实际CPU核心数调整)
-os.environ["LOKY_MAX_CPU_COUNT"] = "32"  # 假设你使用的是32核CPU
+warnings.filterwarnings('ignore')
+
+# 环境配置
+os.environ["LOKY_MAX_CPU_COUNT"] = "32"
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
 
-# --- 硬编码的最佳超参数 (保留用于模型初始化，但不再进行网格搜索) ---
-ADA_BEST_PARAMS = {
-    'learning_rate': 0.4262213204002109,
-    'n_estimators': 393
-}
 
-XGB_BEST_PARAMS = {
-    'colsample_bytree': 0.7123738038749523,
-    'learning_rate': 0.17280882494747454,
-    'max_depth': 11,
-    'n_estimators': 356,
-    'subsample': 0.9208787923016158
-}
+class ProbabilityCalibrator:
+    """Isotonic Regression概率校准器"""
 
-# --- 固定的预处理和模型参数 ---
-FIXED_PARAMS = {
-    'inter_intra_threshold': 0.0005,  # 固定 InterIntraDistanceSelector 阈值
-    # 'adasyn_n_neighbors': 5,         # 移除 ADASYN 参数
-    'lgb_top_ratio': 0.8            # 固定 LightGBM 选择特征比例
-}
+    def __init__(self):
+        self.calibrator = IsotonicRegression(out_of_bounds='clip')
 
-# --- 显式指定的最终分类概率阈值 ---
-FINAL_PROBABILITY_THRESHOLD = 0.2
+    def fit(self, y_prob, y_true):
+        self.calibrator.fit(y_prob, y_true)
+        return self
 
-# --------------------------
+    def calibrate(self, y_prob):
+        return self.calibrator.transform(y_prob)
 
 
-class InterIntraDistanceSelector:
-    def __init__(self, threshold=0.5):
-        self.threshold = threshold
-        self.selected_features_ = None
+class XGBRFE_FeatureSelector:
+    """基于XGBoost的RFE特征选择器"""
+
+    def __init__(self, n_features=None, step=0.1):
+        self.n_features = n_features
+        self.step = step
+        self.selector = None
+        self.feature_mask_ = None
 
     def fit(self, X, y):
-        X = np.asarray(X)
-        y = np.asarray(y)
-        classes = np.unique(y)
+        xgb = XGBClassifier(
+            n_estimators=150,
+            max_depth=7,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=SEED,
+            n_jobs=-1
+        )
 
-        if len(classes) != 2:
-            raise ValueError("目前只支持二分类任务")
+        if self.n_features is None:
+            self.n_features = X.shape[1] // 2
 
-        class_0_indices = (y == classes[0])
-        class_1_indices = (y == classes[1])
-        X_0 = X[class_0_indices]
-        X_1 = X[class_1_indices]
-
-        intra_class_var_0 = np.var(X_0, axis=0)
-        intra_class_var_1 = np.var(X_1, axis=0)
-        intra_class_variance_sum = intra_class_var_0 + intra_class_var_1
-
-        mean_0 = np.mean(X_0, axis=0)
-        mean_1 = np.mean(X_1, axis=0)
-        inter_class_distance_sq = (mean_1 - mean_0) ** 2
-
-        scores = np.divide(inter_class_distance_sq, intra_class_variance_sum,
-                           out=np.zeros_like(inter_class_distance_sq),
-                           where=intra_class_variance_sum != 0)
-
-        self.selected_features_ = scores > self.threshold
+        self.selector = RFE(
+            estimator=xgb,
+            n_features_to_select=self.n_features,
+            step=self.step,
+            verbose=1
+        )
+        self.selector.fit(X, y)
+        self.feature_mask_ = self.selector.support_
         return self
 
     def transform(self, X):
-        if self.selected_features_ is None:
-            raise RuntimeError("Selector has not been fitted yet.")
-        return X[:, self.selected_features_]
+        return self.selector.transform(X)
 
-    def fit_transform(self, X, y):
-        self.fit(X, y)
-        return self.transform(X)
+    def get_feature_mask(self):
+        return self.feature_mask_
 
 
-class FeatureSelector: # 重命名类以反映通用性
-    """用于包装特征选择掩码的标准类"""
+class ModelStacker:
+    """Stacking集成学习器"""
 
-    def __init__(self, selected_features_mask):
-        self.selected_features_ = selected_features_mask
+    def __init__(self, base_models, meta_model, n_folds=5):
+        self.base_models = base_models
+        self.meta_model = meta_model
+        self.n_folds = n_folds
+        self.calibrators = {}
 
-    def transform(self, X):
-        return X[:, self.selected_features_]
+    def fit_base_models(self, X, y):
+        """训练基模型并生成元特征"""
+        kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=SEED)
+        meta_features = np.zeros((X.shape[0], len(self.base_models)))
+
+        print("\n[Stacking] 生成交叉验证元特征...")
+        for i, (train_idx, val_idx) in enumerate(kf.split(X)):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train = y[train_idx]
+
+            for j, (name, model) in enumerate(self.base_models.items()):
+                model.fit(X_train, y_train)
+                meta_features[val_idx, j] = model.predict_proba(X_val)[:, 1]
+
+        # 完整训练基模型
+        print("[Stacking] 完整训练基模型...")
+        for name, model in self.base_models.items():
+            model.fit(X, y)
+
+        return meta_features
+
+    def calibrate_probabilities(self, X, y, test_size=0.2):
+        """训练概率校准器"""
+        print("\n[Calibration] 训练概率校准器...")
+        X_train, X_cal, y_train, y_cal = train_test_split(
+            X, y, test_size=test_size, random_state=SEED
+        )
+
+        # 训练基模型在校准集上的预测
+        cal_probs = np.zeros((X_cal.shape[0], len(self.base_models)))
+        for j, (name, model) in enumerate(self.base_models.items()):
+            model.fit(X_train, y_train)
+            cal_probs[:, j] = model.predict_proba(X_cal)[:, 1]
+
+        # 训练元模型在校准集上的预测
+        self.meta_model.fit(
+            self.fit_base_models(X_train, y_train),
+            y_train
+        )
+        meta_probs = self.meta_model.predict_proba(cal_probs)[:, 1]
+
+        # 训练校准器
+        self.calibrator = ProbabilityCalibrator()
+        self.calibrator.fit(meta_probs, y_cal)
+
+    def predict_proba(self, X):
+        """生成校准后的概率预测"""
+        # 基模型预测
+        base_preds = np.column_stack([
+            model.predict_proba(X)[:, 1]
+            for name, model in self.base_models.items()
+        ])
+
+        # 元模型预测
+        meta_preds = self.meta_model.predict_proba(base_preds)[:, 1]
+
+        # 概率校准
+        if hasattr(self, 'calibrator'):
+            return self.calibrator.calibrate(meta_preds)
+        return meta_preds
 
 
-def train_and_evaluate_fixed_params(X_train_all, y_train_all, X_test, y_test):
-    """
-    使用固定参数进行数据预处理、特征选择、模型训练和评估。
-    """
-    print("[Process] 开始使用固定参数进行处理和评估...")
+def train_and_evaluate_optimized(X_train, y_train, X_test, y_test):
+    """优化后的训练评估流程"""
+    print("\n=== 数据预处理 ===")
+    # 1. 缺失值填充和标准化
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler())
+    ])
+    X_train_processed = pipeline.fit_transform(X_train)
+    X_test_processed = pipeline.transform(X_test)
 
-    # --- 1. 初始预处理 (在整个训练集上执行) ---
-    print("[Preprocessing] 执行初始预处理步骤...")
-    imputer = SimpleImputer(strategy="mean")
-    X_train_imp = imputer.fit_transform(X_train_all)
+    # 2. 特征选择
+    print("\n=== 特征选择 ===")
+    feature_selector = XGBRFE_FeatureSelector(n_features=None, step=0.1)
+    X_train_selected = feature_selector.fit(X_train_processed, y_train).transform(X_train_processed)
+    X_test_selected = feature_selector.transform(X_test_processed)
+    print(f"特征选择完成: {X_train_selected.shape[1]}个特征被保留")
 
-    std_devs = np.std(X_train_imp, axis=0)
-    non_constant_features = std_devs > 0
-    X_train_non_constant = X_train_imp[:, non_constant_features]
-
-    selector = VarianceThreshold()
-    X_train_selected = selector.fit_transform(X_train_non_constant)
-    print(f"[Preprocessing] 初始预处理完成。特征数: {X_train_selected.shape[1]}")
-
-    # --- 2. 应用 InterIntraDistanceSelector (使用固定参数) ---
-    print(f"[Feature Selection] 应用 InterIntraDistanceSelector (threshold={FIXED_PARAMS['inter_intra_threshold']})...")
-    inter_intra_selector = InterIntraDistanceSelector(threshold=FIXED_PARAMS['inter_intra_threshold'])
-    X_train_inter_intra_selected = inter_intra_selector.fit_transform(X_train_selected, y_train_all)
-    print(f"[Feature Selection] InterIntraDistanceSelector 选择后特征数: {X_train_inter_intra_selected.shape[1]}")
-
-    if X_train_inter_intra_selected.shape[1] < 2:
-        raise ValueError("InterIntraDistanceSelector 选择的特征数过少 (<2)，无法继续。")
-
-    # --- 3. 应用 LightGBM 特征选择 (使用固定参数) ---
-    print(f"[Feature Selection] 应用 LightGBM 特征选择 (top_ratio={FIXED_PARAMS['lgb_top_ratio']})...")
-    # 使用 LightGBM 进行特征重要性评估
-    lgb_model = lgb.LGBMClassifier(
-        n_estimators=500,
-        random_state=SEED,
-        verbose=-1, # 静默训练
-        max_depth=10
-    )
-    lgb_model.fit(X_train_inter_intra_selected, y_train_all)
-    feature_importances = lgb_model.feature_importances_
-    num_features_to_select = max(1, int(FIXED_PARAMS['lgb_top_ratio'] * X_train_inter_intra_selected.shape[1]))
-    sorted_indices = np.argsort(feature_importances)[::-1]
-    top_indices = sorted_indices[:num_features_to_select]
-    lgb_selected_features_mask = np.zeros(X_train_inter_intra_selected.shape[1], dtype=bool)
-    lgb_selected_features_mask[top_indices] = True
-    # 使用通用的 FeatureSelector 类
-    feature_selector = FeatureSelector(lgb_selected_features_mask)
-
-    X_train_lgb_selected = feature_selector.transform(X_train_inter_intra_selected)
-    print(f"[Feature Selection] LightGBM 选择后特征数: {X_train_lgb_selected.shape[1]}")
-
-    # --- 4. 标准化 ---
-    print("[Preprocessing] 标准化特征...")
-    scaler = StandardScaler()
-    X_train_lgb_selected_scaled = scaler.fit_transform(X_train_lgb_selected)
-
-    # --- 5. 过采样 (SMOTETomek) ---
-    print(f"[Resampling] 应用 SMOTETomek 过采样...")
-    # 使用 SMOTETomek 进行过采样和欠采样
+    # 3. 处理类别不平衡
+    print("\n=== 处理类别不平衡 ===")
     smote_tomek = SMOTETomek(random_state=SEED)
-    X_resampled_scaled, y_resampled = smote_tomek.fit_resample(X_train_lgb_selected_scaled, y_train_all)
-    print(f"[Resampling] SMOTETomek 采样后样本数: {X_resampled_scaled.shape[0]}")
+    X_resampled, y_resampled = smote_tomek.fit_resample(X_train_selected, y_train)
+    print(f"过采样后数据形状: {X_resampled.shape}")
 
-    # --- 6. 模型训练 ---
-    print("[Training] 训练 AdaBoost 模型...")
-    adaboost = AdaBoostClassifier(
-        n_estimators=ADA_BEST_PARAMS['n_estimators'],
-        learning_rate=ADA_BEST_PARAMS['learning_rate'],
-        random_state=SEED
-    )
-    adaboost.fit(X_resampled_scaled, y_resampled)
+    # 4. 定义基模型
+    base_models = {
+        'AdaBoost': AdaBoostClassifier(
+            n_estimators=393,
+            learning_rate=0.426,
+            random_state=SEED
+        ),
+        'XGBoost': XGBClassifier(
+            n_estimators=356,
+            max_depth=11,
+            learning_rate=0.173,
+            subsample=0.92,
+            colsample_bytree=0.712,
+            random_state=SEED,
+            n_jobs=-1
+        ),
+        'CatBoost': CatBoostClassifier(
+            iterations=500,
+            depth=13,
+            learning_rate=0.8,
+            random_seed=SEED,
+            verbose=0
+        )
+    }
 
-    print("[Training] 训练 XGBoost 模型...")
-    xgboost = XGBClassifier(
-        n_estimators=XGB_BEST_PARAMS['n_estimators'],
-        max_depth=XGB_BEST_PARAMS['max_depth'],
-        learning_rate=XGB_BEST_PARAMS['learning_rate'],
-        subsample=XGB_BEST_PARAMS['subsample'],
-        colsample_bytree=XGB_BEST_PARAMS['colsample_bytree'],
+    # 5. 定义元模型
+    meta_model = LogisticRegression(
+        penalty='l2',
+        C=0.1,
         random_state=SEED,
-        n_jobs=-1,
-        eval_metric='logloss'
+        max_iter=1000
     )
-    xgboost.fit(X_resampled_scaled, y_resampled)
 
-    print("[Training] 训练 CatBoost 模型...")
-    # CatBoost 通常能很好地处理类别特征和不平衡数据，这里使用一些基础调优参数
-    catboost = CatBoostClassifier(
-        iterations=500, # 可根据需要调整
-        depth=13,       # 可根据需要调整
-        learning_rate=0.8, # 可根据需要调整
-        loss_function='Logloss',
-        eval_metric='Precision',
-        random_seed=SEED,
-        verbose=0 # 设置为 0 以避免训练过程中的大量输出
-    )
-    catboost.fit(X_resampled_scaled, y_resampled, silent=True) # silent=True 也用于抑制输出
+    # 6. 训练Stacking集成模型
+    print("\n=== 训练Stacking模型 ===")
+    stacker = ModelStacker(base_models, meta_model, n_folds=5)
+    stacker.fit_base_models(X_resampled, y_resampled)
+    stacker.calibrate_probabilities(X_resampled, y_resampled, test_size=0.2)
 
+    # 7. 测试集预测
+    print("\n=== 测试集评估 ===")
+    y_proba = stacker.predict_proba(X_test_selected)
 
-    # --- 7. 测试集预处理 ---
-    print("[Evaluation] 对测试集应用相同的预处理步骤...")
-    # 应用初始预处理
-    X_test_imp = imputer.transform(X_test)
-    X_test_non_constant = X_test_imp[:, non_constant_features]
-    X_test_selected = selector.transform(X_test_non_constant)
+    # 8. 动态阈值选择 (基于验证集)
+    thresholds = np.linspace(0.1, 0.5, 20)
+    best_score = -1
+    best_thresh = 0.2
 
-    # 应用 InterIntraDistanceSelector
-    X_test_inter_intra_selected = inter_intra_selector.transform(X_test_selected)
+    for thresh in thresholds:
+        y_pred = (y_proba >= thresh).astype(int)
+        score = 0.3 * recall_score(y_test, y_pred) + 0.5 * roc_auc_score(y_test, y_proba) + 0.2 * precision_score(
+            y_test, y_pred)
+        if score > best_score:
+            best_score = score
+            best_thresh = thresh
 
-    # 应用 LightGBM 特征选择
-    X_test_lgb_selected = feature_selector.transform(X_test_inter_intra_selected)
+    y_pred = (y_proba >= best_thresh).astype(int)
 
-    # 标准化
-    X_test_scaled = scaler.transform(X_test_lgb_selected)
-
-    # --- 8. 测试集预测 ---
-    print("[Evaluation] 在测试集上进行预测...")
-    y_proba_adaboost = adaboost.predict_proba(X_test_scaled)[:, 1]
-    y_proba_xgboost = xgboost.predict_proba(X_test_scaled)[:, 1]
-    y_proba_catboost = catboost.predict_proba(X_test_scaled)[:, 1]
-
-    # --- 9. 集成概率 (平均三个模型的概率) ---
-    print("[Evaluation] 集成三个模型的预测概率...")
-    y_proba = (y_proba_adaboost + y_proba_xgboost + y_proba_catboost) / 3
-
-    # --- 10. 使用显式指定的阈值进行分类 ---
-    print(f"[Evaluation] 使用阈值 {FINAL_PROBABILITY_THRESHOLD} 进行最终分类...")
-    y_pred = (y_proba >= FINAL_PROBABILITY_THRESHOLD).astype(int)
-
-    # --- 11. 评估 ---
-    print("[Evaluation] 计算测试集评估指标...")
+    # 9. 评估指标
     recall = recall_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_proba)
-    precision = precision_score(y_test, y_pred, zero_division=0) # 防止 Precision 为 0/0 时警告
+    precision = precision_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
     final_score = 100 * (0.3 * recall + 0.5 * auc + 0.2 * precision)
 
-    print(f"\n[Final Results] 测试集评估结果 (阈值={FINAL_PROBABILITY_THRESHOLD}):")
-    print(f"Recall: {recall:.6f}")
-    print(f"AUC: {auc:.6f}")
-    print(f"Precision: {precision:.6f}")
+    print("\n=== 评估结果 ===")
+    print(f"最优阈值: {best_thresh:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"AUC: {auc:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"F1-score: {f1:.4f}")
     print(f"Final Score: {final_score:.4f}")
 
     return {
         'recall': recall,
         'auc': auc,
         'precision': precision,
+        'f1': f1,
         'final_score': final_score,
         'y_proba': y_proba,
-        'y_pred': y_pred
+        'best_threshold': best_thresh
     }
 
 
 def main():
+    # 检查CUDA可用性
     print("CUDA 可用性:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("当前 CUDA 设备:", torch.cuda.current_device())
         print("CUDA 设备名称:", torch.cuda.get_device_name(0))
-        print(f"显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
-        print(f"显存已分配: {torch.cuda.memory_allocated(0) / 1024 ** 3:.2f} GB")
-    else:
-        print("CUDA 不可用，将使用 CPU 训练。")
 
-    # 打印并行设置
-    print(f"设置 LOKY_MAX_CPU_COUNT 为: {os.environ.get('LOKY_MAX_CPU_COUNT', '未设置')}")
+    # 加载数据
+    print("\n=== 数据加载 ===")
+    try:
+        data = pd.read_csv("clean.csv")
+        if "company_id" in data.columns:
+            data = data.drop(columns=["company_id"])
+        if "target" not in data.columns:
+            raise ValueError("数据中必须包含'target'列")
 
-    # --- 数据加载 ---
-    print("正在加载数据 'clean.csv'...")
-    data = pd.read_csv("clean.csv")
-    if "company_id" in data.columns:
-        data = data.drop(columns=["company_id"])
-        print("已移除 'company_id' 列。")
-    if "target" not in data.columns:
-        raise KeyError("数据中找不到 'target' 列，请检查 clean.csv")
+        X = data.drop(columns=["target"]).values
+        y = data["target"].values.astype(int)
+        print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
+    except Exception as e:
+        print(f"数据加载失败: {str(e)}")
+        return
 
-    X = data.drop(columns=["target"]).values
-    y = data["target"].values
-    print(f"数据加载完成。特征矩阵形状: {X.shape}, 目标向量形状: {y.shape}")
-
+    # 移除y中的NaN
     if np.isnan(y).any():
-        print("检测到目标变量 'y' 中存在 NaN，正在移除对应的样本...")
+        print("移除y中的NaN...")
         mask = ~np.isnan(y)
         X = X[mask]
         y = y[mask]
-        print(f"移除 NaN 后，数据集大小: X={X.shape}, y={y.shape}")
 
-    # --- 数据划分 ---
-    X_train_all, X_test, y_train_all, y_test = train_test_split(X, y, test_size=0.05, random_state=SEED, stratify=y)
-    print(f"数据集划分完成: 训练集 {X_train_all.shape}, 测试集 {X_test.shape}")
+    # 数据划分
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=SEED, stratify=y
+    )
+    print(f"\n数据划分: 训练集={X_train.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # --- 使用固定参数进行处理和评估 ---
-    results = train_and_evaluate_fixed_params(X_train_all, y_train_all, X_test, y_test)
+    # 训练和评估
+    results = train_and_evaluate_optimized(X_train, y_train, X_test, y_test)
+
+    # 保存概率预测结果
+    pd.DataFrame({
+        'true_label': y_test,
+        'pred_prob': results['y_proba'],
+        'pred_label': (results['y_proba'] >= results['best_threshold']).astype(int)
+    }).to_csv("predictions.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
-
-
-
