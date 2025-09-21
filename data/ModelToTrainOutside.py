@@ -618,15 +618,15 @@ def main():
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     adaboost = AdaBoostClassifier(
-        n_estimators=150,
+        n_estimators=200,
         learning_rate=0.1,
         random_state=SEED
     )
     adaboost.fit(X_emb_train_clean, y_resampled)  # <<< 使用清洗后的嵌入训练
 
     xgboost = XGBClassifier(
-        n_estimators=200,
-        max_depth=6,
+        n_estimators=300,
+        max_depth=10,
         learning_rate=0.1,
         subsample=0.8,
         colsample_bytree=0.8,
