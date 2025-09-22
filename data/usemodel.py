@@ -153,7 +153,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
     y_proba = ensemble.predict_proba(X_test_processed)
 
     # 固定阈值0.2进行分类
-    y_pred = (y_proba >= 0.2).astype(int)
+    y_pred = (y_proba >= 0.7).astype(int)
 
     # 评估指标
     recall = recall_score(y_test, y_pred)
@@ -176,9 +176,6 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
         'y_proba': y_proba,
         'y_pred': y_pred
     }
-
-
-
 
 
 # 以上填写对象
