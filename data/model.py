@@ -25,7 +25,7 @@ import time
 warnings.filterwarnings('ignore')
 
 # 环境配置
-os.environ["LOKY_MAX_CPU_COUNT"] = "32"
+os.environ["LOKY_MAX_CPU_COUNT"] = "8"
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
@@ -268,7 +268,7 @@ class FinalEnsemble:
         print("\n[Stage 1.5] 处理类别不平衡 (简化MOO-SMOTE)...")
         # 定义优化目标权重 (AUC, Recall, Accuracy)
         # 示例：更关注AUC和Recall，适度关注Accuracy (可以调整以优化Precision)
-        scoring_weights = (0.45, 0.45, 0.10)  # 可调
+        scoring_weights = (0.3, 0.5, 0.2)  # 可调
         n_trials = 15  # 可调
         try:
             X_resampled, y_resampled = moo_smote_func(X_processed, y, scoring_weights=scoring_weights,
@@ -314,23 +314,21 @@ class FinalEnsemble:
         return (xgb_proba + ada_proba) / 2
 
 
-# --- 其他辅助函数 (保持不变，但增加阈值优化) ---
+# --- 阈值选择辅助函数 ---
 def save_model(model, filename):
     """保存模型到文件"""
     with open(filename, 'wb') as f:
         pickle.dump(model, f)
     print(f"\n模型已保存为 {filename}")
 
-
-def find_best_threshold(y_true, y_proba, beta=1.0):
+def find_best_f1_threshold(y_true, y_proba):
     """
-    寻找最佳阈值以优化 F1 分数 (beta=1) 或其他 beta 分数。
-    也可以修改为优化 Precision 或 Precision-Recall Trade-off。
+    在验证集上寻找最佳阈值以优化 F1 分数。
     """
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
 
-    # 计算 F-beta 分数
-    f_scores = (1 + beta ** 2) * (precisions * recalls) / (beta ** 2 * precisions + recalls + 1e-8)  # 防止除零
+    # 计算 F1 分数
+    f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)  # 防止除零
 
     best_idx = np.argmax(f_scores)
     best_threshold = thresholds[best_idx]
@@ -338,14 +336,38 @@ def find_best_threshold(y_true, y_proba, beta=1.0):
     best_precision = precisions[best_idx]
     best_recall = recalls[best_idx]
 
-    print(f"最佳阈值 (最大化 F{beta:.1f}): {best_threshold:.4f}")
-    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}, F{beta:.1f}: {best_f_score:.4f}")
+    print(f"最佳 F1 阈值: {best_threshold:.4f}")
+    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}, F1: {best_f_score:.4f}")
+
+    return best_threshold
+
+def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.5):
+    """
+    在验证集上寻找能获得最高召回率且精确率不低于 min_precision 的阈值。
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+
+    # 寻找满足最小精确率要求的索引
+    valid_indices = np.where(precisions[:-1] >= min_precision)[0] # precisions[:-1] 对应 thresholds
+
+    if len(valid_indices) == 0:
+        print(f"警告: 没有阈值能满足精确率 >= {min_precision}。返回默认阈值 0.5。")
+        return 0.5
+
+    # 在满足条件的索引中找到最大召回率
+    best_valid_idx = valid_indices[np.argmax(recalls[valid_indices])]
+    best_threshold = thresholds[best_valid_idx]
+    best_precision = precisions[best_valid_idx]
+    best_recall = recalls[best_valid_idx]
+
+    print(f"高召回率阈值 (Precision >= {min_precision}): {best_threshold:.4f}")
+    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}")
 
     return best_threshold
 
 
-def train_and_evaluate(X_train, y_train, X_test, y_test, optimize_threshold=True):
-    """训练评估流程"""
+def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
+    """训练评估流程，包含验证集和多阈值选择"""
     # 训练集成模型
     print("\n=== 训练集成模型 ===")
     start_time = time.time()
@@ -357,51 +379,73 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, optimize_threshold=True
     # 保存训练好的模型
     save_model(ensemble, 'best_cascaded_model.pkl')
 
-    # 测试集预测
+    # --- 在验证集上寻找最佳阈值 ---
+    print("\n=== 验证集阈值选择 ===")
+    val_proba = ensemble.predict_proba(X_val)
+
+    # 1. 寻找最佳 F1 阈值
+    print("\n[阈值选择 1] 优化 F1 分数...")
+    threshold_f1 = find_best_f1_threshold(y_val, val_proba)
+
+    # 2. 寻找高召回率阈值 (例如，要求 Precision >= 0.5)
+    print("\n[阈值选择 2] 优化召回率 (要求 Precision >= 0.5)...")
+    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.5)
+
+
+    # --- 测试集评估 ---
     print("\n=== 测试集评估 ===")
-    y_proba = ensemble.predict_proba(X_test)
+    test_proba = ensemble.predict_proba(X_test)
 
-    # --- 阈值优化 ---
-    threshold = 0.5
-    if optimize_threshold:
-        print("\n[优化阶段] 寻找最佳分类阈值...")
-        # 使用验证集来寻找阈值，这里简化为使用测试集的一部分或交叉验证
-        # 为了简化，我们直接在测试集上寻找（注意这可能会有轻微的过拟合风险到阈值选择上）
-        # 更严谨的做法是划分出一个验证集专门用于阈值选择
-        # 这里我们假设 X_test, y_test 可以作为阈值选择的数据
-        # 或者，可以在训练过程中保留一部分数据作为验证集
+    # 使用 F1 优化的阈值评估
+    print("\n--- 使用 F1 优化阈值评估 ---")
+    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
+    recall_f1 = recall_score(y_test, y_pred_f1)
+    auc_f1 = roc_auc_score(y_test, test_proba) # AUC 不依赖阈值
+    precision_f1 = precision_score(y_test, y_pred_f1)
+    f1_f1 = f1_score(y_test, y_pred_f1)
+    accuracy_f1 = accuracy_score(y_test, y_pred_f1)
+    print(f"阈值: {threshold_f1:.4f}")
+    print(f"Recall: {recall_f1:.4f}")
+    print(f"AUC: {auc_f1:.4f}")
+    print(f"Precision: {precision_f1:.4f}")
+    print(f"F1 Score: {f1_f1:.4f}")
+    print(f"Accuracy: {accuracy_f1:.4f}")
+    print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_f1 + 50 * auc_f1 + 30 * recall_f1:.4f}")
 
-        # 简化处理：直接在测试集上找
-        threshold = find_best_threshold(y_test, y_proba, beta=1.0)  # 可以调整beta来偏向Precision或Recall
+    # 使用高召回率阈值评估
+    print("\n--- 使用高召回率阈值评估 ---")
+    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
+    recall_hr = recall_score(y_test, y_pred_hr)
+    auc_hr = roc_auc_score(y_test, test_proba) # AUC 不依赖阈值
+    precision_hr = precision_score(y_test, y_pred_hr)
+    f1_hr = f1_score(y_test, y_pred_hr)
+    accuracy_hr = accuracy_score(y_test, y_pred_hr)
+    print(f"阈值: {threshold_high_recall:.4f}")
+    print(f"Recall: {recall_hr:.4f}")
+    print(f"AUC: {auc_hr:.4f}")
+    print(f"Precision: {precision_hr:.4f}")
+    print(f"F1 Score: {f1_hr:.4f}")
+    print(f"Accuracy: {accuracy_hr:.4f}")
+    print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_hr + 50 * auc_hr + 30 * recall_hr:.4f}")
 
-    y_pred = (y_proba >= threshold).astype(int)
-
-    # 评估指标
-    recall = recall_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_proba)
-    precision = precision_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    accuracy = accuracy_score(y_test, y_pred)
-
-    print("\n=== 评估结果 ===")
-    print(f"Threshold: {threshold:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"AUC: {auc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"Accuracy: {accuracy:.4f}")
-    # 注意：TestScore 的计算公式可能需要根据实际业务调整
-    print(f"TestScore (20*P+50*AUC+30*R): {20 * precision + 50 * auc + 30 * recall:.4f}")
-
+    # 可以选择一个默认阈值返回，或者返回两个结果
+    # 这里我们返回 F1 优化的结果作为主要结果
     return {
-        'recall': recall,
-        'auc': auc,
-        'precision': precision,
-        'f1': f1,
-        'accuracy': accuracy,
-        'y_proba': y_proba,
-        'y_pred': y_pred,
-        'threshold': threshold
+        'recall': recall_f1,
+        'auc': auc_f1,
+        'precision': precision_f1,
+        'f1': f1_f1,
+        'accuracy': accuracy_f1,
+        'y_proba': test_proba,
+        'y_pred': y_pred_f1, # 返回 F1 优化的预测
+        'threshold': threshold_f1, # 返回 F1 优化的阈值
+        # 也可以将高召回率的结果作为附加信息返回
+        'high_recall_results': {
+            'recall': recall_hr,
+            'precision': precision_hr,
+            'f1': f1_hr,
+            'threshold': threshold_high_recall
+        }
     }
 
 
@@ -437,32 +481,37 @@ def main():
         X = X[mask]
         y = y[mask]
 
-    # 数据划分 (可以考虑分出一个验证集用于阈值选择)
+    # 数据划分: 10% 测试集, 90% 临时集
     X_temp, X_test, y_temp, y_test = train_test_split(
         X, y, test_size=0.1, random_state=SEED, stratify=y
     )
-    # 进一步划分训练集和验证集用于阈值选择 (可选)
-    # X_train, X_val, y_train, y_val = train_test_split(
-    #     X_temp, y_temp, test_size=0.1111, random_state=SEED, stratify=y_temp # 0.1111 * 0.9 ~= 0.1
-    # )
-    # 为了简化，我们直接使用 temp 作为训练集
-    X_train, y_train = X_temp, y_temp
+    print(f"\n初步数据划分: 临时集={X_temp.shape[0]}, 测试集={X_test.shape[0]}")
 
-    print(f"\n数据划分: 训练集={X_train.shape[0]}, 测试集={X_test.shape[0]}")
+    # 再次划分临时集: 10% 验证集, 80% 最终训练集 (相对于原始数据是 81%)
+    # 0.1 / 0.9 ≈ 0.1111
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.1111, random_state=SEED, stratify=y_temp
+    )
+    print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # 训练和评估 (启用阈值优化)
-    results = train_and_evaluate(X_train, y_train, X_test, y_test, optimize_threshold=True)
+    # 训练和评估 (传入验证集)
+    results = train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test)
 
-    # 保存预测结果
+    # 保存预测结果 (使用 F1 优化的预测)
     pd.DataFrame({
         'true_label': y_test,
         'pred_prob': results['y_proba'],
-        'pred_label': results['y_pred']
+        'pred_label_f1_optimized': results['y_pred']
     }).to_csv("predictions.csv", index=False)
+
+    # 如果需要，也可以保存高召回率的预测结果
+    # pd.DataFrame({
+    #     'true_label': y_test,
+    #     'pred_prob': results['y_proba'],
+    #     'pred_label_f1_optimized': results['y_pred'],
+    #     'pred_label_high_recall': (results['y_proba'] >= results['high_recall_results']['threshold']).astype(int)
+    # }).to_csv("predictions_detailed.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
-
-
-
