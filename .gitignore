@@ -216,3 +216,5 @@ AnoData/accepted_2007_to_2018Q4.csv
 data/predictions.csv
 data/predictions.csv
 data/predictions_catboost.csv
+data/predictions.csv
+*.pkl
