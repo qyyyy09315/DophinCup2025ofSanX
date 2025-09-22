@@ -1,25 +1,21 @@
 import os
+import pickle
 import random
+import time
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import StandardScaler, QuantileTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import RFE
-from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, ParameterSampler, cross_val_score, StratifiedKFold
-from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, roc_curve, auc, \
-    confusion_matrix, precision_recall_curve
-# 注意：imblearn的安装: pip install imbalanced-learn
+from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import EditedNearestNeighbours
-from imblearn import FunctionSampler
-# 注意：catboost的安装: pip install catboost
-from catboost import CatBoostClassifier # 替换 XGBoost 和 AdaBoost
-import pickle
-from scipy import stats
-import warnings
-import time
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import RFE
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, \
+    precision_recall_curve
+from sklearn.model_selection import train_test_split, ParameterSampler, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, QuantileTransformer
 
 warnings.filterwarnings('ignore')
 
@@ -182,8 +178,8 @@ class AdvancedPreprocessor:
         X_scaled = self.scaler.fit_transform(X_winsorized)
 
         print("步骤 4/4: PCA 降维...")
-        # 4. PCA 降维 (保留85%方差)
-        self.pca = PCA(n_components=0.85)
+        # 4. PCA 降维
+        self.pca = PCA(n_components=0.95)
         self.pca.fit(X_scaled)
 
         print(f"预处理完成。PCA后特征数: {self.pca.n_components_}")
@@ -274,8 +270,8 @@ class FinalEnsemble:
         print("\n[Stage 1.5] 处理类别不平衡 (简化MOO-SMOTE)...")
         # 定义优化目标权重 (AUC, Recall, Accuracy)
         # 示例：更关注AUC和Recall，适度关注Accuracy (可以调整以优化Precision)
-        scoring_weights = (0.3, 0.5, 0.2)  # 可调
-        n_trials = 15  # 可调
+        scoring_weights = (0.3, 0.4, 0.3)  # 可调
+        n_trials = 50  # 可调
         try:
             X_resampled, y_resampled = moo_smote_func(X_processed, y, scoring_weights=scoring_weights,
                                                       n_trials=n_trials)
@@ -295,12 +291,12 @@ class FinalEnsemble:
         # 第二阶段：训练第一个 CatBoost 模型（优化AUC）
         print("\n[Stage 2] 训练优化AUC的CatBoost模型...")
         self.catboost_model_auc = CatBoostClassifier(
-            iterations=400,
-            depth=5,
-            learning_rate=0.0172808,
+            iterations=500,
+            depth=3,
+            learning_rate=0.001,
             # subsample=0.8, # CatBoost 使用 bootstrap_type 和 bagging_temperature
             # colsample_bytree=0.8, # CatBoost 使用 rsm (random subspace method)
-            # scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
+            scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
             class_weights=[1, len(y_train_cb[y_train_cb == 0]) / len(y_train_cb[y_train_cb == 1])],
             random_seed=SEED,
             verbose=100, # 每100轮打印一次
@@ -314,13 +310,12 @@ class FinalEnsemble:
         print("\n[Stage 3] 训练优化F1/Recall的CatBoost模型...")
         # 尝试不同的参数组合来优化召回率，例如调整 class_weights, eval_metric
         self.catboost_model_recall = CatBoostClassifier(
-            iterations=400,
-            depth=5,
-            learning_rate=0.0172808,
-            # scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
+            iterations=500,
+            depth=10,
+            learning_rate=0.1,
+            scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
             class_weights=[1, len(y_train_cb[y_train_cb == 0]) / len(y_train_cb[y_train_cb == 1])],
             random_seed=SEED,
-            verbose=100,
             eval_metric='F1', # F1 是 Recall 和 Precision 的调和平均，优化它可以间接提高 Recall
             use_best_model=True, # 启用早停
             # task_type="GPU" # 如果有GPU可以启用
@@ -366,7 +361,7 @@ def find_best_f1_threshold(y_true, y_proba):
 
     return best_threshold
 
-def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.5):
+def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
     """
     在验证集上寻找能获得最高召回率且精确率不低于 min_precision 的阈值。
     """
@@ -414,7 +409,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
 
     # 2. 寻找高召回率阈值 (例如，要求 Precision >= 0.5)
     print("\n[阈值选择 2] 优化召回率 (要求 Precision >= 0.5)...")
-    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.5)
+    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
 
 
     # --- 测试集评估 ---
@@ -515,7 +510,7 @@ def main():
     # 再次划分临时集: 10% 验证集, 80% 最终训练集 (相对于原始数据是 81%)
     # 0.1 / 0.9 ≈ 0.1111
     X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.1111, random_state=SEED, stratify=y_temp
+        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp
     )
     print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
