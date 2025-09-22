@@ -146,7 +146,6 @@ class FinalEnsemble:
     def __init__(self):
         self.xgb_model = None
         self.ada_model = None
-        # self.feature_selector = None # 不再使用自定义的 RFE，因为AdvancedPreprocessor已经做了降维
         self.preprocessor = None # 使用高级预处理器
 
     def fit(self, X, y):
@@ -217,7 +216,6 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
     print("\n=== 测试集评估 ===")
     y_proba = ensemble.predict_proba(X_test)
 
-    # 固定阈值0.5进行分类 (原文注释是0.2，但代码是0.5，这里保持代码一致)
     y_pred = (y_proba >= 0.5).astype(int)
 
     # 评估指标
@@ -232,7 +230,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test):
     print(f"Precision: {precision:.4f}")
     print(f"F1 Score: {f1:.4f}")
     # 注意：TestScore 的计算公式可能需要根据实际业务调整
-    print(f"TestScore (示例公式 20*P + 50*AUC + 30*R): {20*precision+50*auc+30*recall:.4f}")
+    print(f"TestScore: {20*precision+50*auc+30*recall:.4f}")
 
     return {
         'recall': recall,
