@@ -91,8 +91,7 @@ class AdvancedPreprocessor:
 
         print("步骤 2/4: 异常值处理 (Winsorization)...")
         # 2. 异常值处理 - Winsorization
-        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED,
-                                              n_quantiles=min(1000, X.shape[0]))
+        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED, n_quantiles=min(1000, X.shape[0]))
         X_winsorized = X_imputed.copy()
         if isinstance(X_imputed, np.ndarray):
             X_winsorized[:, self.numerical_features] = self.winsorizer.fit_transform(
@@ -207,25 +206,61 @@ class FinalEnsemble:
             X_resampled, y_resampled, test_size=0.15, random_state=SEED, stratify=y_resampled
         )
 
-        # 第二阶段：训练第一个 GBDT 模型（优化AUC）- 使用固定参数
+        # 第二阶段：训练第一个 GBDT 模型（优化AUC）
         print("\n[Stage 2] 训练优化AUC的GBDT模型...")
-        print("    -> 使用固定最优参数: {'subsample': 0.8, 'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.1}")
-
-        best_gbdt_params_auc = {
-            'subsample': 0.8,
-            'n_estimators': 300,
-            'max_depth': 5,
-            'learning_rate': 0.1
+        # 参数搜索空间
+        gbdt_param_dist_auc = {
+            'n_estimators': [100, 300, 500],
+            'max_depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'subsample': [0.8, 1.0],
         }
+        gbdt_sampler_auc = ParameterSampler(gbdt_param_dist_auc, n_iter=20, random_state=SEED)
 
-        self.gbdt_model_auc = GradientBoostingClassifier(
-            validation_fraction=0.1,
-            n_iter_no_change=10,
-            tol=1e-4,
-            random_state=SEED,
-            **best_gbdt_params_auc
-        )
-        self.gbdt_model_auc.fit(X_resampled, y_resampled)  # 使用全部重采样数据训练最终模型
+        best_score_auc = -np.inf
+        best_gbdt_params_auc = None
+
+        for i, params in enumerate(gbdt_sampler_auc):
+            print(f"    -> 尝试 AUC 优化 GBDT 参数组合 {i + 1}/20: {params}")
+            try:
+                model = GradientBoostingClassifier(
+                    validation_fraction=0.1,
+                    n_iter_no_change=10,
+                    tol=1e-4,
+                    random_state=SEED,
+                    **params
+                )
+                model.fit(X_train_gbdt, y_train_gbdt)
+                val_proba = model.predict_proba(X_val_gbdt)[:, 1]
+                val_auc = roc_auc_score(y_val_gbdt, val_proba)
+                print(f"      -> 验证集 AUC: {val_auc:.4f}")
+
+                if val_auc > best_score_auc:
+                    best_score_auc = val_auc
+                    best_gbdt_params_auc = params
+                    print(f"      -> 发现更优 AUC 参数: {best_gbdt_params_auc}, AUC: {best_score_auc:.4f}")
+            except Exception as e:
+                print(f"      -> 参数组合 {params} 评估失败: {e}")
+
+        if best_gbdt_params_auc:
+            print(f"\n    -> 最佳 AUC 优化 GBDT 参数: {best_gbdt_params_auc}")
+            self.gbdt_model_auc = GradientBoostingClassifier(
+                validation_fraction=0.1,
+                n_iter_no_change=10,
+                tol=1e-4,
+                random_state=SEED,
+                **best_gbdt_params_auc
+            )
+            self.gbdt_model_auc.fit(X_resampled, y_resampled)
+        else:
+            print("    -> 未能找到有效 AUC 优化参数。使用默认参数。")
+            self.gbdt_model_auc = GradientBoostingClassifier(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.1,
+                random_state=SEED
+            )
+            self.gbdt_model_auc.fit(X_resampled, y_resampled)
 
         # 第三阶段：训练第二个 GBDT 模型（优化F1/Recall）
         print("\n[Stage 3] 训练优化F1/Recall的GBDT模型...")
@@ -272,7 +307,7 @@ class FinalEnsemble:
                 random_state=SEED,
                 **best_gbdt_params_recall
             )
-            self.gbdt_model_recall.fit(X_resampled, y_resampled)  # 使用全部重采样数据训练最终模型
+            self.gbdt_model_recall.fit(X_resampled, y_resampled)
         else:
             print("    -> 未能找到有效 Recall/F1 优化参数。使用默认参数。")
             self.gbdt_model_recall = GradientBoostingClassifier(
@@ -480,7 +515,7 @@ def main():
         'true_label': y_test,
         'pred_prob': results['y_proba'],
         'pred_label_f1_optimized': results['y_pred']
-    }).to_csv("predictions.csv", index=False)
+    }).to_csv("predictions_gbdt.csv", index=False)
 
 
 if __name__ == "__main__":
