@@ -3,28 +3,29 @@ import pickle
 import random
 import time
 import warnings
+import multiprocessing
 
 import numpy as np
 import pandas as pd
 import torch
-# 注意：SMOTETomek 已被移除，但 SMOTE 和 TomekLinks 保留用于固定参数组合
-# from imblearn.combine import SMOTETomek # 不再直接使用
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
-from imblearn.combine import SMOTETomek  # 重新导入，用于固定参数组合
+from imblearn.combine import SMOTETomek
 from sklearn.decomposition import PCA
 from sklearn.feature_selection import RFE
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, \
     precision_recall_curve
-from sklearn.model_selection import train_test_split, ParameterSampler, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, ParameterSampler, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.ensemble import GradientBoostingClassifier
 
 warnings.filterwarnings('ignore')
 
-# 环境配置
-os.environ["LOKY_MAX_CPU_COUNT"] = "8"
+# 环境配置 - 最大化CPU利用率
+NUM_CORES = multiprocessing.cpu_count()
+print(f"检测到 {NUM_CORES} 个CPU核心")
+os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
@@ -43,13 +44,9 @@ def moo_smotetomek_func(X, y):
 
     try:
         # 使用固定的参数组合
-        # 这些参数是基于经验或文献选择的，例如：
-        # - smote__k_neighbors=5: SMOTE 的常用邻居数
-        # - smote__sampling_strategy='auto': 让 SMOTE 自动决定采样比例
-        # - tomek__sampling_strategy='majority': 只对多数类应用 Tomek Links
         smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED),
-            tomek=TomekLinks(sampling_strategy='majority'),
+            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
+            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
             random_state=SEED
         )
 
@@ -62,7 +59,7 @@ def moo_smotetomek_func(X, y):
         return X, y
 
 
-# --- 预处理器类 (保持不变) ---
+# --- 预处理器类 ---
 class AdvancedPreprocessor:
     """高级数据预处理管道，包含清洗、标准化、特征工程"""
 
@@ -71,7 +68,7 @@ class AdvancedPreprocessor:
         self.scaler = None
         self.winsorizer = None
         self.pca = None
-        self.numerical_features = None  # 需要外部传入或在fit时推断
+        self.numerical_features = None
 
     def fit(self, X, y=None):
         """拟合预处理器"""
@@ -94,7 +91,7 @@ class AdvancedPreprocessor:
 
         print("步骤 2/4: 异常值处理 (Winsorization)...")
         # 2. 异常值处理 - Winsorization
-        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED)
+        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED, n_quantiles=min(1000, X.shape[0]))
         X_winsorized = X_imputed.copy()
         if isinstance(X_imputed, np.ndarray):
             X_winsorized[:, self.numerical_features] = self.winsorizer.fit_transform(
@@ -105,7 +102,6 @@ class AdvancedPreprocessor:
 
         print("步骤 3/4: 特征转换与标准化...")
         # 3. 特征转换与标准化
-        # Z-score 标准化
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X_winsorized)
 
@@ -145,7 +141,7 @@ class AdvancedPreprocessor:
         return self.fit(X, y).transform(X)
 
 
-# --- 特征选择器类 (保持不变，但使用 GBDT) ---
+# --- 特征选择器类 ---
 class GBDT_RFE_FeatureSelector:
     """基于GBDT的RFE特征选择器"""
 
@@ -181,7 +177,7 @@ class GBDT_RFE_FeatureSelector:
         return self.selector.transform(X)
 
 
-# --- 最终集成模型类 (修改采样部分和模型为 GBDT) ---
+# --- 最终集成模型类 ---
 class FinalEnsemble:
     """最终集成模型（GBDT + GBDT）"""
 
@@ -206,8 +202,6 @@ class FinalEnsemble:
             X_resampled, y_resampled = X_processed, y
 
         # --- 为 GBDT 训练准备带验证集的数据 ---
-        # Scikit-learn 的 GBDT 本身不直接支持 early stopping，但我们可以在训练后选择最佳迭代轮次
-        # 或者使用 validation_fraction 和 n_iter_no_change 参数
         X_train_gbdt, X_val_gbdt, y_train_gbdt, y_val_gbdt = train_test_split(
             X_resampled, y_resampled, test_size=0.15, random_state=SEED, stratify=y_resampled
         )
@@ -220,7 +214,6 @@ class FinalEnsemble:
             'max_depth': [3, 5, 7],
             'learning_rate': [0.01, 0.05, 0.1],
             'subsample': [0.8, 1.0],
-            # 'max_features': ['sqrt', 'log2', None] # 可选
         }
         gbdt_sampler_auc = ParameterSampler(gbdt_param_dist_auc, n_iter=20, random_state=SEED)
 
@@ -231,15 +224,13 @@ class FinalEnsemble:
             print(f"    -> 尝试 AUC 优化 GBDT 参数组合 {i + 1}/20: {params}")
             try:
                 model = GradientBoostingClassifier(
-                    validation_fraction=0.1,  # 使用一部分训练数据作为内部验证集
-                    n_iter_no_change=10,  # 10轮内没有 improvement 则停止
-                    tol=1e-4,  # improvement 的阈值
+                    validation_fraction=0.1,
+                    n_iter_no_change=10,
+                    tol=1e-4,
                     random_state=SEED,
                     **params
                 )
-                # 注意：GradientBoostingClassifier 的 best_estimator_ 是在训练后根据验证集选择的迭代次数
                 model.fit(X_train_gbdt, y_train_gbdt)
-                # 使用验证集评估
                 val_proba = model.predict_proba(X_val_gbdt)[:, 1]
                 val_auc = roc_auc_score(y_val_gbdt, val_proba)
                 print(f"      -> 验证集 AUC: {val_auc:.4f}")
@@ -260,7 +251,7 @@ class FinalEnsemble:
                 random_state=SEED,
                 **best_gbdt_params_auc
             )
-            self.gbdt_model_auc.fit(X_resampled, y_resampled)  # 使用全部重采样数据训练最终模型
+            self.gbdt_model_auc.fit(X_resampled, y_resampled)
         else:
             print("    -> 未能找到有效 AUC 优化参数。使用默认参数。")
             self.gbdt_model_auc = GradientBoostingClassifier(
@@ -276,7 +267,7 @@ class FinalEnsemble:
         # 参数搜索空间，可以偏向于更深的树来提高 recall
         gbdt_param_dist_recall = {
             'n_estimators': [100, 300, 500],
-            'max_depth': [5, 7, 10],  # 更深的树
+            'max_depth': [5, 7, 10],
             'learning_rate': [0.01, 0.05, 0.1],
             'subsample': [0.8, 1.0],
         }
@@ -296,7 +287,6 @@ class FinalEnsemble:
                     **params
                 )
                 model.fit(X_train_gbdt, y_train_gbdt)
-                # 使用验证集评估 F1
                 val_pred = model.predict(X_val_gbdt)
                 val_f1 = f1_score(y_val_gbdt, val_pred)
                 print(f"      -> 验证集 F1: {val_f1:.4f}")
@@ -317,12 +307,12 @@ class FinalEnsemble:
                 random_state=SEED,
                 **best_gbdt_params_recall
             )
-            self.gbdt_model_recall.fit(X_resampled, y_resampled)  # 使用全部重采样数据训练最终模型
+            self.gbdt_model_recall.fit(X_resampled, y_resampled)
         else:
             print("    -> 未能找到有效 Recall/F1 优化参数。使用默认参数。")
             self.gbdt_model_recall = GradientBoostingClassifier(
                 n_estimators=100,
-                max_depth=7,  # 稍深一点
+                max_depth=7,
                 learning_rate=0.1,
                 random_state=SEED
             )
@@ -340,7 +330,7 @@ class FinalEnsemble:
         return (gbdt_auc_proba + gbdt_recall_proba) / 2
 
 
-# --- 阈值选择辅助函数 (保持不变)---
+# --- 阈值选择辅助函数 ---
 def save_model(model, filename):
     """保存模型到文件"""
     with open(filename, 'wb') as f:
@@ -355,7 +345,7 @@ def find_best_f1_threshold(y_true, y_proba):
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
 
     # 计算 F1 分数
-    f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)  # 防止除零
+    f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
 
     best_idx = np.argmax(f_scores)
     best_threshold = thresholds[best_idx]
@@ -376,7 +366,7 @@ def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
 
     # 寻找满足最小精确率要求的索引
-    valid_indices = np.where(precisions[:-1] >= min_precision)[0]  # precisions[:-1] 对应 thresholds
+    valid_indices = np.where(precisions[:-1] >= min_precision)[0]
 
     if len(valid_indices) == 0:
         print(f"警告: 没有阈值能满足精确率 >= {min_precision}。返回默认阈值 0.5。")
@@ -405,7 +395,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print(f"\n训练耗时: {end_time - start_time:.2f} 秒")
 
     # 保存训练好的模型
-    save_model(ensemble, 'best_cascaded_model_gbdt.pkl')  # 修改保存文件名
+    save_model(ensemble, 'best_cascaded_model_gbdt.pkl')
 
     # --- 在验证集上寻找最佳阈值 ---
     print("\n=== 验证集阈值选择 ===")
@@ -427,7 +417,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print("\n--- 使用 F1 优化阈值评估 ---")
     y_pred_f1 = (test_proba >= threshold_f1).astype(int)
     recall_f1 = recall_score(y_test, y_pred_f1)
-    auc_f1 = roc_auc_score(y_test, test_proba)  # AUC 不依赖阈值
+    auc_f1 = roc_auc_score(y_test, test_proba)
     precision_f1 = precision_score(y_test, y_pred_f1)
     f1_f1 = f1_score(y_test, y_pred_f1)
     accuracy_f1 = accuracy_score(y_test, y_pred_f1)
@@ -443,7 +433,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print("\n--- 使用高召回率阈值评估 ---")
     y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
     recall_hr = recall_score(y_test, y_pred_hr)
-    auc_hr = roc_auc_score(y_test, test_proba)  # AUC 不依赖阈值
+    auc_hr = roc_auc_score(y_test, test_proba)
     precision_hr = precision_score(y_test, y_pred_hr)
     f1_hr = f1_score(y_test, y_pred_hr)
     accuracy_hr = accuracy_score(y_test, y_pred_hr)
@@ -455,8 +445,6 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print(f"Accuracy: {accuracy_hr:.4f}")
     print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_hr + 50 * auc_hr + 30 * recall_hr:.4f}")
 
-    # 可以选择一个默认阈值返回，或者返回两个结果
-    # 这里我们返回 F1 优化的结果作为主要结果
     return {
         'recall': recall_f1,
         'auc': auc_f1,
@@ -464,9 +452,8 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
         'f1': f1_f1,
         'accuracy': accuracy_f1,
         'y_proba': test_proba,
-        'y_pred': y_pred_f1,  # 返回 F1 优化的预测
-        'threshold': threshold_f1,  # 返回 F1 优化的阈值
-        # 也可以将高召回率的结果作为附加信息返回
+        'y_pred': y_pred_f1,
+        'threshold': threshold_f1,
         'high_recall_results': {
             'recall': recall_hr,
             'precision': precision_hr,
@@ -528,12 +515,8 @@ def main():
         'true_label': y_test,
         'pred_prob': results['y_proba'],
         'pred_label_f1_optimized': results['y_pred']
-    }).to_csv("predictions_gbdt.csv", index=False)  # 修改输出文件名
+    }).to_csv("predictions_gbdt.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
