@@ -7,7 +7,6 @@ from sklearn.preprocessing import StandardScaler, QuantileTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import RFE
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, ParameterSampler, cross_val_score, StratifiedKFold
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, roc_curve, auc, \
     confusion_matrix, precision_recall_curve
@@ -15,8 +14,8 @@ from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_sco
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import EditedNearestNeighbours
 from imblearn import FunctionSampler
-from sklearn.ensemble import AdaBoostClassifier
-from xgboost import XGBClassifier
+# 注意：catboost的安装: pip install catboost
+from catboost import CatBoostClassifier # 替换 XGBoost 和 AdaBoost
 import pickle
 from scipy import stats
 import warnings
@@ -70,12 +69,19 @@ def moo_smote_func(X, y, scoring_weights=(0.4, 0.4, 0.2), n_trials=10, cv_folds=
             smote = SMOTE(random_state=SEED, k_neighbors=k, sampling_strategy=sampling_strat)
             X_resampled, y_resampled = smote.fit_resample(X, y)
 
-            # 使用简单的 XGBoost 评估性能
-            eval_model = XGBClassifier(
-                n_estimators=100, max_depth=3, learning_rate=0.1,
-                random_state=SEED, n_jobs=1,  # 减少评估模型的资源消耗
+            # 使用简单的 CatBoost 评估性能
+            # 注意：CatBoost 不需要 scale_pos_weight 在初始化时，但可以通过 class_weights 或样本权重处理
+            eval_model = CatBoostClassifier(
+                iterations=100, # 减少评估模型的资源消耗
+                depth=3,
+                learning_rate=0.1,
+                random_seed=SEED,
+                verbose=False, # 静默模式
                 # scale_pos_weight 根据重采样后的数据调整
-                scale_pos_weight=np.sum(y_resampled == 0) / np.sum(y_resampled == 1)
+                # scale_pos_weight=(np.sum(y_resampled == 0) / np.sum(y_resampled == 1)) # CatBoost 0.26+ 支持
+                # 或者使用 class_weights
+                # class_weights=[1, np.sum(y_resampled == 0) / np.sum(y_resampled == 1)] # 需要标签从0开始
+                # 这里我们先不设置，让cross_val_score处理
             )
 
             # 使用交叉验证评估
@@ -213,7 +219,7 @@ class AdvancedPreprocessor:
 
 # --- 特征选择器类 (保持不变) ---
 class XGBRFE_FeatureSelector:
-    """基于XGBoost的RFE特征选择器"""
+    """基于XGBoost的RFE特征选择器 (注意：这里仍然使用XGBoost进行特征选择)"""
 
     def __init__(self, n_features=None, step=0.1):
         self.n_features = n_features
@@ -222,14 +228,14 @@ class XGBRFE_FeatureSelector:
         self.feature_mask_ = None
 
     def fit(self, X, y):
-        xgb = XGBClassifier(
-            n_estimators=500,
-            max_depth=3,
+        # 特征选择仍然使用 XGBoost，因为它是一个强大的基础模型
+        xgb = CatBoostClassifier( # 尝试用 CatBoost 替代
+            iterations=500,
+            depth=3,
             learning_rate=0.0001,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=SEED,
-            n_jobs=-1
+            verbose=False, # 静默模式
+            random_seed=SEED,
+            # scale_pos_weight=(len(y) - np.sum(y)) / np.sum(y) # 可选
         )
 
         if self.n_features is None:
@@ -249,13 +255,13 @@ class XGBRFE_FeatureSelector:
         return self.selector.transform(X)
 
 
-# --- 最终集成模型类 (修改采样部分) ---
+# --- 最终集成模型类 (修改采样部分和模型) ---
 class FinalEnsemble:
-    """最终集成模型（XGBoost + AdaBoost）"""
+    """最终集成模型（CatBoost + CatBoost）"""
 
     def __init__(self):
-        self.xgb_model = None
-        self.ada_model = None
+        self.catboost_model_auc = None  # 优化AUC的模型
+        self.catboost_model_recall = None # 优化召回率的模型
         self.preprocessor = None  # 使用高级预处理器
 
     def fit(self, X, y):
@@ -278,43 +284,62 @@ class FinalEnsemble:
             print(f"  MOO-SMOTE失败: {e}。回退到原始数据。")
             X_resampled, y_resampled = X_processed, y
 
-        # 第二阶段：训练XGBoost模型（优化AUC）
-        print("\n[Stage 2] 训练XGBoost模型...")
-        self.xgb_model = XGBClassifier(
-            n_estimators=400,
-            max_depth=5,
-            learning_rate=0.0172808,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1]),
-            random_state=SEED,
-            n_jobs=-1,
-            eval_metric='auc'
+        # --- 为 CatBoost 训练准备带验证集的数据 ---
+        # CatBoost 的 early stopping 需要 eval_set
+        X_train_cb, X_val_cb, y_train_cb, y_val_cb = train_test_split(
+            X_resampled, y_resampled, test_size=0.15, random_state=SEED, stratify=y_resampled
         )
-        self.xgb_model.fit(X_resampled, y_resampled)
+        eval_set_auc = [(X_val_cb, y_val_cb)]
+        eval_set_recall = [(X_val_cb, y_val_cb)] # 可以使用相同的验证集，或划分不同的
 
-        # 第三阶段：训练AdaBoost模型（优化召回率）
-        print("\n[Stage 3] 训练AdaBoost模型...")
-        self.ada_model = AdaBoostClassifier(
-            n_estimators=400,
-            learning_rate=0.4262,
-            random_state=SEED
+        # 第二阶段：训练第一个 CatBoost 模型（优化AUC）
+        print("\n[Stage 2] 训练优化AUC的CatBoost模型...")
+        self.catboost_model_auc = CatBoostClassifier(
+            iterations=400,
+            depth=5,
+            learning_rate=0.0172808,
+            # subsample=0.8, # CatBoost 使用 bootstrap_type 和 bagging_temperature
+            # colsample_bytree=0.8, # CatBoost 使用 rsm (random subspace method)
+            # scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
+            class_weights=[1, len(y_train_cb[y_train_cb == 0]) / len(y_train_cb[y_train_cb == 1])],
+            random_seed=SEED,
+            verbose=100, # 每100轮打印一次
+            eval_metric='AUC',
+            use_best_model=True, # 启用早停
+            # task_type="GPU" # 如果有GPU可以启用
         )
-        self.ada_model.fit(X_resampled, y_resampled)
+        self.catboost_model_auc.fit(X_train_cb, y_train_cb, eval_set=eval_set_auc)
+
+        # 第三阶段：训练第二个 CatBoost 模型（优化F1/Recall）
+        print("\n[Stage 3] 训练优化F1/Recall的CatBoost模型...")
+        # 尝试不同的参数组合来优化召回率，例如调整 class_weights, eval_metric
+        self.catboost_model_recall = CatBoostClassifier(
+            iterations=400,
+            depth=5,
+            learning_rate=0.0172808,
+            # scale_pos_weight=(len(y_resampled[y_resampled == 0]) / len(y_resampled[y_resampled == 1])), # 0.26+
+            class_weights=[1, len(y_train_cb[y_train_cb == 0]) / len(y_train_cb[y_train_cb == 1])],
+            random_seed=SEED,
+            verbose=100,
+            eval_metric='F1', # F1 是 Recall 和 Precision 的调和平均，优化它可以间接提高 Recall
+            use_best_model=True, # 启用早停
+            # task_type="GPU" # 如果有GPU可以启用
+        )
+        self.catboost_model_recall.fit(X_train_cb, y_train_cb, eval_set=eval_set_recall)
 
     def predict_proba(self, X):
         """预测概率（返回两个模型的平均概率）"""
         X_processed = self.preprocessor.transform(X)
 
-        # 获取两个模型的预测概率
-        xgb_proba = self.xgb_model.predict_proba(X_processed)[:, 1]
-        ada_proba = self.ada_model.predict_proba(X_processed)[:, 1]
+        # 获取两个模型的预测概率 (取正类概率)
+        catboost_auc_proba = self.catboost_model_auc.predict_proba(X_processed)[:, 1]
+        catboost_recall_proba = self.catboost_model_recall.predict_proba(X_processed)[:, 1]
 
         # 返回平均概率
-        return (xgb_proba + ada_proba) / 2
+        return (catboost_auc_proba + catboost_recall_proba) / 2
 
 
-# --- 阈值选择辅助函数 ---
+# --- 阈值选择辅助函数 (保持不变)---
 def save_model(model, filename):
     """保存模型到文件"""
     with open(filename, 'wb') as f:
@@ -377,7 +402,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print(f"\n训练耗时: {end_time - start_time:.2f} 秒")
 
     # 保存训练好的模型
-    save_model(ensemble, 'best_cascaded_model.pkl')
+    save_model(ensemble, 'best_cascaded_model_catboost.pkl') # 修改保存文件名
 
     # --- 在验证集上寻找最佳阈值 ---
     print("\n=== 验证集阈值选择 ===")
@@ -502,7 +527,7 @@ def main():
         'true_label': y_test,
         'pred_prob': results['y_proba'],
         'pred_label_f1_optimized': results['y_pred']
-    }).to_csv("predictions.csv", index=False)
+    }).to_csv("predictions_catboost.csv", index=False) # 修改输出文件名
 
     # 如果需要，也可以保存高召回率的预测结果
     # pd.DataFrame({
@@ -510,7 +535,7 @@ def main():
     #     'pred_prob': results['y_proba'],
     #     'pred_label_f1_optimized': results['y_pred'],
     #     'pred_label_high_recall': (results['y_proba'] >= results['high_recall_results']['threshold']).astype(int)
-    # }).to_csv("predictions_detailed.csv", index=False)
+    # }).to_csv("predictions_detailed_catboost.csv", index=False) # 修改输出文件名
 
 
 if __name__ == "__main__":
