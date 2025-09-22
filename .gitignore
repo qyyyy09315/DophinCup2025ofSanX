@@ -218,3 +218,4 @@ data/predictions.csv
 data/predictions_catboost.csv
 data/predictions.csv
 *.pkl
+data/submit_template.csv
