@@ -171,11 +171,13 @@ class AdvancedFeatureEngineer:
         self.feature_names = []
         # 新增：用于记录嵌入特征组
         self.embedding_groups = {}
+        # 新增：用于记录向量特征列名
+        self.vector_feature_names = []
 
     def _identify_embedding_groups(self, feature_names):
         """识别并分组 *_emb_* 形式的特征"""
         print("  -> 识别嵌入特征组...")
-        emb_pattern = "_emb_" # 修改为新的模式
+        emb_pattern = "_emb_"  # 修改为新的模式
         emb_dict = {}
 
         for feat in feature_names:
@@ -183,7 +185,7 @@ class AdvancedFeatureEngineer:
                 # 提取前缀 (例如 'industry_emb_0' -> 'industry')
                 parts = feat.split(emb_pattern)
                 if len(parts) >= 2:
-                    prefix = emb_pattern.join(parts[:-1]) # 处理 'a_emb_b_emb_0' 的情况
+                    prefix = emb_pattern.join(parts[:-1])  # 处理 'a_emb_b_emb_0' 的情况
                     suffix = parts[-1]
                     # 确保后缀是数字
                     if suffix.isdigit():
@@ -227,9 +229,37 @@ class AdvancedFeatureEngineer:
             # 4. 删除原始的嵌入特征列
             X_processed_df = X_processed_df.drop(columns=emb_features)
             print(f"    -> 合并为特征 '{new_vector_feature_name}' 和 '{new_norm_feature_name}' 并移除原始列")
+            # 记录新创建的向量特征列名
+            self.vector_feature_names.append(new_vector_feature_name)
 
         print(f"  -> 嵌入特征处理完成，剩余特征数: {X_processed_df.shape[1]}")
         return X_processed_df
+
+    def _impute_vector_columns(self, X_df):
+        """使用零向量填充向量列中的缺失值"""
+        if not self.vector_feature_names:
+            print("  -> 未发现向量特征列，跳过向量缺失值填充。")
+            return X_df
+
+        print("  -> 使用零向量填充向量列缺失值...")
+        X_imputed_df = X_df.copy()
+
+        for vec_col_name in self.vector_feature_names:
+            # 获取该列的第一个非空元素来确定向量维度
+            first_valid_vector = X_imputed_df[vec_col_name].dropna().iloc[0] if not X_imputed_df[
+                vec_col_name].dropna().empty else None
+            if first_valid_vector is not None:
+                vector_dim = len(first_valid_vector)
+                zero_vector = np.zeros(vector_dim)
+
+                # 填充缺失值
+                X_imputed_df[vec_col_name] = X_imputed_df[vec_col_name].apply(
+                    lambda x: zero_vector if (isinstance(x, (list, np.ndarray)) and len(x) == 0) or pd.isna(x) else x
+                )
+                print(f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值。")
+            else:
+                print(f"    -> 警告: 列 '{vec_col_name}' 没有有效数据来确定向量维度，跳过填充。")
+        return X_imputed_df
 
     def _create_statistical_features(self, X_dense):
         """创建统计特征"""
@@ -367,8 +397,30 @@ class AdvancedFeatureEngineer:
             self._identify_embedding_groups(X.columns.tolist())
             # 新增：处理嵌入特征
             X_processed_df = self._process_embedding_features(X)
-            self.numerical_features = X_processed_df.select_dtypes(include=[np.number]).columns.tolist()
-            X_dense = X_processed_df.values
+            # 新增：填充向量列缺失值
+            X_imputed_df = self._impute_vector_columns(X_processed_df)
+
+            # 分离数值列和向量列
+            self.numerical_features = X_imputed_df.select_dtypes(include=[np.number]).columns.tolist()
+            vector_columns = [col for col in self.vector_feature_names if col in X_imputed_df.columns]
+
+            # 将向量列展开为数值列
+            vector_data_list = []
+            for col in vector_columns:
+                # 假设所有向量维度相同
+                expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
+                                           columns=[f"{col}_dim_{i}" for i in range(len(X_imputed_df[col].iloc[0]))])
+                vector_data_list.append(expanded_df)
+
+            if vector_data_list:
+                vector_data_df = pd.concat(vector_data_list, axis=1)
+                numerical_data_df = X_imputed_df[self.numerical_features]
+                X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
+            else:
+                X_final_df = X_imputed_df[self.numerical_features]
+
+            X_dense = X_final_df.values
+
         elif sparse.issparse(X):
             X_dense = X.toarray()
             self.numerical_features = list(range(X.shape[1]))
@@ -379,7 +431,7 @@ class AdvancedFeatureEngineer:
         self.original_feature_count = X_dense.shape[1]
         print(f"原始特征数: {self.original_feature_count}")
 
-        # 1. 缺失值处理
+        # 1. 缺失值处理 (现在处理的是纯数值型数组)
         print("步骤 1: 缺失值处理...")
         self.imputer_num = SimpleImputer(strategy='median')
         X_dense = self.imputer_num.fit_transform(X_dense)
@@ -470,15 +522,37 @@ class AdvancedFeatureEngineer:
         """应用特征工程变换"""
         # 处理输入格式
         if isinstance(X, pd.DataFrame):
-             # 新增：处理嵌入特征 (使用在fit中识别的组)
+            # 新增：处理嵌入特征 (使用在fit中识别的组)
             X_processed_df = self._process_embedding_features(X)
-            X_dense = X_processed_df.values
+            # 新增：填充向量列缺失值
+            X_imputed_df = self._impute_vector_columns(X_processed_df)
+
+            # 分离数值列和向量列
+            numerical_data_df = X_imputed_df[self.numerical_features]
+            vector_columns = [col for col in self.vector_feature_names if col in X_imputed_df.columns]
+
+            # 将向量列展开为数值列
+            vector_data_list = []
+            for col in vector_columns:
+                # 假设所有向量维度相同
+                expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
+                                           columns=[f"{col}_dim_{i}" for i in range(len(X_imputed_df[col].iloc[0]))])
+                vector_data_list.append(expanded_df)
+
+            if vector_data_list:
+                vector_data_df = pd.concat(vector_data_list, axis=1)
+                X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
+            else:
+                X_final_df = numerical_data_df
+
+            X_dense = X_final_df.values
+
         elif sparse.issparse(X):
             X_dense = X.toarray()
         else:
             X_dense = X
 
-        # 1. 缺失值处理
+        # 1. 缺失值处理 (现在处理的是纯数值型数组)
         X_dense = self.imputer_num.transform(X_dense)
 
         # 2. 数据预处理
@@ -767,7 +841,7 @@ def main():
         # 分离特征和目标
         y = data["target"].values.astype(int)
         feature_data = data.drop(columns=["target"])
-        X = feature_data # 传递DataFrame给特征工程器
+        X = feature_data  # 传递DataFrame给特征工程器
 
         print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
         print(f"正样本比例: {np.mean(y):.4f}")
@@ -780,7 +854,7 @@ def main():
     if np.isnan(y).any():
         print("移除y中的NaN...")
         mask = ~np.isnan(y)
-        X = X.iloc[mask] # 使用iloc进行索引
+        X = X.iloc[mask]  # 使用iloc进行索引
         y = y[mask]
 
     # 数据划分
