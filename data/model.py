@@ -1,38 +1,34 @@
-# -*- coding: utf-8 -*-
-"""取消超参数搜索示例"""
-
+import multiprocessing
 import os
 import pickle
 import random
 import time
 import warnings
-import multiprocessing
-from contextlib import contextmanager
 
+# --- 导入绘图库 ---
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import torch
+from imblearn.combine import SMOTETomek
+from imblearn.ensemble import BalancedRandomForestClassifier  # 用于特征选择
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
-from imblearn.combine import SMOTETomek
+# --- 导入 TruncatedSVD 作为 PCA 的替代方案 (可选但推荐) ---
+from sklearn.decomposition import PCA, TruncatedSVD
 # --- 导入随机森林和特征选择器 ---
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.feature_selection import RFE, SelectFromModel
-# --- ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, \
     precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report
-from sklearn.model_selection import train_test_split, ParameterSampler, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, QuantileTransformer, KBinsDiscretizer, PolynomialFeatures
-# --- 导入 TruncatedSVD 作为 PCA 的替代方案 (可选但推荐) ---
-from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.model_selection import train_test_split
 # --- 导入 Pipeline ---
 from sklearn.pipeline import Pipeline
-# --- 导入绘图库 ---
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.preprocessing import StandardScaler, QuantileTransformer, KBinsDiscretizer, PolynomialFeatures
+# --- 导入 XGBoost 和 平衡随机森林 ---
+from xgboost import XGBClassifier
 
-# --- ---
 
 warnings.filterwarnings('ignore')
 
@@ -181,7 +177,8 @@ class AdvancedPreprocessor:
                 n_features_to_select = self.rf_n_features_to_select
 
             # 使用一个快速的随机森林模型来评估特征重要性
-            temp_rf = RandomForestClassifier(n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
+            # --- 修改点: 使用 BalancedRandomForestClassifier ---
+            temp_rf = BalancedRandomForestClassifier(n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
             # threshold=-np.inf 确保选出 max_features 个特征，即使重要性很低
             self.rf_selector = SelectFromModel(temp_rf, max_features=n_features_to_select, threshold=-np.inf)
             X_rf_selected = self.rf_selector.fit_transform(X_crossed, y)  # 输入是 X_crossed
@@ -270,9 +267,9 @@ class AdvancedPreprocessor:
         return self.fit(X, y).transform(X)
 
 # --- ---
-# --- 特征选择器类 ---
-class GBDT_RFE_FeatureSelector:
-    """基于GBDT的RFE特征选择器"""
+# --- 特征选择器类 (修改为使用 BalancedRandomForestClassifier) ---
+class GBDT_RFE_FeatureSelector: # 类名保持不变，但功能已修改
+    """基于平衡随机森林的RFE特征选择器"""
 
     def __init__(self, n_features=None, step=0.1):
         self.n_features = n_features
@@ -281,11 +278,12 @@ class GBDT_RFE_FeatureSelector:
         self.feature_mask_ = None
 
     def fit(self, X, y):
-        # 特征选择使用 GBDT
-        gbdt = GradientBoostingClassifier(
+        # 特征选择使用 BalancedRandomForestClassifier
+        # --- 修改点: 使用 BalancedRandomForestClassifier ---
+        brf = BalancedRandomForestClassifier(
             n_estimators=500,
             max_depth=3,
-            learning_rate=0.0001,
+            # learning_rate 参数不适用于 BalancedRandomForestClassifier，已移除
             random_state=SEED
         )
 
@@ -293,7 +291,7 @@ class GBDT_RFE_FeatureSelector:
             self.n_features = max(1, X.shape[1] // 2)  # 确保至少选择1个特征
 
         self.selector = RFE(
-            estimator=gbdt,
+            estimator=brf,
             n_features_to_select=self.n_features,
             step=self.step,
             verbose=1
@@ -400,15 +398,16 @@ def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="M
     print(classification_report(y_true, y_pred_f1, target_names=['Negative', 'Positive']))
     print("-" * 40)
 
-# --- 修改后的训练评估流程 (取消超参数搜索) ---
+# --- 修改后的训练评估流程 (取消超参数搜索, 使用 XGBoost) ---
 def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_test, preprocessor_params=None):
-    """取消超参数搜索的训练评估流程"""
+    """取消超参数搜索的训练评估流程 (XGBoost 版本)"""
     # --- 构建 Pipeline ---
     print("\n=== 构建 Scikit-learn Pipeline ===")
     pipeline = Pipeline([
         ('preprocessor', AdvancedPreprocessor(**preprocessor_params)),
         # ('smote_tomek', 'passthrough'), # SMOTETomek 通常在Pipeline外处理或用自定义转换器，这里我们手动处理
-        ('classifier', GradientBoostingClassifier(random_state=SEED)) # 使用默认参数
+        # --- 修改点: 使用 XGBClassifier ---
+        ('classifier', XGBClassifier(random_state=SEED, n_jobs=-1)) # 使用默认参数, 启用多核
     ])
 
     # --- 手动应用 SMOTETomek (如果需要) ---
@@ -431,7 +430,7 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
     print(f"\n模型训练耗时: {end_time - start_time:.2f} 秒")
 
     # --- 保存训练好的模型 ---
-    save_model(pipeline, 'trained_model_without_search.pkl')
+    save_model(pipeline, 'trained_model_without_search_xgb.pkl')
 
     # --- 在验证集上寻找最佳阈值 ---
     print("\n=== 验证集阈值选择 ===")
@@ -487,7 +486,7 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
 
     # --- 可视化评估结果 ---
     print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall, model_name="GBDT (No Search)")
+    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall, model_name="XGBoost (No Search)")
 
     return {
         'recall': recall_f1,
@@ -508,8 +507,8 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
     }
 
 def main():
-    # 检查CUDA可用性
-    print("CUDA 可用性:", torch.cuda.is_available())
+    # 检查CUDA可用性 (PyTorch)
+    print("CUDA 可用性 (PyTorch):", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("当前 CUDA 设备:", torch.cuda.current_device())
         print("CUDA 设备名称:", torch.cuda.get_device_name(0))
@@ -571,7 +570,7 @@ def main():
     print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
     # --- 调用新的训练评估函数 (取消搜索) ---
-    print("\n=== 启动不带超参数搜索的训练评估流程 ===")
+    print("\n=== 启动不带超参数搜索的训练评估流程 (XGBoost 版本) ===")
     results = train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_test,
                                  preprocessor_params=preprocessor_params)
 
@@ -581,11 +580,8 @@ def main():
             'true_label': y_test,
             'pred_prob': results['y_proba'],
             'pred_label_f1_optimized': results['y_pred']
-        }).to_csv("predictions_gbdt.csv", index=False)
+        }).to_csv("predictions_xgboost.csv", index=False)
         print("\n预测结果已保存")
 
 if __name__ == "__main__":
     main()
-
-
-
