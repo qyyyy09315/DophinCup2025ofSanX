@@ -221,3 +221,5 @@ data/predictions.csv
 data/submit_template.csv
 data/predictions_gbdt.csv
 /.idea
+/UseBert/bert-base-chinese/
+*.csv

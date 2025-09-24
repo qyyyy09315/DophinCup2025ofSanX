@@ -20,7 +20,7 @@ class AdaptiveAttention(BaseEstimator, TransformerMixin):
         return X
 
 # 读取CSV文件
-data = pd.read_csv('../clean.csv')
+data = pd.read_csv('../../UseBert/train_bert_embedded.csv')
 
 # 提取特征和标签
 X = data.drop(columns=['target'])  # 假设 'target' 列是标签

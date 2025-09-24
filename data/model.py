@@ -12,29 +12,37 @@ import pandas as pd
 import seaborn as sns
 import torch
 from imblearn.combine import SMOTETomek
-from imblearn.ensemble import BalancedRandomForestClassifier  # 用于特征选择
+from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
-# --- 导入 TruncatedSVD 作为 PCA 的替代方案 (可选但推荐) ---
-from sklearn.decomposition import TruncatedSVD
-# --- 导入随机森林和特征选择器 ---
-from sklearn.feature_selection import RFE, SelectFromModel
+
+# --- 导入先进的特征工程库 ---
+from sklearn.decomposition import TruncatedSVD, FastICA, FactorAnalysis
+from sklearn.feature_selection import RFE, SelectFromModel, VarianceThreshold, SelectKBest, f_classif, \
+    mutual_info_classif
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, \
-    precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report
+from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
+                             precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
 from sklearn.model_selection import train_test_split
-# --- 导入 Pipeline ---
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, QuantileTransformer, KBinsDiscretizer, PolynomialFeatures
-# --- 导入 XGBoost 和 平衡随机森林 ---
+from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
+                                   PowerTransformer, MinMaxScaler)
+
+# --- 导入聚类和异常检测用于特征工程 ---
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+
+# --- 导入 XGBoost ---
 from xgboost import XGBClassifier
 
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
+from scipy.stats import skew, kurtosis
 
 warnings.filterwarnings('ignore')
 
-# 环境配置 - 最大化CPU利用率
+# 环境配置
 NUM_CORES = multiprocessing.cpu_count()
 print(f"检测到 {NUM_CORES} 个CPU核心")
 os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
@@ -43,11 +51,9 @@ np.random.seed(SEED)
 random.seed(SEED)
 
 
-# --- 固定参数的 SMOTETomek ---
 def moo_smotetomek_func(X, y):
     """
     使用一组固定的参数应用 SMOTETomek 进行重采样。
-    注意：imblearn 通常需要密集矩阵输入。
     """
     print("  -> 应用固定参数的 SMOTETomek...")
 
@@ -56,14 +62,12 @@ def moo_smotetomek_func(X, y):
         return X, y
 
     try:
-        # 确保输入是密集矩阵，因为 SMOTETomek 可能不直接支持稀疏矩阵
         if sparse.issparse(X):
             print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
             X_dense = X.toarray()
         else:
             X_dense = X
 
-        # 使用固定的参数组合
         smotetomek = SMOTETomek(
             smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
             tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
@@ -72,8 +76,6 @@ def moo_smotetomek_func(X, y):
 
         X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
 
-        # 如果原始输入是稀疏的，考虑是否将结果转回稀疏（但重采样后可能不稀疏）
-        # 这里我们保持为密集矩阵，因为它可能已经不稀疏了
         print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
         return X_resampled_dense, y_resampled
 
@@ -82,326 +84,373 @@ def moo_smotetomek_func(X, y):
         return X, y
 
 
-# --- 更新 AdvancedPreprocessor 类 (调整步骤顺序并支持稀疏矩阵) ---
-class AdvancedPreprocessor:
-    """高级数据预处理管道，包含清洗、标准化、特征工程（分箱、交叉）、随机森林特征选择和降维 (支持稀疏矩阵)"""
+class AdvancedFeatureEngineer:
+    """
+    先进的特征工程管道，包含：
+    1. 多种预处理技术
+    2. 统计特征生成
+    3. 聚类特征
+    4. 异常检测特征
+    5. 降维技术组合
+    6. 智能特征选择
+    """
 
-    def __init__(self, n_bins=None, cross_degree=None, rf_n_features_to_select=None, use_truncated_svd=False,
-                 svd_n_components=None, force_sparse_output=True):
-        """
-        初始化预处理器。
-        :param n_bins: int or None, 分箱的数量。如果为 None，则不进行分箱。
-        :param cross_degree: int or None, 特征交叉的度数。如果为 None，则不进行特征交叉。
-        :param rf_n_features_to_select: int or float or None, 使用随机森林选择的特征数量。
-                                        如果是 int，则选择该数量的特征。
-                                        如果是 float (0 < x < 1)，则选择该比例的特征。
-                                        如果为 None，则跳过随机森林特征选择。
-        :param use_truncated_svd: bool, 是否使用 TruncatedSVD 替代 PCA。
-        :param svd_n_components: int or float or None, TruncatedSVD 的 n_components。
-                                 如果是 int，则保留该数量的成分。
-                                 如果是 float (0 < x < 1)，则保留该比例的方差。
-                                 如果为 None 且 use_truncated_svd=True，则默认为 100。
-        :param force_sparse_output: bool, 是否强制输出为稀疏矩阵 (csr_matrix)。
-        """
+    def __init__(self,
+                 # 预处理参数
+                 scaler_type='robust',  # 'standard', 'robust', 'quantile', 'power', 'minmax'
+                 power_method='yeo-johnson',  # PowerTransformer method
+
+                 # 统计特征参数
+                 create_statistical_features=True,
+                 rolling_windows=[3, 5, 10],  # 滚动统计窗口
+
+                 # 聚类特征参数
+                 create_cluster_features=True,
+                 n_clusters_kmeans=10,
+                 dbscan_eps=0.5,
+                 dbscan_min_samples=5,
+
+                 # 异常检测特征参数
+                 create_anomaly_features=True,
+                 isolation_contamination=0.1,
+                 lof_n_neighbors=20,
+
+                 # 降维参数
+                 use_multiple_decomposition=True,
+                 svd_components=50,
+                 ica_components=30,
+                 fa_components=20,
+
+                 # 特征选择参数
+                 variance_threshold=0.01,
+                 univariate_k_best=1000,
+                 rf_n_features_to_select=800,
+
+                 # 输出格式
+                 force_sparse_output=False):  # 改为False，因为高级特征工程通常产生密集特征
+
+        # 存储参数
+        self.scaler_type = scaler_type
+        self.power_method = power_method
+        self.create_statistical_features = create_statistical_features
+        self.rolling_windows = rolling_windows
+        self.create_cluster_features = create_cluster_features
+        self.n_clusters_kmeans = n_clusters_kmeans
+        self.dbscan_eps = dbscan_eps
+        self.dbscan_min_samples = dbscan_min_samples
+        self.create_anomaly_features = create_anomaly_features
+        self.isolation_contamination = isolation_contamination
+        self.lof_n_neighbors = lof_n_neighbors
+        self.use_multiple_decomposition = use_multiple_decomposition
+        self.svd_components = svd_components
+        self.ica_components = ica_components
+        self.fa_components = fa_components
+        self.variance_threshold = variance_threshold
+        self.univariate_k_best = univariate_k_best
+        self.rf_n_features_to_select = rf_n_features_to_select
+        self.force_sparse_output = force_sparse_output
+
+        # 初始化组件
         self.imputer_num = None
         self.scaler = None
-        self.winsorizer = None
-        self.binner = None
-        self.crosser = None
-        self.rf_selector = None  # 新增：随机森林选择器
-        self.svd = None  # 新增：TruncatedSVD (替代PCA)
+        self.power_transformer = None
+        self.kmeans = None
+        self.dbscan = None
+        self.isolation_forest = None
+        self.lof = None
+        self.svd = None
+        self.ica = None
+        self.fa = None
+        self.variance_selector = None
+        self.univariate_selector = None
+        self.rf_selector = None
+
+        # 记录特征信息
         self.numerical_features = None
-        self.n_bins = n_bins
-        self.cross_degree = cross_degree
-        self.rf_n_features_to_select = rf_n_features_to_select
-        self.use_truncated_svd = use_truncated_svd
-        self.svd_n_components = svd_n_components
-        self.force_sparse_output = force_sparse_output  # 控制输出格式
-        self.original_feature_count = None  # 记录原始特征数
+        self.original_feature_count = None
+        self.feature_names = []
+
+    def _create_statistical_features(self, X_dense):
+        """创建统计特征"""
+        if not self.create_statistical_features:
+            return X_dense
+
+        print("  -> 创建统计特征...")
+        stat_features = []
+
+        # 基础统计特征
+        stat_features.append(np.mean(X_dense, axis=1, keepdims=True))  # 行均值
+        stat_features.append(np.std(X_dense, axis=1, keepdims=True))  # 行标准差
+        stat_features.append(np.max(X_dense, axis=1, keepdims=True))  # 行最大值
+        stat_features.append(np.min(X_dense, axis=1, keepdims=True))  # 行最小值
+        stat_features.append(np.median(X_dense, axis=1, keepdims=True))  # 行中位数
+
+        # 高级统计特征
+        stat_features.append(skew(X_dense, axis=1).reshape(-1, 1))  # 偏度
+        stat_features.append(kurtosis(X_dense, axis=1).reshape(-1, 1))  # 峰度
+
+        # 百分位数特征
+        stat_features.append(np.percentile(X_dense, 25, axis=1, keepdims=True))  # 25%分位数
+        stat_features.append(np.percentile(X_dense, 75, axis=1, keepdims=True))  # 75%分位数
+
+        # 变异系数 (标准差/均值)
+        mean_vals = np.mean(X_dense, axis=1, keepdims=True)
+        std_vals = np.std(X_dense, axis=1, keepdims=True)
+        cv = np.divide(std_vals, mean_vals + 1e-8)  # 避免除零
+        stat_features.append(cv)
+
+        # 合并统计特征
+        stat_features_array = np.concatenate(stat_features, axis=1)
+
+        # 添加特征名称
+        stat_names = ['row_mean', 'row_std', 'row_max', 'row_min', 'row_median',
+                      'row_skew', 'row_kurtosis', 'row_q25', 'row_q75', 'row_cv']
+        self.feature_names.extend(stat_names)
+
+        print(f"    -> 创建了 {stat_features_array.shape[1]} 个统计特征")
+        return np.concatenate([X_dense, stat_features_array], axis=1)
+
+    def _create_cluster_features(self, X_dense):
+        """创建聚类特征"""
+        if not self.create_cluster_features:
+            return X_dense
+
+        print("  -> 创建聚类特征...")
+        cluster_features = []
+
+        # K-Means 聚类
+        if self.kmeans is None:
+            self.kmeans = KMeans(n_clusters=self.n_clusters_kmeans,
+                                 random_state=SEED, n_init=10)
+            kmeans_labels = self.kmeans.fit_predict(X_dense)
+        else:
+            kmeans_labels = self.kmeans.predict(X_dense)
+
+        # K-Means 距离特征
+        kmeans_distances = self.kmeans.transform(X_dense)
+        cluster_features.append(kmeans_distances)
+
+        # DBSCAN 聚类 (仅在训练时)
+        if self.dbscan is None:
+            self.dbscan = DBSCAN(eps=self.dbscan_eps,
+                                 min_samples=self.dbscan_min_samples, n_jobs=-1)
+            dbscan_labels = self.dbscan.fit_predict(X_dense)
+        else:
+            # DBSCAN 没有 predict 方法，需要重新拟合或使用其他方法
+            # 这里简化处理，跳过测试集的DBSCAN标签
+            dbscan_labels = np.zeros(X_dense.shape[0])
+
+        # 添加聚类标签作为特征 (one-hot编码可能更好，但这里简化)
+        cluster_features.append(kmeans_labels.reshape(-1, 1))
+        cluster_features.append(dbscan_labels.reshape(-1, 1))
+
+        # 合并聚类特征
+        cluster_features_array = np.concatenate(cluster_features, axis=1)
+
+        # 添加特征名称
+        cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)]
+        cluster_names.extend(['kmeans_label', 'dbscan_label'])
+        self.feature_names.extend(cluster_names)
+
+        print(f"    -> 创建了 {cluster_features_array.shape[1]} 个聚类特征")
+        return np.concatenate([X_dense, cluster_features_array], axis=1)
+
+    def _create_anomaly_features(self, X_dense):
+        """创建异常检测特征"""
+        if not self.create_anomaly_features:
+            return X_dense
+
+        print("  -> 创建异常检测特征...")
+        anomaly_features = []
+
+        # Isolation Forest
+        if self.isolation_forest is None:
+            self.isolation_forest = IsolationForest(
+                contamination=self.isolation_contamination,
+                random_state=SEED, n_jobs=-1)
+            iso_scores = self.isolation_forest.fit(X_dense).decision_function(X_dense)
+        else:
+            iso_scores = self.isolation_forest.decision_function(X_dense)
+
+        anomaly_features.append(iso_scores.reshape(-1, 1))
+
+        # Local Outlier Factor
+        if self.lof is None:
+            self.lof = LocalOutlierFactor(
+                n_neighbors=self.lof_n_neighbors,
+                novelty=True, n_jobs=-1)
+            self.lof.fit(X_dense)
+            lof_scores = self.lof.decision_function(X_dense)
+        else:
+            lof_scores = self.lof.decision_function(X_dense)
+
+        anomaly_features.append(lof_scores.reshape(-1, 1))
+
+        # 合并异常检测特征
+        anomaly_features_array = np.concatenate(anomaly_features, axis=1)
+
+        # 添加特征名称
+        anomaly_names = ['isolation_score', 'lof_score']
+        self.feature_names.extend(anomaly_names)
+
+        print(f"    -> 创建了 {anomaly_features_array.shape[1]} 个异常检测特征")
+        return np.concatenate([X_dense, anomaly_features_array], axis=1)
 
     def fit(self, X, y=None):
-        """拟合预处理器"""
-        # 假设 X 是一个 DataFrame，或者需要提供列名列表 self.numerical_features
+        """拟合特征工程管道"""
+        print("开始高级特征工程拟合...")
+
+        # 处理输入格式
         if isinstance(X, pd.DataFrame):
             self.numerical_features = X.select_dtypes(include=[np.number]).columns.tolist()
-        elif self.numerical_features is None:
-            # 如果 X 是 numpy array 且未提供列名，则假设所有列都是数值型
+            X_dense = X.values
+        elif sparse.issparse(X):
+            X_dense = X.toarray()
             self.numerical_features = list(range(X.shape[1]))
-            print("警告: 未提供列名，假设所有特征均为数值型。")
+        else:
+            X_dense = X
+            self.numerical_features = list(range(X.shape[1]))
 
-        self.original_feature_count = X.shape[1]
+        self.original_feature_count = X_dense.shape[1]
         print(f"原始特征数: {self.original_feature_count}")
 
-        print("步骤 1/4: 缺失值处理...")
-        # 1. 缺失值处理 - 使用中位数填充数值型特征
+        # 1. 缺失值处理
+        print("步骤 1: 缺失值处理...")
         self.imputer_num = SimpleImputer(strategy='median')
-        X_imputed = X.copy()
+        X_dense = self.imputer_num.fit_transform(X_dense)
 
-        # 检查 numerical_features 是否在有效范围内
-        valid_numerical_features = [f for f in self.numerical_features if f < self.original_feature_count]
-        if len(valid_numerical_features) != len(self.numerical_features):
-            print(f"警告: 发现无效的 numerical_features 索引，已过滤。有效特征数: {len(valid_numerical_features)}")
-            self.numerical_features = valid_numerical_features
+        # 2. 数据预处理和变换
+        print("步骤 2: 数据预处理...")
 
-        if isinstance(X, np.ndarray) or sparse.issparse(X):
-            # 对于 numpy array 或稀疏矩阵，需要处理列索引
-            if sparse.issparse(X):
-                # 稀疏矩阵需要先转换为密集来填充，然后可能再转回稀疏
-                # 或者使用稀疏友好的 imputer (如 sklearn 0.24+ 的 SimpleImputer)
-                # 这里我们简单处理：转换 -> 填充 -> 转回
-                X_dense_for_impute = X.toarray()
-                X_dense_for_impute[:, self.numerical_features] = self.imputer_num.fit_transform(
-                    X_dense_for_impute[:, self.numerical_features])
-                X_imputed = sparse.csr_matrix(X_dense_for_impute)
-            else:  # numpy array
-                X_imputed[:, self.numerical_features] = self.imputer_num.fit_transform(X[:, self.numerical_features])
-        else:  # DataFrame
-            X_imputed.loc[:, self.numerical_features] = self.imputer_num.fit_transform(X[self.numerical_features])
+        # 选择缩放器
+        if self.scaler_type == 'standard':
+            self.scaler = StandardScaler()
+        elif self.scaler_type == 'robust':
+            self.scaler = RobustScaler()
+        elif self.scaler_type == 'quantile':
+            self.scaler = QuantileTransformer(output_distribution='uniform', random_state=SEED)
+        elif self.scaler_type == 'power':
+            self.power_transformer = PowerTransformer(method=self.power_method, standardize=True)
+            X_dense = self.power_transformer.fit_transform(X_dense)
+            self.scaler = StandardScaler()
+        elif self.scaler_type == 'minmax':
+            self.scaler = MinMaxScaler()
 
-        print("步骤 2/4: 异常值处理 (Winsorization)...")
-        # 2. 异常值处理 - Winsorization
-        # QuantileTransformer 可以处理稀疏矩阵 (如果输入是稀疏的，输出通常也是稀疏的)
-        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED,
-                                              n_quantiles=min(1000, X_imputed.shape[0]))
-        X_winsorized = X_imputed.copy()
-        if isinstance(X_imputed, np.ndarray):
-            X_winsorized[:, self.numerical_features] = self.winsorizer.fit_transform(
-                X_imputed[:, self.numerical_features])
-        elif sparse.issparse(X_imputed):
-            # QuantileTransformer 可以直接处理稀疏矩阵
-            # 但通常要求输入是密集的或特定格式，这里我们转换
-            X_winsorized_dense = X_imputed.toarray()
-            X_winsorized_dense[:, self.numerical_features] = self.winsorizer.fit_transform(
-                X_winsorized_dense[:, self.numerical_features])
-            X_winsorized = sparse.csr_matrix(X_winsorized_dense)
-        else:  # DataFrame
-            X_winsorized.loc[:, self.numerical_features] = self.winsorizer.fit_transform(
-                X_imputed[self.numerical_features])
+        X_dense = self.scaler.fit_transform(X_dense)
 
-        print("步骤 3/4: 特征转换与标准化...")
-        # 3. 特征转换与标准化
-        # StandardScaler 可以处理稀疏矩阵 (输出也是稀疏的)
-        self.scaler = StandardScaler(with_mean=False)  # with_mean=False 对稀疏矩阵是必需的
-        X_scaled = self.scaler.fit_transform(X_winsorized)
-        # 确保标准化后的数据是稀疏的 (如果输入是稀疏的)
-        if not sparse.issparse(X_scaled) and (sparse.issparse(X_winsorized) or self.force_sparse_output):
-            X_scaled = sparse.csr_matrix(X_scaled)
-            print("    -> 标准化后数据已转换为稀疏矩阵 (csr_matrix)。")
+        # 3. 高级特征工程
+        print("步骤 3: 高级特征工程...")
+        X_dense = self._create_statistical_features(X_dense)
+        X_dense = self._create_cluster_features(X_dense)
+        X_dense = self._create_anomaly_features(X_dense)
 
-        # --- 新增步骤: 特征分箱 ---
-        if self.n_bins is not None and self.n_bins > 1:
-            print(f"步骤 3.1: 特征分箱 (n_bins={self.n_bins})...")
-            # KBinsDiscretizer 可以处理稀疏矩阵 (输出是稀疏的)
-            # 使用 'quantile' 策略以获得更平衡的箱
-            self.binner = KBinsDiscretizer(n_bins=self.n_bins, encode='onehot-dense', strategy='quantile')
-            # 注意: encode='onehot-dense' 会输出密集矩阵。如果希望保持稀疏，可以使用 'onehot' (但需要 sklearn 0.24+)
-            # 这里为了兼容性暂时使用 'onehot-dense'，然后强制转回稀疏
-            # --- 关键修改点：确保输入到 fit_transform 的是密集数组 ---
-            if sparse.issparse(X_scaled):
-                print("    -> 将稀疏矩阵 X_scaled 转换为密集数组以供 KBinsDiscretizer 使用...")
-                X_scaled_dense = X_scaled.toarray()
-            else:
-                X_scaled_dense = X_scaled
+        print(f"特征工程后特征数: {X_dense.shape[1]}")
 
-            X_binned_dense = self.binner.fit_transform(X_scaled_dense)  # 输入是密集的 X_scaled_dense
-            X_binned = sparse.csr_matrix(X_binned_dense)
-            print(f"  -> 分箱后特征数: {X_binned.shape[1]}")
-        else:
-            X_binned = X_scaled  # 注意输入是 X_scaled
-            print("  -> 跳过分箱步骤。")
+        # 4. 多重降维
+        if self.use_multiple_decomposition:
+            print("步骤 4: 多重降维...")
 
-        # --- 新增步骤: 特征交叉 ---
-        if self.cross_degree is not None and self.cross_degree >= 2:
-            print(f"步骤 3.2: 特征交叉 (degree={self.cross_degree})...")
-            # PolynomialFeatures 可以处理稀疏矩阵 (输出是稀疏的)
-            # 限制交互项数量，degree=2 通常足够
-            self.crosser = PolynomialFeatures(degree=self.cross_degree, interaction_only=True, include_bias=False)
-            X_crossed = self.crosser.fit_transform(X_binned)  # 注意输入是 X_binned
-            # 确保交叉后的数据是稀疏的
-            if not sparse.issparse(X_crossed):
-                X_crossed = sparse.csr_matrix(X_crossed)
-            print(f"  -> 交叉后特征数: {X_crossed.shape[1]}")
-        else:
-            X_crossed = X_binned  # 注意输入是 X_binned
-            print("  -> 跳过特征交叉步骤。")
+            # TruncatedSVD
+            n_svd = min(self.svd_components, X_dense.shape[1] - 1)
+            self.svd = TruncatedSVD(n_components=n_svd, random_state=SEED)
+            X_svd = self.svd.fit_transform(X_dense)
 
-        # --- 新增步骤: 随机森林特征选择 (调整到交叉之后) ---
-        if self.rf_n_features_to_select is not None:
-            print(f"步骤 3.3: 随机森林特征选择 (目标特征数: {self.rf_n_features_to_select})...")
-            # 使用一个相对快速的随机森林来评估特征重要性
-            # 注意：输入是 X_crossed (已分箱和交叉)
-            if isinstance(self.rf_n_features_to_select, int) and self.rf_n_features_to_select > X_crossed.shape[1]:
-                print(
-                    f"  -> 警告: 请求的特征数 ({self.rf_n_features_to_select}) 超过可用特征数 ({X_crossed.shape[1]})。将选择所有可用特征。")
-                n_features_to_select = X_crossed.shape[1]
-            elif isinstance(self.rf_n_features_to_select, float) and 0 < self.rf_n_features_to_select <= 1:
-                n_features_to_select = int(self.rf_n_features_to_select * X_crossed.shape[1])
-                print(f"  -> 根据比例 {self.rf_n_features_to_select}，将选择约 {n_features_to_select} 个特征。")
-            else:
-                n_features_to_select = self.rf_n_features_to_select
+            # FastICA
+            n_ica = min(self.ica_components, X_dense.shape[1])
+            self.ica = FastICA(n_components=n_ica, random_state=SEED, max_iter=1000)
+            X_ica = self.ica.fit_transform(X_dense)
 
-            # 使用一个快速的随机森林模型来评估特征重要性
-            # --- 修改点: 使用 BalancedRandomForestClassifier ---
-            temp_rf = BalancedRandomForestClassifier(n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
-            # threshold=-np.inf 确保选出 max_features 个特征，即使重要性很低
-            self.rf_selector = SelectFromModel(temp_rf, max_features=n_features_to_select, threshold=-np.inf)
+            # Factor Analysis
+            n_fa = min(self.fa_components, X_dense.shape[1])
+            self.fa = FactorAnalysis(n_components=n_fa, random_state=SEED)
+            X_fa = self.fa.fit_transform(X_dense)
 
-            # SelectFromModel 可以处理稀疏矩阵
-            X_rf_selected = self.rf_selector.fit_transform(X_crossed, y)  # 输入是 X_crossed
-            # 确保选择后的数据是稀疏的
-            if not sparse.issparse(X_rf_selected):
-                X_rf_selected = sparse.csr_matrix(X_rf_selected)
-            print(f"  -> 随机森林选择后特征数: {X_rf_selected.shape[1]}")
-        else:
-            X_rf_selected = X_crossed  # 输入是 X_crossed
-            print("  -> 跳过随机森林特征选择步骤。")
+            # 组合降维特征
+            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
+            print(f"  -> SVD: {X_svd.shape[1]}, ICA: {X_ica.shape[1]}, FA: {X_fa.shape[1]}")
 
-        # --- 修改点: 使用 TruncatedSVD 降维 (输入是 X_rf_selected) ---
-        if self.use_truncated_svd:
-            print("步骤 4/4: TruncatedSVD 降维...")
-            n_components_svd = self.svd_n_components if self.svd_n_components is not None else min(100,
-                                                                                                   X_rf_selected.shape[
-                                                                                                       1] - 1)
-            # TruncatedSVD 可以直接处理稀疏矩阵
-            self.svd = TruncatedSVD(n_components=n_components_svd, random_state=SEED)
-            self.svd.fit(X_rf_selected)  # 输入是 X_rf_selected
-            print(f"TruncatedSVD 完成。保留特征数: {self.svd.n_components}")
-        else:
-            print("步骤 4/4: 跳过降维步骤 (未启用 TruncatedSVD)。")
+            # 将原始特征和降维特征结合
+            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
+            print(f"降维后总特征数: {X_dense.shape[1]}")
 
-        # --- ---
+        # 5. 智能特征选择
+        print("步骤 5: 智能特征选择...")
 
-        print(f"预处理完成。")
+        # 方差过滤
+        self.variance_selector = VarianceThreshold(threshold=self.variance_threshold)
+        X_dense = self.variance_selector.fit_transform(X_dense)
+        print(f"  -> 方差过滤后特征数: {X_dense.shape[1]}")
+
+        # 单变量特征选择
+        if y is not None and self.univariate_k_best:
+            k_best = min(self.univariate_k_best, X_dense.shape[1])
+            self.univariate_selector = SelectKBest(score_func=f_classif, k=k_best)
+            X_dense = self.univariate_selector.fit_transform(X_dense, y)
+            print(f"  -> 单变量选择后特征数: {X_dense.shape[1]}")
+
+        # 随机森林特征选择
+        if y is not None and self.rf_n_features_to_select:
+            n_rf_features = min(self.rf_n_features_to_select, X_dense.shape[1])
+            temp_rf = BalancedRandomForestClassifier(
+                n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
+            self.rf_selector = SelectFromModel(
+                temp_rf, max_features=n_rf_features, threshold=-np.inf)
+            X_dense = self.rf_selector.fit_transform(X_dense, y)
+            print(f"  -> 随机森林选择后特征数: {X_dense.shape[1]}")
+
+        print("特征工程拟合完成！")
         return self
 
     def transform(self, X):
-        """应用预处理步骤"""
-        # 处理输入类型
+        """应用特征工程变换"""
+        # 处理输入格式
         if isinstance(X, pd.DataFrame):
-            X_values = X.values  # 转换为 numpy array 以便处理
-            if self.force_sparse_output:
-                X_values = sparse.csr_matrix(X_values)
+            X_dense = X.values
         elif sparse.issparse(X):
-            X_values = X
-        else:  # numpy array
-            X_values = X
-            if self.force_sparse_output:
-                X_values = sparse.csr_matrix(X_values)
+            X_dense = X.toarray()
+        else:
+            X_dense = X
 
         # 1. 缺失值处理
-        if sparse.issparse(X_values):
-            X_dense_for_impute = X_values.toarray()
-            X_dense_for_impute[:, self.numerical_features] = self.imputer_num.transform(
-                X_dense_for_impute[:, self.numerical_features])
-            X_imputed = sparse.csr_matrix(X_dense_for_impute)
-        else:  # numpy array or dense
-            X_imputed = X_values.copy()
-            X_imputed[:, self.numerical_features] = self.imputer_num.transform(X_values[:, self.numerical_features])
+        X_dense = self.imputer_num.transform(X_dense)
 
-        # 2. 异常值处理
-        if sparse.issparse(X_imputed):
-            X_winsorized_dense = X_imputed.toarray()
-            X_winsorized_dense[:, self.numerical_features] = self.winsorizer.transform(
-                X_winsorized_dense[:, self.numerical_features])
-            X_winsorized = sparse.csr_matrix(X_winsorized_dense)
-        else:  # numpy array or dense
-            X_winsorized = X_imputed.copy()
-            X_winsorized[:, self.numerical_features] = self.winsorizer.transform(X_imputed[:, self.numerical_features])
+        # 2. 数据预处理
+        if self.power_transformer is not None:
+            X_dense = self.power_transformer.transform(X_dense)
+        X_dense = self.scaler.transform(X_dense)
 
-        # 3. 标准化
-        X_scaled = self.scaler.transform(X_winsorized)
-        if not sparse.issparse(X_scaled) and (sparse.issparse(X_winsorized) or self.force_sparse_output):
-            X_scaled = sparse.csr_matrix(X_scaled)
+        # 3. 特征工程 (注意：聚类和异常检测需要特殊处理)
+        X_dense = self._create_statistical_features(X_dense)
+        X_dense = self._create_cluster_features(X_dense)
+        X_dense = self._create_anomaly_features(X_dense)
 
-        # 3.1. 特征分箱 (如果已拟合)
-        if self.binner is not None:
-            # --- 关键修改点：确保输入到 transform 的是密集数组 ---
-            if sparse.issparse(X_scaled):
-                X_scaled_dense = X_scaled.toarray()
-            else:
-                X_scaled_dense = X_scaled
-            X_binned_dense = self.binner.transform(X_scaled_dense)  # 输入是密集的 X_scaled_dense
-            X_binned = sparse.csr_matrix(X_binned_dense)
-        else:
-            X_binned = X_scaled  # 输入是 X_scaled
+        # 4. 多重降维
+        if self.use_multiple_decomposition:
+            X_svd = self.svd.transform(X_dense)
+            X_ica = self.ica.transform(X_dense)
+            X_fa = self.fa.transform(X_dense)
+            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
+            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
 
-        # 3.2. 特征交叉 (如果已拟合)
-        if self.crosser is not None:
-            X_crossed = self.crosser.transform(X_binned)  # 输入是 X_binned
-            if not sparse.issparse(X_crossed):
-                X_crossed = sparse.csr_matrix(X_crossed)
-        else:
-            X_crossed = X_binned  # 输入是 X_binned
-
-        # 3.3. 随机森林特征选择 (如果已拟合)
+        # 5. 特征选择
+        X_dense = self.variance_selector.transform(X_dense)
+        if self.univariate_selector is not None:
+            X_dense = self.univariate_selector.transform(X_dense)
         if self.rf_selector is not None:
-            X_rf_selected = self.rf_selector.transform(X_crossed)  # 输入是 X_crossed
-            if not sparse.issparse(X_rf_selected):
-                X_rf_selected = sparse.csr_matrix(X_rf_selected)
+            X_dense = self.rf_selector.transform(X_dense)
+
+        # 输出格式控制
+        if self.force_sparse_output:
+            return sparse.csr_matrix(X_dense)
         else:
-            X_rf_selected = X_crossed  # 输入是 X_crossed
-
-        # 4. TruncatedSVD 降维
-        if self.use_truncated_svd and self.svd is not None:
-            X_reduced = self.svd.transform(X_rf_selected)  # 输入是 X_rf_selected
-            # SVD 输出通常是密集的，除非强制稀疏
-            if self.force_sparse_output:
-                X_reduced = sparse.csr_matrix(X_reduced)
-        else:
-            X_reduced = X_rf_selected  # 如果没有降维步骤
-
-        # 最终输出格式控制
-        if self.force_sparse_output and not sparse.issparse(X_reduced):
-            X_reduced = sparse.csr_matrix(X_reduced)
-        elif not self.force_sparse_output and sparse.issparse(X_reduced):
-            X_reduced = X_reduced.toarray()
-
-        return X_reduced
+            return X_dense
 
     def fit_transform(self, X, y=None):
         """组合fit和transform"""
         return self.fit(X, y).transform(X)
 
 
-# --- ---
-# --- 特征选择器类 (修改为使用 BalancedRandomForestClassifier) ---
-class GBDT_RFE_FeatureSelector:  # 类名保持不变，但功能已修改
-    """基于平衡随机森林的RFE特征选择器 (支持稀疏矩阵)"""
-
-    def __init__(self, n_features=None, step=0.1):
-        self.n_features = n_features
-        self.step = step
-        self.selector = None
-        self.feature_mask_ = None
-
-    def fit(self, X, y):
-        # 特征选择使用 BalancedRandomForestClassifier
-        # --- 修改点: 使用 BalancedRandomForestClassifier ---
-        brf = BalancedRandomForestClassifier(
-            n_estimators=500,
-            max_depth=3,
-            # learning_rate 参数不适用于 BalancedRandomForestClassifier，已移除
-            random_state=SEED
-        )
-
-        if self.n_features is None:
-            self.n_features = max(1, X.shape[1] // 2)  # 确保至少选择1个特征
-
-        self.selector = RFE(
-            estimator=brf,
-            n_features_to_select=self.n_features,
-            step=self.step,
-            verbose=1
-        )
-        self.selector.fit(X, y)
-        self.feature_mask_ = self.selector.support_
-        return self
-
-    def transform(self, X):
-        return self.selector.transform(X)
-
-
-# --- 阈值选择辅助函数 ---
+# 其他函数保持不变
 def save_model(model, filename):
     """保存模型到文件"""
     with open(filename, 'wb') as f:
@@ -410,14 +459,9 @@ def save_model(model, filename):
 
 
 def find_best_f1_threshold(y_true, y_proba):
-    """
-    在验证集上寻找最佳阈值以优化 F1 分数。
-    """
+    """在验证集上寻找最佳阈值以优化 F1 分数"""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-
-    # 计算 F1 分数
     f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-
     best_idx = np.argmax(f_scores)
     best_threshold = thresholds[best_idx]
     best_f_score = f_scores[best_idx]
@@ -431,19 +475,14 @@ def find_best_f1_threshold(y_true, y_proba):
 
 
 def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
-    """
-    在验证集上寻找能获得最高召回率且精确率不低于 min_precision 的阈值。
-    """
+    """寻找能获得最高召回率且精确率不低于 min_precision 的阈值"""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-
-    # 寻找满足最小精确率要求的索引
     valid_indices = np.where(precisions[:-1] >= min_precision)[0]
 
     if len(valid_indices) == 0:
         print(f"警告: 没有阈值能满足精确率 >= {min_precision}。返回默认阈值 0.5。")
         return 0.5
 
-    # 在满足条件的索引中找到最大召回率
     best_valid_idx = valid_indices[np.argmax(recalls[valid_indices])]
     best_threshold = thresholds[best_valid_idx]
     best_precision = precisions[best_valid_idx]
@@ -455,14 +494,11 @@ def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
     return best_threshold
 
 
-# --- 新增：评估与可视化函数 ---
 def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="Model"):
-    """
-    评估模型并绘制 ROC, PR, Confusion Matrix
-    """
+    """评估模型并绘制 ROC, PR, Confusion Matrix"""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # --- 1. ROC Curve ---
+    # ROC Curve
     fpr, tpr, _ = roc_curve(y_true, y_proba)
     roc_auc = auc(fpr, tpr)
     axes[0].plot(fpr, tpr, color='darkorange', lw=2, label=f'{model_name} (AUC = {roc_auc:.2f})')
@@ -474,16 +510,16 @@ def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="M
     axes[0].set_title('Receiver Operating Characteristic')
     axes[0].legend(loc="lower right")
 
-    # --- 2. Precision-Recall Curve ---
+    # Precision-Recall Curve
     precision, recall, _ = precision_recall_curve(y_true, y_proba)
-    pr_auc = auc(recall, precision)  # AUC of PR curve
+    pr_auc = auc(recall, precision)
     axes[1].plot(recall, precision, color='b', lw=2, label=f'{model_name} (AUC = {pr_auc:.2f})')
     axes[1].set_xlabel('Recall')
     axes[1].set_ylabel('Precision')
     axes[1].set_title('Precision-Recall Curve')
     axes[1].legend(loc="lower left")
 
-    # --- 3. Confusion Matrix (使用 F1 优化阈值) ---
+    # Confusion Matrix
     y_pred_f1 = (y_proba >= threshold_f1).astype(int)
     cm = confusion_matrix(y_true, y_pred_f1)
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[2])
@@ -494,71 +530,65 @@ def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="M
     plt.tight_layout()
     plt.show()
 
-    # --- 打印详细报告 ---
     print(f"\n=== {model_name} 详细评估报告 ===")
     print(classification_report(y_true, y_pred_f1, target_names=['Negative', 'Positive']))
     print("-" * 40)
 
 
-def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_test, preprocessor_params=None):
-    """取消超参数搜索的训练评估流程 (XGBoost 版本, 支持稀疏矩阵)"""
-    # --- 构建 Pipeline (注意: SMOTETomek 通常在Pipeline外处理) ---
-    print("\n=== 构建 Scikit-learn Pipeline ===")
-    # Pipeline 主要用于预处理和最终分类器
-    # 注意：AdvancedPreprocessor 现在可以处理稀疏矩阵
-    preprocessor = AdvancedPreprocessor(**preprocessor_params)
-    classifier = XGBClassifier(random_state=SEED, n_jobs=-1)  # XGBoost 原生支持稀疏输入
+def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
+    """使用先进特征工程的训练评估流程"""
+    print("\n=== 构建先进特征工程管道 ===")
 
-    # --- 1. 预处理训练数据 (仅拟合一次!) ---
-    print("\n=== 拟合预处理器 (基于原始训练数据) ===")
-    preprocessor.fit(X_train, y_train)
-    X_train_preprocessed = preprocessor.transform(X_train)
+    # 特征工程
+    feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
+    classifier = XGBClassifier(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=SEED,
+        n_jobs=-1,
+        eval_metric='logloss'
+    )
 
-    # --- 2. 应用 SMOTETomek 重采样 (在预处理后的数据上) ---
+    # 1. 拟合特征工程器
+    print("\n=== 拟合特征工程器 ===")
+    feature_engineer.fit(X_train, y_train)
+    X_train_engineered = feature_engineer.transform(X_train)
+
+    # 2. 应用 SMOTETomek
     print("\n=== 应用 SMOTETomek 重采样 ===")
-    # 应用 SMOTETomek (需要密集矩阵)
-    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_preprocessed, y_train)
+    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered, y_train)
 
-    # --- 3. 模型训练 (在重采样后的数据上) ---
+    # 3. 模型训练
     print("\n=== 开始模型训练 ===")
     start_time = time.time()
-
-    # 直接使用重采样后的数据训练分类器
-    # 不需要重新拟合 preprocessor，因为它已经基于原始训练数据拟合好了
     classifier.fit(X_train_resampled, y_train_resampled)
-
     end_time = time.time()
-    print(f"\n模型训练耗时: {end_time - start_time:.2f} 秒")
+    print(f"模型训练耗时: {end_time - start_time:.2f} 秒")
 
-    # --- 保存训练好的模型 ---
-    # 保存整个Pipeline或组件
+    # 4. 保存模型
     trained_pipeline = Pipeline([
-        ('preprocessor', preprocessor),
+        ('feature_engineer', feature_engineer),
         ('classifier', classifier)
     ])
-    save_model(trained_pipeline, 'trained_model_without_search_xgb_sparse.pkl')
+    save_model(trained_pipeline, 'advanced_feature_engineering_model.pkl')
 
-    # --- 在验证集上寻找最佳阈值 ---
+    # 5. 验证集阈值选择
     print("\n=== 验证集阈值选择 ===")
-    # 需要先对验证集进行预处理 (使用最初拟合的 preprocessor)
-    X_val_processed = preprocessor.transform(X_val) # <-- 这里不会再报错，因为 preprocessor 是基于原始维度拟合的
-    val_proba = classifier.predict_proba(X_val_processed)[:, 1]
+    X_val_engineered = feature_engineer.transform(X_val)
+    val_proba = classifier.predict_proba(X_val_engineered)[:, 1]
 
-    # 1. 寻找最佳 F1 阈值
-    print("\n[阈值选择 1] 优化 F1 分数...")
     threshold_f1 = find_best_f1_threshold(y_val, val_proba)
-
-    # 2. 寻找高召回率阈值 (例如，要求 Precision >= 0.4)
-    print("\n[阈值选择 2] 优化召回率 (要求 Precision >= 0.4)...")
     threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
 
-    # --- 测试集评估 ---
+    # 6. 测试集评估
     print("\n=== 测试集评估 ===")
-    # 需要先对测试集进行预处理 (使用最初拟合的 preprocessor)
-    X_test_processed = preprocessor.transform(X_test) # <-- 这里也不会再报错
-    test_proba = classifier.predict_proba(X_test_processed)[:, 1]
+    X_test_engineered = feature_engineer.transform(X_test)
+    test_proba = classifier.predict_proba(X_test_engineered)[:, 1]
 
-    # 使用 F1 优化的阈值评估
+    # F1优化阈值评估
     print("\n--- 使用 F1 优化阈值评估 ---")
     y_pred_f1 = (test_proba >= threshold_f1).astype(int)
     recall_f1 = recall_score(y_test, y_pred_f1)
@@ -574,7 +604,7 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
     print(f"Accuracy: {accuracy_f1:.4f}")
     print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_f1 + 50 * auc_f1 + 30 * recall_f1:.4f}")
 
-    # 使用高召回率阈值评估
+    # 高召回率阈值评估
     print("\n--- 使用高召回率阈值评估 ---")
     y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
     recall_hr = recall_score(y_test, y_pred_hr)
@@ -590,9 +620,10 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
     print(f"Accuracy: {accuracy_hr:.4f}")
     print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_hr + 50 * auc_hr + 30 * recall_hr:.4f}")
 
-    # --- 可视化评估结果 ---
+    # 可视化评估结果
     print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall, model_name="XGBoost (No Search, Sparse)")
+    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall,
+                      model_name="Advanced Feature Engineering XGBoost")
 
     return {
         'recall': recall_f1,
@@ -609,35 +640,57 @@ def train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_
             'f1': f1_hr,
             'threshold': threshold_high_recall
         },
-        'trained_model': trained_pipeline  # 返回训练好的Pipeline
+        'trained_model': trained_pipeline
     }
 
 
-
 def main():
-    # 检查CUDA可用性 (PyTorch)
+    # 检查CUDA可用性
     print("CUDA 可用性 (PyTorch):", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("当前 CUDA 设备:", torch.cuda.current_device())
         print("CUDA 设备名称:", torch.cuda.get_device_name(0))
 
-    # --- 配置预处理器参数 ---
-    # 建议: 使用稀疏友好的设置
-    preprocessor_params = {
-        'n_bins': 10,
-        'cross_degree': 2,
-        'rf_n_features_to_select': 1000,  # 可尝试更小值如 500
-        'use_truncated_svd': True,  # 强烈推荐：使用 TruncatedSVD 替代 PCA
-        'svd_n_components': 50,  # TruncatedSVD保留的成分
-        'force_sparse_output': True  # 强制输出为稀疏矩阵
+    # 配置先进特征工程参数
+    feature_engineer_params = {
+        # 预处理配置
+        'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
+        'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
+
+        # 统计特征配置
+        'create_statistical_features': True,
+        'rolling_windows': [3, 5, 10],
+
+        # 聚类特征配置
+        'create_cluster_features': True,
+        'n_clusters_kmeans': 15,  # 增加聚类数量
+        'dbscan_eps': 0.3,
+        'dbscan_min_samples': 5,
+
+        # 异常检测特征配置
+        'create_anomaly_features': True,
+        'isolation_contamination': 0.05,  # 假设5%的数据是异常值
+        'lof_n_neighbors': 20,
+
+        # 多重降维配置
+        'use_multiple_decomposition': True,
+        'svd_components': 80,  # 增加SVD成分
+        'ica_components': 50,  # 增加ICA成分
+        'fa_components': 30,  # 增加FA成分
+
+        # 特征选择配置
+        'variance_threshold': 0.01,
+        'univariate_k_best': 1500,  # 增加单变量选择的特征数
+        'rf_n_features_to_select': 1000,  # 最终保留1000个特征
+
+        # 输出格式
+        'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
     }
 
-    # 加载数据 (尝试加载为稀疏矩阵)
+    # 数据加载
     print("\n=== 数据加载 ===")
     try:
-        # 尝试以稀疏格式读取 (如果原始CSV是稀疏的，这可能有效)
-        # 注意：pandas read_csv 的 sparse=True 可能不总是有效，取决于数据
-        data = pd.read_csv("clean.csv", low_memory=False)  # 通常不直接支持 sparse=True 有效加载
+        data = pd.read_csv("clean.csv", low_memory=False)
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
         if "target" not in data.columns:
@@ -646,23 +699,11 @@ def main():
         # 分离特征和目标
         y = data["target"].values.astype(int)
         feature_data = data.drop(columns=["target"])
-
-        # 尝试转换为稀疏矩阵
-        print("尝试将特征数据转换为稀疏矩阵...")
-        X_dense = feature_data.values
-        # 这里可以根据数据的稀疏性决定是否转换
-        # 一个简单的启发式：如果0的比例超过某个阈值，则认为是稀疏的
-        sparsity_ratio = 1.0 - np.count_nonzero(X_dense) / X_dense.size
-        print(f"数据稀疏度 (0的比例): {sparsity_ratio:.4f}")
-        if sparsity_ratio > 0.5:  # 例如，超过50%为0
-            X = sparse.csr_matrix(X_dense)
-            print("特征数据已转换为稀疏矩阵 (csr_matrix)。")
-        else:
-            X = X_dense
-            print("特征数据保持为密集矩阵。")
+        X = feature_data.values
 
         print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
-        print(f"使用的预处理器参数: {preprocessor_params}")
+        print(f"正样本比例: {np.mean(y):.4f}")
+        print(f"使用的特征工程参数: {feature_engineer_params}")
     except Exception as e:
         print(f"数据加载失败: {str(e)}")
         return
@@ -671,41 +712,50 @@ def main():
     if np.isnan(y).any():
         print("移除y中的NaN...")
         mask = ~np.isnan(y)
-        if sparse.issparse(X):
-            X = X[mask]  # 稀疏矩阵的布尔索引
-        else:
-            X = X[mask]
+        X = X[mask]
         y = y[mask]
 
-    # 数据划分: 10% 测试集, 90% 临时集
+    # 数据划分
     X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.1, random_state=SEED, stratify=y
-    )
+        X, y, test_size=0.1, random_state=SEED, stratify=y)
     print(f"\n初步数据划分: 临时集={X_temp.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # 再次划分临时集
     X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp
-    )
+        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp)
     print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # --- 调用新的训练评估函数 (取消搜索) ---
-    print("\n=== 启动不带超参数搜索的训练评估流程 (XGBoost 版本, 稀疏矩阵) ===")
-    results = train_and_evaluate_without_search(X_train, y_train, X_val, y_val, X_test, y_test,
-                                                preprocessor_params=preprocessor_params)
+    # 启动先进特征工程训练流程
+    print("\n=== 启动先进特征工程训练流程 ===")
+    results = train_and_evaluate_advanced(
+        X_train, y_train, X_val, y_val, X_test, y_test,
+        feature_engineer_params=feature_engineer_params
+    )
 
-    # 保存预测结果 (使用 F1 优化的预测)
+    # 保存预测结果
     if 'y_proba' in results and 'y_pred' in results:
         pd.DataFrame({
             'true_label': y_test,
             'pred_prob': results['y_proba'],
             'pred_label_f1_optimized': results['y_pred']
-        }).to_csv("predictions.csv", index=False)
-        print("\n预测结果已保存")
+        }).to_csv("advanced_predictions.csv", index=False)
+        print("\n预测结果已保存到 advanced_predictions.csv")
+
+    # 打印最终总结
+    print("\n" + "=" * 50)
+    print("先进特征工程模型训练完成！")
+    print("=" * 50)
+    print(f"最佳F1阈值: {results['threshold']:.4f}")
+    print(f"测试集性能:")
+    print(f"  - Precision: {results['precision']:.4f}")
+    print(f"  - Recall: {results['recall']:.4f}")
+    print(f"  - F1-Score: {results['f1']:.4f}")
+    print(f"  - AUC-ROC: {results['auc']:.4f}")
+    print(f"  - Accuracy: {results['accuracy']:.4f}")
+
+    test_score = 20 * results['precision'] + 50 * results['auc'] + 30 * results['recall']
+    print(f"  - 综合得分: {test_score:.4f}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
     main()
-
-
-
