@@ -260,7 +260,7 @@ def main():
 
     # --- 数据加载 ---
     print("正在加载数据 'clean.csv'...")
-    data = pd.read_csv("clean.csv")
+    data = pd.read_csv("../../UseBert/train_bert_embedded.csv")
     if "company_id" in data.columns:
         data = data.drop(columns=["company_id"])
         print("已移除 'company_id' 列。")

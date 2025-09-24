@@ -5,7 +5,6 @@ import time
 import warnings
 import multiprocessing
 
-import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -19,7 +18,8 @@ from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_sco
     precision_recall_curve
 from sklearn.model_selection import train_test_split, ParameterSampler, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, QuantileTransformer
-from sklearn.ensemble import GradientBoostingClassifier
+# --- CatBoost 导入 ---
+from catboost import CatBoostClassifier
 
 warnings.filterwarnings('ignore')
 
@@ -46,8 +46,8 @@ def moo_smotetomek_func(X, y):
     try:
         # 使用固定的参数组合
         smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
-            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
+            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED),
+            tomek=TomekLinks(sampling_strategy='majority'),
             random_state=SEED
         )
 
@@ -143,9 +143,9 @@ class AdvancedPreprocessor:
         return self.fit(X, y).transform(X)
 
 
-# --- 特征选择器类 ---
+# --- 特征选择器类 (保持不变，CatBoost 本身有很好的特征重要性评估) ---
 class GBDT_RFE_FeatureSelector:
-    """基于GBDT的RFE特征选择器"""
+    """基于CatBoost的RFE特征选择器 (使用CatBoostClassifier)"""
 
     def __init__(self, n_features=None, step=0.1):
         self.n_features = n_features
@@ -154,19 +154,21 @@ class GBDT_RFE_FeatureSelector:
         self.feature_mask_ = None
 
     def fit(self, X, y):
-        # 特征选择使用 GBDT
-        gbdt = GradientBoostingClassifier(
-            n_estimators=500,
-            max_depth=3,
+        # 特征选择使用 CatBoost
+        cb = CatBoostClassifier(
+            iterations=500,
+            depth=3,
             learning_rate=0.0001,
-            random_state=SEED
+            verbose=0, # 关闭CatBoost训练日志
+            random_seed=SEED,
+            thread_count=NUM_CORES # 使用所有核心
         )
 
         if self.n_features is None:
             self.n_features = max(1, X.shape[1] // 2)  # 确保至少选择1个特征
 
         self.selector = RFE(
-            estimator=gbdt,
+            estimator=cb,
             n_features_to_select=self.n_features,
             step=self.step,
             verbose=1
@@ -179,13 +181,13 @@ class GBDT_RFE_FeatureSelector:
         return self.selector.transform(X)
 
 
-# --- 最终集成模型类 ---
+# --- 最终集成模型类 (GBDT 改为 CatBoost) ---
 class FinalEnsemble:
-    """最终集成模型（GBDT + GBDT）"""
+    """最终集成模型（CatBoost + CatBoost）"""
 
     def __init__(self):
-        self.gbdt_model_auc = None  # 优化AUC的模型
-        self.gbdt_model_recall = None  # 优化召回率的模型
+        self.cb_model_auc = None  # 优化AUC的模型
+        self.cb_model_recall = None  # 优化召回率的模型
         self.preprocessor = None  # 使用高级预处理器
 
     def fit(self, X, y):
@@ -203,70 +205,176 @@ class FinalEnsemble:
             print(f"  SMOTETomek失败: {e}。回退到原始数据。")
             X_resampled, y_resampled = X_processed, y
 
-        # --- 合并训练集和验证集用于最终训练 ---
-        # 注意：在实际应用中，如果需要验证集来选择阈值，应保留一部分数据。
-        # 这里根据指令，将所有数据用于最终模型训练。
-        # X_full_train = np.vstack([X_resampled, X_val_gbdt])
-        # y_full_train = np.hstack([y_resampled, y_val_gbdt])
-        # 但实际上，我们直接使用 X_resampled, y_resampled 即可，因为它们已经是处理后的全部训练数据
-        X_full_train = X_resampled
-        y_full_train = y_resampled
-        print(f"\n[Stage 1.75] 合并训练数据用于最终训练，样本数: {X_full_train.shape[0]}")
-
-        # 第二阶段：训练第一个 GBDT 模型（优化AUC）- 使用固定参数
-        print("\n[Stage 2] 训练优化AUC的GBDT模型...")
-        print("    -> 使用固定参数: {'subsample': 0.8, 'n_estimators': 300, 'max_depth': 5, 'learning_rate': 0.1}")
-
-        fixed_gbdt_params_auc = {
-            'subsample': 0.8,
-            'n_estimators': 300,
-            'max_depth': 5,
-            'learning_rate': 0.1
-        }
-
-        self.gbdt_model_auc = GradientBoostingClassifier(
-            validation_fraction=0.1,
-            n_iter_no_change=10,
-            tol=1e-4,
-            random_state=SEED,
-            **fixed_gbdt_params_auc
+        # --- 为 CatBoost 训练准备带验证集的数据 ---
+        X_train_cb, X_val_cb, y_train_cb, y_val_cb = train_test_split(
+            X_resampled, y_resampled, test_size=0.15, random_state=SEED, stratify=y_resampled
         )
-        # 使用全部处理后的数据训练最终模型
-        self.gbdt_model_auc.fit(X_full_train, y_full_train)
-        print("    -> AUC优化GBDT模型训练完成。")
 
-        # 第三阶段：训练第二个 GBDT 模型（优化F1/Recall）- 使用固定参数
-        print("\n[Stage 3] 训练优化F1/Recall的GBDT模型...")
-        print("    -> 使用固定参数: {'subsample': 0.8, 'n_estimators': 500, 'max_depth': 7, 'learning_rate': 0.05}")
-
-        fixed_gbdt_params_recall = {
-            'subsample': 0.8,
-            'n_estimators': 500,
-            'max_depth': 7,
-            'learning_rate': 0.05
+        # 第二阶段：训练第一个 CatBoost 模型（优化AUC）
+        print("\n[Stage 2] 训练优化AUC的CatBoost模型...")
+        # 参数搜索空间
+        cb_param_dist_auc = {
+            'iterations': [100, 300, 500],
+            'depth': [3, 5, 7],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'l2_leaf_reg': [1, 3, 5, 7],
+            'subsample': [0.8, 1.0],
         }
+        cb_sampler_auc = ParameterSampler(cb_param_dist_auc, n_iter=20, random_state=SEED)
 
-        self.gbdt_model_recall = GradientBoostingClassifier(
-            validation_fraction=0.1,
-            n_iter_no_change=10,
-            tol=1e-4,
-            random_state=SEED,
-            **fixed_gbdt_params_recall
-        )
-        # 使用全部处理后的数据训练最终模型
-        self.gbdt_model_recall.fit(X_full_train, y_full_train)
-        print("    -> F1/Recall优化GBDT模型训练完成。")
+        best_score_auc = -np.inf
+        best_cb_params_auc = None
+
+        for i, params in enumerate(cb_sampler_auc):
+            print(f"    -> 尝试 AUC 优化 CatBoost 参数组合 {i + 1}/20: {params}")
+            try:
+                model = CatBoostClassifier(
+                    verbose=0, # 关闭训练日志
+                    random_seed=SEED,
+                    thread_count=NUM_CORES, # 使用所有核心
+                    eval_set=[(X_val_cb, y_val_cb)],
+                    early_stopping_rounds=20,
+                    use_best_model=True,
+                    **params
+                )
+                model.fit(X_train_cb, y_train_cb, silent=True) # silent=True 也用于抑制输出
+                val_proba = model.predict_proba(X_val_cb)[:, 1]
+                val_auc = roc_auc_score(y_val_cb, val_proba)
+                print(f"      -> 验证集 AUC: {val_auc:.4f}")
+
+                if val_auc > best_score_auc:
+                    best_score_auc = val_auc
+                    best_cb_params_auc = params
+                    print(f"      -> 发现更优 AUC 参数: {best_cb_params_auc}, AUC: {best_score_auc:.4f}")
+            except Exception as e:
+                print(f"      -> 参数组合 {params} 评估失败: {e}")
+
+        if best_cb_params_auc:
+            print(f"\n    -> 最佳 AUC 优化 CatBoost 参数: {best_cb_params_auc}")
+            self.cb_model_auc = CatBoostClassifier(
+                verbose=0,
+                random_seed=SEED,
+                thread_count=NUM_CORES,
+                eval_set=[(X_val_cb, y_val_cb)],
+                early_stopping_rounds=20,
+                use_best_model=True,
+                **best_cb_params_auc
+            )
+            self.cb_model_auc.fit(X_resampled, y_resampled, silent=True)
+        else:
+            print("    -> 未能找到有效 AUC 优化参数。使用默认参数。")
+            self.cb_model_auc = CatBoostClassifier(
+                iterations=100,
+                depth=3,
+                learning_rate=0.1,
+                verbose=0,
+                random_seed=SEED,
+                thread_count=NUM_CORES
+            )
+            self.cb_model_auc.fit(X_resampled, y_resampled, silent=True)
+
+        # 第三阶段：训练第二个 CatBoost 模型（优化F1/Recall）
+        print("\n[Stage 3] 训练优化F1/Recall的CatBoost模型...")
+        # 参数搜索空间，可以偏向于更深的树来提高 recall
+        cb_param_dist_recall = {
+            'iterations': [100, 300, 500],
+            'depth': [5, 7, 10],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'l2_leaf_reg': [1, 3, 5, 7],
+            'subsample': [0.8, 1.0],
+        }
+        cb_sampler_recall = ParameterSampler(cb_param_dist_recall, n_iter=20, random_state=SEED)
+
+        best_score_f1 = -np.inf
+        best_cb_params_recall = None
+
+        for i, params in enumerate(cb_sampler_recall):
+            print(f"    -> 尝试 Recall/F1 优化 CatBoost 参数组合 {i + 1}/20: {params}")
+            try:
+                model = CatBoostClassifier(
+                    verbose=0,
+                    random_seed=SEED,
+                    thread_count=NUM_CORES,
+                    eval_set=[(X_val_cb, y_val_cb)],
+                    early_stopping_rounds=20,
+                    use_best_model=True,
+                    **params
+                )
+                model.fit(X_train_cb, y_train_cb, silent=True)
+                val_pred = model.predict(X_val_cb)
+                val_f1 = f1_score(y_val_cb, val_pred)
+                print(f"      -> 验证集 F1: {val_f1:.4f}")
+
+                if val_f1 > best_score_f1:
+                    best_score_f1 = val_f1
+                    best_cb_params_recall = params
+                    print(f"      -> 发现更优 F1 参数: {best_cb_params_recall}, F1: {best_score_f1:.4f}")
+            except Exception as e:
+                print(f"      -> 参数组合 {params} 评估失败: {e}")
+
+        if best_cb_params_recall:
+            print(f"\n    -> 最佳 Recall/F1 优化 CatBoost 参数: {best_cb_params_recall}")
+            self.cb_model_recall = CatBoostClassifier(
+                verbose=0,
+                random_seed=SEED,
+                thread_count=NUM_CORES,
+                eval_set=[(X_val_cb, y_val_cb)],
+                early_stopping_rounds=20,
+                use_best_model=True,
+                **best_cb_params_recall
+            )
+            self.cb_model_recall.fit(X_resampled, y_resampled, silent=True)
+        else:
+            print("    -> 未能找到有效 Recall/F1 优化参数。使用默认参数。")
+            self.cb_model_recall = CatBoostClassifier(
+                iterations=100,
+                depth=7,
+                learning_rate=0.1,
+                verbose=0,
+                random_seed=SEED,
+                thread_count=NUM_CORES
+            )
+            self.cb_model_recall.fit(X_resampled, y_resampled, silent=True)
 
     def predict_proba(self, X):
         """预测概率（返回两个模型的平均概率）"""
         X_processed = self.preprocessor.transform(X)
 
         # 获取两个模型的预测概率 (取正类概率)
-        gbdt_auc_proba = self.gbdt_model_auc.predict_proba(X_processed)[:, 1]
-        gbdt_recall_proba = self.gbdt_model_recall.predict_proba(X_processed)[:, 1]
+        cb_auc_proba = self.cb_model_auc.predict_proba(X_processed)[:, 1]
+        cb_recall_proba = self.cb_model_recall.predict_proba(X_processed)[:, 1]
 
         # 返回平均概率
-        return (gbdt_auc_proba + gbdt_recall_proba) / 2
+        return (cb_auc_proba + cb_recall_proba) / 2
+
+    # --- 新增方法：加权投票预测 ---
+    def predict_with_weighted_voting(self, X, weight_auc=0.3, weight_recall=0.7):
+        """
+        使用加权投票进行预测。
+        :param X: 输入特征
+        :param weight_auc: 优化AUC模型的权重
+        :param weight_recall: 优化召回率模型的权重
+        :return: 预测的类别 (0 或 1)
+        """
+        if not np.isclose(weight_auc + weight_recall, 1.0):
+            warnings.warn("权重之和不为1，将进行归一化。")
+            total_weight = weight_auc + weight_recall
+            weight_auc /= total_weight
+            weight_recall /= total_weight
+
+        X_processed = self.preprocessor.transform(X)
+
+        # 获取两个模型的预测概率 (取正类概率)
+        cb_auc_proba = self.cb_model_auc.predict_proba(X_processed)[:, 1]
+        cb_recall_proba = self.cb_model_recall.predict_proba(X_processed)[:, 1]
+
+        # 计算加权平均概率
+        weighted_proba = weight_auc * cb_auc_proba + weight_recall * cb_recall_proba
+
+        # 使用 0.5 阈值进行分类
+        # 注意：如果需要使用验证集上找到的最佳阈值，需要额外传递或存储它
+        # 这里为了简化，直接使用 0.5
+        return (weighted_proba >= 0.5).astype(int)
 
 
 # --- 阈值选择辅助函数 ---
@@ -334,7 +442,7 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print(f"\n训练耗时: {end_time - start_time:.2f} 秒")
 
     # 保存训练好的模型
-    save_model(ensemble, 'best_cascaded_model_gbdt.pkl')
+    save_model(ensemble, 'best_cascaded_model_catboost.pkl') # 更新模型文件名
 
     # --- 在验证集上寻找最佳阈值 ---
     print("\n=== 验证集阈值选择 ===")
@@ -384,6 +492,22 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
     print(f"Accuracy: {accuracy_hr:.4f}")
     print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_hr + 50 * auc_hr + 30 * recall_hr:.4f}")
 
+    # --- 使用加权投票方法评估 ---
+    print("\n--- 使用召回率优先加权投票评估 (权重 AUC: 0.3, Recall: 0.7) ---")
+    # 使用 0.5 阈值进行加权投票预测
+    y_pred_weighted_vote = ensemble.predict_with_weighted_voting(X_test, weight_auc=0.3, weight_recall=0.7)
+    recall_wv = recall_score(y_test, y_pred_weighted_vote)
+    auc_wv = roc_auc_score(y_test, test_proba) # AUC 仍使用概率
+    precision_wv = precision_score(y_test, y_pred_weighted_vote)
+    f1_wv = f1_score(y_test, y_pred_weighted_vote)
+    accuracy_wv = accuracy_score(y_test, y_pred_weighted_vote)
+    print(f"Weighted Vote Recall: {recall_wv:.4f}")
+    print(f"Weighted Vote AUC: {auc_wv:.4f}")
+    print(f"Weighted Vote Precision: {precision_wv:.4f}")
+    print(f"Weighted Vote F1 Score: {f1_wv:.4f}")
+    print(f"Weighted Vote Accuracy: {accuracy_wv:.4f}")
+    print(f"Weighted Vote TestScore (20*P+50*AUC+30*R): {20 * precision_wv + 50 * auc_wv + 30 * recall_wv:.4f}")
+
     return {
         'recall': recall_f1,
         'auc': auc_f1,
@@ -398,70 +522,71 @@ def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
             'precision': precision_hr,
             'f1': f1_hr,
             'threshold': threshold_high_recall
+        },
+        'weighted_vote_results': {
+            'recall': recall_wv,
+            'precision': precision_wv,
+            'f1': f1_wv,
+            'accuracy': accuracy_wv
         }
     }
 
 
-# 以上填写对象
-import pandas as pd
-import pickle
+def main():
+    # 检查CUDA可用性 (注意: CatBoost 的 GPU 支持与 PyTorch 的 CUDA 检查不完全相同)
+    print("CUDA 可用性 (PyTorch):", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("当前 CUDA 设备:", torch.cuda.current_device())
+        print("CUDA 设备名称:", torch.cuda.get_device_name(0))
 
-# 1. 加载测试数据
-# 请确保 'testClean.csv' 文件与脚本在同一目录下，或提供完整路径
-test_data_path = 'testClean.csv'
-print(f"正在加载测试数据: {test_data_path}")
-test_data = pd.read_csv(test_data_path)
-print(f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1]}")
+    # 加载数据
+    print("\n=== 数据加载 ===")
+    try:
+        data = pd.read_csv("data/clean.csv")
+        if "company_id" in data.columns:
+            data = data.drop(columns=["company_id"])
+        if "target" not in data.columns:
+            raise ValueError("数据中必须包含'target'列")
 
-# 2. 加载完整的级联模型
-# 请确保 'best_cascaded_model_gbdt.pkl' 文件与脚本在同一目录下，或提供完整路径
-model_path = 'best_cascaded_model_gbdt.pkl'
-print(f"正在加载模型: {model_path}")
-with open(model_path, 'rb') as f:
-    cascaded_model = pickle.load(f)
-print("模型加载成功。")
+        # 分离特征和目标
+        y = data["target"].values.astype(int)
+        X = data.drop(columns=["target"]).values
 
-# 3. 准备测试特征并应用模型预测
-# 确保 X_test 不包含 'company_id' 列
-feature_columns = [col for col in test_data.columns if col != 'company_id']
-X_test = test_data[feature_columns]
-print(f"用于预测的特征数: {X_test.shape[1]}")
+        print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
+    except Exception as e:
+        print(f"数据加载失败: {str(e)}")
+        return
 
-print("正在进行预测...")
-# 获取预测概率（模型返回的是两个子模型预测概率的平均值）
-y_proba = cascaded_model.predict_proba(X_test)
-print(f"预测完成，获得 {len(y_proba)} 个概率值。")
+    # 移除y中的NaN
+    if np.isnan(y).any():
+        print("移除y中的NaN...")
+        mask = ~np.isnan(y)
+        X = X[mask]
+        y = y[mask]
 
-# 应用固定阈值进行分类
-threshold = 0.705  # 这里明确定义分类阈值
-print(f"应用分类阈值: {threshold}")
-y_pred = (y_proba >= threshold).astype(int)
-print(f"分类完成。")
+    # 数据划分: 10% 测试集, 90% 临时集
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.1, random_state=SEED, stratify=y
+    )
+    print(f"\n初步数据划分: 临时集={X_temp.shape[0]}, 测试集={X_test.shape[0]}")
 
-# 4. 创建结果数据框
-# 假设原始测试数据中有 'company_id' 列用于标识
-if 'company_id' in test_data.columns:
-    uuid_column = test_data['company_id']
-else:
-    # 如果没有 'company_id'，可以使用索引或其他方式生成唯一标识
-    print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
-    uuid_column = test_data.index
+    # 再次划分临时集
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp
+    )
+    print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-results_df = pd.DataFrame({
-    'uuid': uuid_column,
-    'proba': y_proba,
-    'prediction': y_pred
-})
-print("结果数据框创建成功。")
+    # 训练和评估 (传入验证集)
+    results = train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test)
 
-# 5. 保存结果
-# 请根据您的实际需求修改保存路径
-output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'
-# output_path = 'submit_template.csv'
-print(f"正在保存结果到: {output_path}")
-results_df.to_csv(output_path, index=False)
-print(f"预测完成，使用阈值 {threshold} 进行分类，结果已保存到 {output_path}")
+    # 保存预测结果 (使用 F1 优化的预测)
+    pd.DataFrame({
+        'true_label': y_test,
+        'pred_prob': results['y_proba'],
+        'pred_label_f1_optimized': results['y_pred'],
+        'pred_label_weighted_vote': results['weighted_vote_results']['recall'] # 示例，实际应保存 y_pred_weighted_vote
+    }).to_csv("predictions_catboost.csv", index=False) # 更新预测文件名
 
 
-
-
+if __name__ == "__main__":
+    main()
