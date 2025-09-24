@@ -173,27 +173,33 @@ class AdvancedFeatureEngineer:
         self.embedding_groups = {}
 
     def _identify_embedding_groups(self, feature_names):
-        """识别并分组 *_name_emb_* 形式的特征"""
+        """识别并分组 *_emb_* 形式的特征"""
         print("  -> 识别嵌入特征组...")
-        emb_pattern = "_name_emb_"
+        emb_pattern = "_emb_" # 修改为新的模式
         emb_dict = {}
 
         for feat in feature_names:
             if emb_pattern in feat:
-                # 提取前缀 (例如 'industry_l3')
-                prefix = feat.split(emb_pattern)[0]
-                if prefix not in emb_dict:
-                    emb_dict[prefix] = []
-                emb_dict[prefix].append(feat)
+                # 提取前缀 (例如 'industry_emb_0' -> 'industry')
+                parts = feat.split(emb_pattern)
+                if len(parts) >= 2:
+                    prefix = emb_pattern.join(parts[:-1]) # 处理 'a_emb_b_emb_0' 的情况
+                    suffix = parts[-1]
+                    # 确保后缀是数字
+                    if suffix.isdigit():
+                        if prefix not in emb_dict:
+                            emb_dict[prefix] = []
+                        emb_dict[prefix].append(feat)
 
         # 按照编号排序每个组内的特征
         for prefix, feats in emb_dict.items():
+            # 根据后缀数字排序
             feats.sort(key=lambda x: int(x.split('_')[-1]))
             self.embedding_groups[prefix] = feats
             print(f"    -> 发现嵌入组 '{prefix}': 包含 {len(feats)} 个特征")
 
     def _process_embedding_features(self, X_df):
-        """处理嵌入特征：将 *_name_emb_* 组合并为向量特征"""
+        """处理嵌入特征：将 *_emb_* 组合并为向量特征，并保留原始向量和范数"""
         if not self.embedding_groups:
             print("  -> 未发现嵌入特征组，跳过处理。")
             return X_df
@@ -205,21 +211,22 @@ class AdvancedFeatureEngineer:
             print(f"    -> 处理组 '{prefix}' ({len(emb_features)} 个特征)...")
             # 提取嵌入向量
             emb_vectors = X_processed_df[emb_features].values
-            # 为新特征命名 (例如 'industry_l3_emb_vector')
-            new_feature_name = f"{prefix}_emb_vector"
-            # 将向量作为新列添加 (注意：这会创建一个包含数组的列)
-            # 为了兼容后续处理，我们通常会进行统计操作，例如均值、标准差等
-            # 这里我们计算向量的L2范数作为示例
-            vector_norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
-            X_processed_df[new_feature_name] = vector_norms.flatten()
 
-            # 可选：也可以添加向量的均值、最大值等统计信息
-            # vector_means = np.mean(emb_vectors, axis=1, keepdims=True)
-            # X_processed_df[f"{prefix}_emb_mean"] = vector_means.flatten()
+            # 1. 为新特征命名 (例如 'industry_emb_vector')
+            new_vector_feature_name = f"{prefix}_emb_vector"
+            new_norm_feature_name = f"{prefix}_emb_norm"
 
-            # 删除原始的嵌入特征列
+            # 2. 将向量作为新列添加 (注意：这会创建一个包含数组的列)
+            #    这里我们将向量本身作为一个特征存储
+            X_processed_df[new_vector_feature_name] = list(emb_vectors)
+
+            # 3. 计算向量的L2范数作为另一个特征
+            vector_norms = np.linalg.norm(emb_vectors, axis=1)
+            X_processed_df[new_norm_feature_name] = vector_norms
+
+            # 4. 删除原始的嵌入特征列
             X_processed_df = X_processed_df.drop(columns=emb_features)
-            print(f"    -> 合并为特征 '{new_feature_name}' 并移除原始列")
+            print(f"    -> 合并为特征 '{new_vector_feature_name}' 和 '{new_norm_feature_name}' 并移除原始列")
 
         print(f"  -> 嵌入特征处理完成，剩余特征数: {X_processed_df.shape[1]}")
         return X_processed_df
@@ -750,6 +757,7 @@ def main():
     # 数据加载
     print("\n=== 数据加载 ===")
     try:
+        # 假设你的数据文件是 train_bert_embedded.csv
         data = pd.read_csv("train_bert_embedded.csv", low_memory=False)
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
@@ -819,3 +827,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
