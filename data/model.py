@@ -11,14 +11,19 @@ import torch
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
 from imblearn.combine import SMOTETomek
-from sklearn.decomposition import PCA
-from sklearn.feature_selection import RFE
+# --- 导入随机森林和特征选择器 ---
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.feature_selection import RFE, SelectFromModel
+# --- ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, precision_score, roc_auc_score, f1_score, accuracy_score, \
     precision_recall_curve
 from sklearn.model_selection import train_test_split, ParameterSampler, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, QuantileTransformer
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler, QuantileTransformer, KBinsDiscretizer, PolynomialFeatures
+# --- 导入 TruncatedSVD 作为 PCA 的替代方案 (可选但推荐) ---
+from sklearn.decomposition import PCA, TruncatedSVD
+
+# --- ---
 
 warnings.filterwarnings('ignore')
 
@@ -59,16 +64,41 @@ def moo_smotetomek_func(X, y):
         return X, y
 
 
-# --- 预处理器类 ---
+# --- 更新 AdvancedPreprocessor 类 (调整步骤顺序) ---
+# --- 预处理器类 (增强版，调整特征处理顺序) ---
 class AdvancedPreprocessor:
-    """高级数据预处理管道，包含清洗、标准化、特征工程"""
+    """高级数据预处理管道，包含清洗、标准化、特征工程（分箱、交叉）、随机森林特征选择和降维"""
 
-    def __init__(self):
+    def __init__(self, n_bins=None, cross_degree=None, rf_n_features_to_select=None, use_truncated_svd=False,
+                 svd_n_components=None):
+        """
+        初始化预处理器。
+        :param n_bins: int or None, 分箱的数量。如果为 None，则不进行分箱。
+        :param cross_degree: int or None, 特征交叉的度数。如果为 None，则不进行特征交叉。
+        :param rf_n_features_to_select: int or float or None, 使用随机森林选择的特征数量。
+                                        如果是 int，则选择该数量的特征。
+                                        如果是 float (0 < x < 1)，则选择该比例的特征。
+                                        如果为 None，则跳过随机森林特征选择。
+        :param use_truncated_svd: bool, 是否使用 TruncatedSVD 替代 PCA。
+        :param svd_n_components: int or float or None, TruncatedSVD 的 n_components。
+                                 如果是 int，则保留该数量的成分。
+                                 如果是 float (0 < x < 1)，则保留该比例的方差。
+                                 如果为 None 且 use_truncated_svd=True，则默认为 100。
+        """
         self.imputer_num = None
         self.scaler = None
         self.winsorizer = None
+        self.binner = None
+        self.crosser = None
+        self.rf_selector = None  # 新增：随机森林选择器
         self.pca = None
+        self.svd = None  # 新增：TruncatedSVD
         self.numerical_features = None
+        self.n_bins = n_bins
+        self.cross_degree = cross_degree
+        self.rf_n_features_to_select = rf_n_features_to_select
+        self.use_truncated_svd = use_truncated_svd
+        self.svd_n_components = svd_n_components
 
     def fit(self, X, y=None):
         """拟合预处理器"""
@@ -91,7 +121,8 @@ class AdvancedPreprocessor:
 
         print("步骤 2/4: 异常值处理 (Winsorization)...")
         # 2. 异常值处理 - Winsorization
-        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED, n_quantiles=min(1000, X.shape[0]))
+        self.winsorizer = QuantileTransformer(output_distribution='uniform', random_state=SEED,
+                                              n_quantiles=min(1000, X.shape[0]))
         X_winsorized = X_imputed.copy()
         if isinstance(X_imputed, np.ndarray):
             X_winsorized[:, self.numerical_features] = self.winsorizer.fit_transform(
@@ -105,12 +136,80 @@ class AdvancedPreprocessor:
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X_winsorized)
 
-        print("步骤 4/4: PCA 降维...")
-        # 4. PCA 降维
-        self.pca = PCA(n_components=0.95)
-        self.pca.fit(X_scaled)
+        # --- 新增步骤: 特征分箱 ---
+        if self.n_bins is not None and self.n_bins > 1:
+            print(f"步骤 3.1: 特征分箱 (n_bins={self.n_bins})...")
+            # 使用 'quantile' 策略以获得更平衡的箱
+            self.binner = KBinsDiscretizer(n_bins=self.n_bins, encode='onehot-dense', strategy='quantile')
+            X_binned = self.binner.fit_transform(X_scaled)  # 注意输入是 X_scaled
+            print(f"  -> 分箱后特征数: {X_binned.shape[1]}")
+        else:
+            X_binned = X_scaled  # 注意输入是 X_scaled
+            print("  -> 跳过分箱步骤。")
 
-        print(f"预处理完成。PCA后特征数: {self.pca.n_components_}")
+        # --- 新增步骤: 特征交叉 ---
+        if self.cross_degree is not None and self.cross_degree >= 2:
+            print(f"步骤 3.2: 特征交叉 (degree={self.cross_degree})...")
+            # 限制交互项数量，degree=2 通常足够
+            self.crosser = PolynomialFeatures(degree=self.cross_degree, interaction_only=True, include_bias=False)
+            X_crossed = self.crosser.fit_transform(X_binned)  # 注意输入是 X_binned
+            print(f"  -> 交叉后特征数: {X_crossed.shape[1]}")
+        else:
+            X_crossed = X_binned  # 注意输入是 X_binned
+            print("  -> 跳过特征交叉步骤。")
+
+        # --- 新增步骤: 随机森林特征选择 (调整到交叉之后) ---
+        if self.rf_n_features_to_select is not None:
+            print(f"步骤 3.3: 随机森林特征选择 (目标特征数: {self.rf_n_features_to_select})...")
+            # 使用一个相对快速的随机森林来评估特征重要性
+            # 注意：输入是 X_crossed (已分箱和交叉)
+            if isinstance(self.rf_n_features_to_select, int) and self.rf_n_features_to_select > X_crossed.shape[1]:
+                print(
+                    f"  -> 警告: 请求的特征数 ({self.rf_n_features_to_select}) 超过可用特征数 ({X_crossed.shape[1]})。将选择所有可用特征。")
+                n_features_to_select = X_crossed.shape[1]
+            elif isinstance(self.rf_n_features_to_select, float) and 0 < self.rf_n_features_to_select <= 1:
+                n_features_to_select = int(self.rf_n_features_to_select * X_crossed.shape[1])
+                print(f"  -> 根据比例 {self.rf_n_features_to_select}，将选择约 {n_features_to_select} 个特征。")
+            else:
+                n_features_to_select = self.rf_n_features_to_select
+
+            # 使用一个快速的随机森林模型来评估特征重要性
+            temp_rf = RandomForestClassifier(n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
+            # threshold=-np.inf 确保选出 max_features 个特征，即使重要性很低
+            self.rf_selector = SelectFromModel(temp_rf, max_features=n_features_to_select, threshold=-np.inf)
+            X_rf_selected = self.rf_selector.fit_transform(X_crossed, y)  # 输入是 X_crossed
+            print(f"  -> 随机森林选择后特征数: {X_rf_selected.shape[1]}")
+        else:
+            X_rf_selected = X_crossed  # 输入是 X_crossed
+            print("  -> 跳过随机森林特征选择步骤。")
+
+        # --- 修改点: PCA / TruncatedSVD 降维 (输入是 X_rf_selected) ---
+        if self.use_truncated_svd:
+            print("步骤 4/4: TruncatedSVD 降维...")
+            n_components_svd = self.svd_n_components if self.svd_n_components is not None else 100
+            self.svd = TruncatedSVD(n_components=n_components_svd, random_state=SEED)
+            self.svd.fit(X_rf_selected)  # 输入是 X_rf_selected
+            print(f"TruncatedSVD 完成。保留特征数: {self.svd.n_components}")
+        else:
+            print("步骤 4/4: PCA 降维...")
+            # 4. PCA 降维 (输入是 X_rf_selected)
+            self.pca = PCA(n_components=0.95)  # 或者设置一个固定的较小整数，如 50
+            try:
+                self.pca.fit(X_rf_selected)  # 输入是 X_rf_selected
+                print(f"PCA 完成。保留特征数: {self.pca.n_components_}")
+            except ValueError as e:
+                if "Indexing a matrix" in str(e) and "integer overflow" in str(e):
+                    print(f"    -> PCA 失败: {e}")
+                    print("    -> 数据量过大导致PCA整数溢出。建议:")
+                    print("        1. 进一步减少特征数量 (减小 rf_n_features_to_select)。")
+                    print("        2. 使用 TruncatedSVD (设置 use_truncated_svd=True)。")
+                    print("        3. 减少特征交叉度数 (cross_degree)。")
+                    raise e  # 重新抛出异常以便上层处理
+                else:
+                    raise e  # 重新抛出其他ValueError
+        # --- ---
+
+        print(f"预处理完成。")
         return self
 
     def transform(self, X):
@@ -131,14 +230,40 @@ class AdvancedPreprocessor:
         # 3. 标准化
         X_scaled = self.scaler.transform(X_winsorized)
 
-        # 4. PCA 降维
-        X_pca = self.pca.transform(X_scaled)
+        # 3.1. 特征分箱 (如果已拟合)
+        if self.binner is not None:
+            X_binned = self.binner.transform(X_scaled)  # 输入是 X_scaled
+        else:
+            X_binned = X_scaled  # 输入是 X_scaled
 
-        return X_pca
+        # 3.2. 特征交叉 (如果已拟合)
+        if self.crosser is not None:
+            X_crossed = self.crosser.transform(X_binned)  # 输入是 X_binned
+        else:
+            X_crossed = X_binned  # 输入是 X_binned
+
+        # 3.3. 随机森林特征选择 (如果已拟合)
+        if self.rf_selector is not None:
+            X_rf_selected = self.rf_selector.transform(X_crossed)  # 输入是 X_crossed
+        else:
+            X_rf_selected = X_crossed  # 输入是 X_crossed
+
+        # 4. PCA / TruncatedSVD 降维
+        if self.use_truncated_svd and self.svd is not None:
+            X_reduced = self.svd.transform(X_rf_selected)  # 输入是 X_rf_selected
+        elif self.pca is not None:
+            X_reduced = self.pca.transform(X_rf_selected)  # 输入是 X_rf_selected
+        else:
+            X_reduced = X_rf_selected  # 如果没有降维步骤
+
+        return X_reduced
 
     def fit_transform(self, X, y=None):
         """组合fit和transform"""
         return self.fit(X, y).transform(X)
+
+
+# --- ---
 
 
 # --- 特征选择器类 ---
@@ -181,15 +306,20 @@ class GBDT_RFE_FeatureSelector:
 class FinalEnsemble:
     """最终集成模型（GBDT + GBDT）"""
 
-    def __init__(self):
+    def __init__(self, preprocessor_params=None):
+        """
+        初始化最终集成模型。
+        :param preprocessor_params: dict, 传递给 AdvancedPreprocessor 的参数。
+        """
         self.gbdt_model_auc = None  # 优化AUC的模型
         self.gbdt_model_recall = None  # 优化召回率的模型
         self.preprocessor = None  # 使用高级预处理器
+        self.preprocessor_params = preprocessor_params if preprocessor_params is not None else {}
 
     def fit(self, X, y):
-        # 第一阶段：高级数据预处理 (包含清洗, 标准化, PCA)
+        # 第一阶段：高级数据预处理 (包含清洗, 标准化, 分箱, 交叉, PCA)
         print("\n[Stage 1] 高级数据预处理...")
-        self.preprocessor = AdvancedPreprocessor()
+        self.preprocessor = AdvancedPreprocessor(**self.preprocessor_params)  # 使用传入的参数
         X_processed = self.preprocessor.fit_transform(X, y)
 
         # 处理类别不平衡 - 使用固定参数的 SMOTETomek
@@ -384,12 +514,13 @@ def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
     return best_threshold
 
 
-def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test):
+def train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test, preprocessor_params=None):
     """训练评估流程，包含验证集和多阈值选择"""
     # 训练集成模型
     print("\n=== 训练集成模型 ===")
     start_time = time.time()
-    ensemble = FinalEnsemble()
+    # 传递预处理器参数
+    ensemble = FinalEnsemble(preprocessor_params=preprocessor_params)
     ensemble.fit(X_train, y_train)
     end_time = time.time()
     print(f"\n训练耗时: {end_time - start_time:.2f} 秒")
@@ -470,10 +601,21 @@ def main():
         print("当前 CUDA 设备:", torch.cuda.current_device())
         print("CUDA 设备名称:", torch.cuda.get_device_name(0))
 
+    # --- 配置预处理器参数 ---
+    # 例如：启用分箱 (10个箱), 2度交叉, 并使用随机森林选择特征
+    # 如果交叉后特征数少于1000，则随机森林会选择所有特征。
+    preprocessor_params = {
+        'n_bins': 10,
+        'cross_degree': 2,
+        'rf_n_features_to_select': 1000,  # 在交叉之后选择最多1000个特征
+        # 'use_truncated_svd': True,        # 可选：如果PCA仍有问题，启用TruncatedSVD
+        # 'svd_n_components': 50           # 可选：TruncatedSVD保留的成分
+    }
+
     # 加载数据
     print("\n=== 数据加载 ===")
     try:
-        data = pd.read_csv("clean.csv")
+        data = pd.read_csv("clean.csv")  # 确保您的数据文件路径正确
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
         if "target" not in data.columns:
@@ -484,6 +626,7 @@ def main():
         X = data.drop(columns=["target"]).values
 
         print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
+        print(f"使用的预处理器参数: {preprocessor_params}")
     except Exception as e:
         print(f"数据加载失败: {str(e)}")
         return
@@ -507,8 +650,9 @@ def main():
     )
     print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # 训练和评估 (传入验证集)
-    results = train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test)
+    # 训练和评估 (传入验证集和预处理器参数)
+    results = train_and_evaluate(X_train, y_train, X_val, y_val, X_test, y_test,
+                                 preprocessor_params=preprocessor_params)
 
     # 保存预测结果 (使用 F1 优化的预测)
     pd.DataFrame({
