@@ -13,15 +13,16 @@ tokenizer = BertTokenizer.from_pretrained(local_model_path)
 model = BertModel.from_pretrained(local_model_path).to(device)
 model.eval()
 
-# 2. 读取数据（用更快的引擎，如 'pyarrow' 或 'c'）
-train_df = pd.read_csv("../data/train.csv", engine='pyarrow')
-test_df = pd.read_csv("../data/test.csv", engine='pyarrow')
+# 2. 读取数据
+train_df = pd.read_csv("../data/train.csv")
+test_df = pd.read_csv("../data/test.csv")
 
 # 3. 需嵌入的中文列名
 chinese_columns = [
     'province', 'city', 'industry_l1_name', 'industry_l2_name',
     'industry_l3_name', 'industry_l4_name', 'establish_year', 'legal_person',
-    'business_scope', 'company_type', 'tags', 'company_on_scale'
+    'business_scope', 'company_type', 'tags', 'company_on_scale', 'honor_titles',
+    'sci_tech_ent_tags', 'top100_tags'
 ]
 
 
