@@ -223,3 +223,4 @@ data/predictions_gbdt.csv
 /.idea
 /UseBert/bert-base-chinese/
 *.csv
+/UseBert/catboost_info
