@@ -91,8 +91,8 @@ class AdvancedFeatureEngineer:
     2. 统计特征生成
     3. 聚类特征
     4. 异常检测特征
-    5. 降维技术组合
-    6. 智能特征选择
+    5. 取消降维技术组合
+    6. 取消智能特征选择
     """
 
     def __init__(self,
@@ -115,16 +115,16 @@ class AdvancedFeatureEngineer:
                  isolation_contamination=0.1,
                  lof_n_neighbors=20,
 
-                 # 降维参数
-                 use_multiple_decomposition=True,
+                 # 取消降维参数
+                 use_multiple_decomposition=False,  # 设置为False以取消降维
                  svd_components=50,
                  ica_components=30,
                  fa_components=20,
 
-                 # 特征选择参数
+                 # 取消特征选择参数
                  variance_threshold=0.01,
-                 univariate_k_best=1000,
-                 rf_n_features_to_select=800,
+                 univariate_k_best=None,  # 设置为None以取消单变量选择
+                 rf_n_features_to_select=None,  # 设置为None以取消随机森林选择
 
                  # 输出格式
                  force_sparse_output=False):  # 改为False，因为高级特征工程通常产生密集特征
@@ -141,13 +141,13 @@ class AdvancedFeatureEngineer:
         self.create_anomaly_features = create_anomaly_features
         self.isolation_contamination = isolation_contamination
         self.lof_n_neighbors = lof_n_neighbors
-        self.use_multiple_decomposition = use_multiple_decomposition
+        self.use_multiple_decomposition = use_multiple_decomposition  # 降维已取消
         self.svd_components = svd_components
         self.ica_components = ica_components
         self.fa_components = fa_components
         self.variance_threshold = variance_threshold
-        self.univariate_k_best = univariate_k_best
-        self.rf_n_features_to_select = rf_n_features_to_select
+        self.univariate_k_best = univariate_k_best  # 特征选择已取消
+        self.rf_n_features_to_select = rf_n_features_to_select  # 特征选择已取消
         self.force_sparse_output = force_sparse_output
 
         # 初始化组件
@@ -158,9 +158,11 @@ class AdvancedFeatureEngineer:
         self.dbscan = None
         self.isolation_forest = None
         self.lof = None
+        # 取消降维组件
         self.svd = None
         self.ica = None
         self.fa = None
+        # 取消特征选择组件
         self.variance_selector = None
         self.univariate_selector = None
         self.rf_selector = None
@@ -523,57 +525,15 @@ class AdvancedFeatureEngineer:
 
         print(f"特征工程后特征数: {X_dense.shape[1]}")
 
-        # 4. 多重降维
+        # 4. 取消多重降维
         if self.use_multiple_decomposition:
-            print("步骤 4: 多重降维...")
+            print("步骤 4: 多重降维... (已取消)")
+        else:
+            print("步骤 4: 多重降维已取消")
+        # 不执行降维，保持 X_dense 不变
 
-            # TruncatedSVD
-            n_svd = min(self.svd_components, X_dense.shape[1] - 1)
-            self.svd = TruncatedSVD(n_components=n_svd, random_state=SEED)
-            X_svd = self.svd.fit_transform(X_dense)
-
-            # FastICA
-            n_ica = min(self.ica_components, X_dense.shape[1])
-            self.ica = FastICA(n_components=n_ica, random_state=SEED, max_iter=1000)
-            X_ica = self.ica.fit_transform(X_dense)
-
-            # Factor Analysis
-            n_fa = min(self.fa_components, X_dense.shape[1])
-            self.fa = FactorAnalysis(n_components=n_fa, random_state=SEED)
-            X_fa = self.fa.fit_transform(X_dense)
-
-            # 组合降维特征
-            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
-            print(f"  -> SVD: {X_svd.shape[1]}, ICA: {X_ica.shape[1]}, FA: {X_fa.shape[1]}")
-
-            # 将原始特征和降维特征结合
-            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
-            print(f"降维后总特征数: {X_dense.shape[1]}")
-
-        # 5. 智能特征选择
-        print("步骤 5: 智能特征选择...")
-
-        # 方差过滤
-        self.variance_selector = VarianceThreshold(threshold=self.variance_threshold)
-        X_dense = self.variance_selector.fit_transform(X_dense)
-        print(f"  -> 方差过滤后特征数: {X_dense.shape[1]}")
-
-        # 单变量特征选择
-        if y is not None and self.univariate_k_best:
-            k_best = min(self.univariate_k_best, X_dense.shape[1])
-            self.univariate_selector = SelectKBest(score_func=f_classif, k=k_best)
-            X_dense = self.univariate_selector.fit_transform(X_dense, y)
-            print(f"  -> 单变量选择后特征数: {X_dense.shape[1]}")
-
-        # 随机森林特征选择
-        if y is not None and self.rf_n_features_to_select:
-            n_rf_features = min(self.rf_n_features_to_select, X_dense.shape[1])
-            temp_rf = BalancedRandomForestClassifier(
-                n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
-            self.rf_selector = SelectFromModel(
-                temp_rf, max_features=n_rf_features, threshold=-np.inf)
-            X_dense = self.rf_selector.fit_transform(X_dense, y)
-            print(f"  -> 随机森林选择后特征数: {X_dense.shape[1]}")
+        # 5. 取消智能特征选择
+        print("步骤 5: 智能特征选择... (已取消)")
 
         # 记录最终特征数
         self.final_feature_count_after_engineering_ = X_dense.shape[1]
@@ -691,20 +651,16 @@ class AdvancedFeatureEngineer:
         X_dense = self._create_cluster_features(X_dense)
         X_dense = self._create_anomaly_features(X_dense)
 
-        # 4. 多重降维
+        # 4. 取消多重降维
         if self.use_multiple_decomposition:
-            X_svd = self.svd.transform(X_dense)
-            X_ica = self.ica.transform(X_dense)
-            X_fa = self.fa.transform(X_dense)
-            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
-            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
+            print("  -> transform 阶段，多重降维... (已取消)")
+        else:
+            print("  -> transform 阶段，多重降维已取消")
+        # 不执行降维操作
 
-        # 5. 特征选择
-        X_dense = self.variance_selector.transform(X_dense)
-        if self.univariate_selector is not None:
-            X_dense = self.univariate_selector.transform(X_dense)
-        if self.rf_selector is not None:
-            X_dense = self.rf_selector.transform(X_dense)
+        # 5. 取消特征选择
+        print("  -> transform 阶段，特征选择... (已取消)")
+        # 不执行任何特征选择操作
 
         # --- 新增：强制维度一致性检查 ---
         if self.final_feature_count_after_engineering_ is not None:
@@ -950,16 +906,16 @@ def main():
         'isolation_contamination': 0.05,  # 假设5%的数据是异常值
         'lof_n_neighbors': 20,
 
-        # 多重降维配置
-        'use_multiple_decomposition': True,
-        'svd_components': 80,  # 增加SVD成分
-        'ica_components': 50,  # 增加ICA成分
-        'fa_components': 30,  # 增加FA成分
+        # 取消多重降维配置
+        'use_multiple_decomposition': False,  # 关闭降维
+        'svd_components': 80,  # 降维已取消
+        'ica_components': 50,  # 降维已取消
+        'fa_components': 30,   # 降维已取消
 
-        # 特征选择配置
-        'variance_threshold': 0.01,
-        'univariate_k_best': 1500,  # 增加单变量选择的特征数
-        'rf_n_features_to_select': 1000,  # 最终保留1000个特征
+        # 取消特征选择配置
+        'variance_threshold': 0.01,  # 特征选择已取消
+        'univariate_k_best': None,     # 取消单变量选择
+        'rf_n_features_to_select': None, # 取消随机森林选择
 
         # 输出格式
         'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
@@ -1042,6 +998,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
