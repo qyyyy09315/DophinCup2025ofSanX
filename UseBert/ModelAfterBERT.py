@@ -173,6 +173,11 @@ class AdvancedFeatureEngineer:
         self.embedding_groups = {}
         # 新增：用于记录向量特征列名
         self.vector_feature_names = []
+        # 新增：记录经过所有工程处理后的特征数
+        self.final_feature_count_after_engineering_ = None
+        # 新增：记录在fit阶段的特征数，用于后续一致性检查
+        self.fit_feature_count_before_imputer_ = None
+        self.fit_feature_count_after_imputer_ = None
 
     def _identify_embedding_groups(self, feature_names):
         """识别并分组 *_emb_* 形式的特征"""
@@ -246,17 +251,52 @@ class AdvancedFeatureEngineer:
 
         for vec_col_name in self.vector_feature_names:
             # 获取该列的第一个非空元素来确定向量维度
-            first_valid_vector = X_imputed_df[vec_col_name].dropna().iloc[0] if not X_imputed_df[
+            first_valid_entry = X_imputed_df[vec_col_name].dropna().iloc[0] if not X_imputed_df[
                 vec_col_name].dropna().empty else None
-            if first_valid_vector is not None:
-                vector_dim = len(first_valid_vector)
+            if first_valid_entry is not None:
+                # 确保第一个有效条目是数组或列表，然后获取其长度
+                if isinstance(first_valid_entry, (list, np.ndarray)):
+                    vector_dim = len(first_valid_entry)
+                else:
+                    # 如果第一个有效条目不是列表或数组（理论上不应该发生），跳过
+                    print(
+                        f"    -> 警告: 列 '{vec_col_name}' 的第一个有效条目不是列表或数组: {type(first_valid_entry)}，跳过填充。")
+                    continue
                 zero_vector = np.zeros(vector_dim)
 
-                # 填充缺失值
-                X_imputed_df[vec_col_name] = X_imputed_df[vec_col_name].apply(
-                    lambda x: zero_vector if (isinstance(x, (list, np.ndarray)) and len(x) == 0) or pd.isna(x) else x
-                )
-                print(f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值。")
+                # 定义一个更安全的填充函数
+                def fill_na_with_zero_vector(x):
+                    # 检查是否为标量缺失值
+                    try:
+                        # 对于标量值，pd.isna 是安全的
+                        if not isinstance(x, (list, np.ndarray)):
+                            if pd.isna(x):
+                                return zero_vector
+                            else:
+                                return x
+
+                        # 对于数组或列表
+                        x_array = np.asarray(x)
+
+                        # 检查是否为空数组
+                        if x_array.size == 0:
+                            return zero_vector
+
+                        # 检查是否包含所有NaN
+                        if x_array.dtype.kind in ['f', 'c']:  # 浮点数或复数
+                            if np.all(np.isnan(x_array)):
+                                return zero_vector
+
+                        # 如果是有效向量，保留原值
+                        return x
+
+                    except Exception as e:
+                        print(f"      -> 处理值时出错: {e}, 使用零向量填充")
+                        return zero_vector
+
+                # 应用填充函数
+                X_imputed_df[vec_col_name] = X_imputed_df[vec_col_name].apply(fill_na_with_zero_vector)
+                print(f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值/空向量/全NaN向量。")
             else:
                 print(f"    -> 警告: 列 '{vec_col_name}' 没有有效数据来确定向量维度，跳过填充。")
         return X_imputed_df
@@ -407,14 +447,25 @@ class AdvancedFeatureEngineer:
             # 将向量列展开为数值列
             vector_data_list = []
             for col in vector_columns:
-                # 假设所有向量维度相同
-                expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
-                                           columns=[f"{col}_dim_{i}" for i in range(len(X_imputed_df[col].iloc[0]))])
-                vector_data_list.append(expanded_df)
+                if len(X_imputed_df[col]) > 0:
+                    # 获取第一个有效向量来确定维度
+                    sample_vector = None
+                    for vec in X_imputed_df[col]:
+                        if isinstance(vec, (list, np.ndarray)) and len(vec) > 0:
+                            sample_vector = vec
+                            break
+
+                    if sample_vector is not None:
+                        expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
+                                                   columns=[f"{col}_dim_{i}" for i in range(len(sample_vector))])
+                        vector_data_list.append(expanded_df)
 
             if vector_data_list:
                 vector_data_df = pd.concat(vector_data_list, axis=1)
                 numerical_data_df = X_imputed_df[self.numerical_features]
+                # 重置索引以避免合并时的索引冲突
+                numerical_data_df = numerical_data_df.reset_index(drop=True)
+                vector_data_df = vector_data_df.reset_index(drop=True)
                 X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
             else:
                 X_final_df = X_imputed_df[self.numerical_features]
@@ -434,7 +485,16 @@ class AdvancedFeatureEngineer:
         # 1. 缺失值处理 (现在处理的是纯数值型数组)
         print("步骤 1: 缺失值处理...")
         self.imputer_num = SimpleImputer(strategy='median')
+
+        # 记录 imputer 期望的特征数 before fit
+        self.fit_feature_count_before_imputer_ = X_dense.shape[1]
+        print(f"  -> SimpleImputer 拟合前特征数: {self.fit_feature_count_before_imputer_}")
+
         X_dense = self.imputer_num.fit_transform(X_dense)
+
+        # 记录 imputer 期望的特征数 after fit
+        self.fit_feature_count_after_imputer_ = X_dense.shape[1]
+        print(f"  -> SimpleImputer 拟合后特征数: {self.fit_feature_count_after_imputer_}")
 
         # 2. 数据预处理和变换
         print("步骤 2: 数据预处理...")
@@ -515,7 +575,9 @@ class AdvancedFeatureEngineer:
             X_dense = self.rf_selector.fit_transform(X_dense, y)
             print(f"  -> 随机森林选择后特征数: {X_dense.shape[1]}")
 
-        print("特征工程拟合完成！")
+        # 记录最终特征数
+        self.final_feature_count_after_engineering_ = X_dense.shape[1]
+        print(f"特征工程拟合完成！最终特征数: {self.final_feature_count_after_engineering_}")
         return self
 
     def transform(self, X):
@@ -528,22 +590,34 @@ class AdvancedFeatureEngineer:
             X_imputed_df = self._impute_vector_columns(X_processed_df)
 
             # 分离数值列和向量列
-            numerical_data_df = X_imputed_df[self.numerical_features]
+            # 注意：这里使用 self.numerical_features，它是在 fit 时确定的
+            numerical_data_df = X_imputed_df.reindex(columns=self.numerical_features, fill_value=0)  # 安全地选择列
             vector_columns = [col for col in self.vector_feature_names if col in X_imputed_df.columns]
 
             # 将向量列展开为数值列
             vector_data_list = []
             for col in vector_columns:
-                # 假设所有向量维度相同
-                expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
-                                           columns=[f"{col}_dim_{i}" for i in range(len(X_imputed_df[col].iloc[0]))])
-                vector_data_list.append(expanded_df)
+                if len(X_imputed_df[col]) > 0:
+                    # 获取第一个有效向量来确定维度
+                    sample_vector = None
+                    for vec in X_imputed_df[col]:
+                        if isinstance(vec, (list, np.ndarray)) and len(vec) > 0:
+                            sample_vector = vec
+                            break
+
+                    if sample_vector is not None:
+                        expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
+                                                   columns=[f"{col}_dim_{i}" for i in range(len(sample_vector))])
+                        vector_data_list.append(expanded_df)
 
             if vector_data_list:
                 vector_data_df = pd.concat(vector_data_list, axis=1)
+                # 重置索引以避免合并时的索引冲突
+                numerical_data_df = numerical_data_df.reset_index(drop=True)
+                vector_data_df = vector_data_df.reset_index(drop=True)
                 X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
             else:
-                X_final_df = numerical_data_df
+                X_final_df = numerical_data_df  # 如果没有向量特征，就只用 numerical_data_df
 
             X_dense = X_final_df.values
 
@@ -552,8 +626,60 @@ class AdvancedFeatureEngineer:
         else:
             X_dense = X
 
+        # --- 新增：维度检查点 1 ---
+        print(f"  -> transform 阶段，经过 DataFrame 处理后的特征数: {X_dense.shape[1]}")
+
+        # --- 新增：维度一致性检查 before imputer ---
+        if self.fit_feature_count_before_imputer_ is not None:
+            if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
+                print(
+                    f"  -> transform 阶段，经过 DataFrame 处理后的特征数 ({X_dense.shape[1]}) 与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 不一致。")
+                print(f"  -> 尝试调整 X_dense 维度以匹配...")
+                if X_dense.shape[1] > self.fit_feature_count_before_imputer_:
+                    # 如果 transform 时特征数更多，裁剪
+                    X_dense = X_dense[:, :self.fit_feature_count_before_imputer_]
+                    print(f"  -> 裁剪至 {self.fit_feature_count_before_imputer_} 个特征")
+                elif X_dense.shape[1] < self.fit_feature_count_before_imputer_:
+                    # 如果 transform 时特征数更少，用零填充
+                    zeros_to_add = self.fit_feature_count_before_imputer_ - X_dense.shape[1]
+                    zeros = np.zeros((X_dense.shape[0], zeros_to_add))
+                    X_dense = np.concatenate([X_dense, zeros], axis=1)
+                    print(f"  -> 填充 {zeros_to_add} 个零特征列")
+            else:
+                print(f"  -> transform 阶段，经过 DataFrame 处理后的特征数校验通过: {X_dense.shape[1]}")
+
         # 1. 缺失值处理 (现在处理的是纯数值型数组)
+        # --- 新增：维度检查点 2 ---
+        print(f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数: {X_dense.shape[1]}")
+
+        # --- 新增：维度一致性检查 during imputer ---
+        if X_dense.shape[1] != self.fit_feature_count_after_imputer_:
+            # Imputer 在 fit 时会根据输入调整，但 transform 时要求输入维度一致
+            # 我们需要确保 X_dense 的列数与 fit 时一致
+            print(
+                f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数 ({X_dense.shape[1]}) 与 fit 阶段的 imputer 输出特征数 ({self.fit_feature_count_after_imputer_}) 不一致。")
+            if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
+                print(
+                    f"  -> 但是，它与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 相同，这可能意味着 imputer 没有改变特征数。")
+                # 在这种情况下，我们假设 imputer 的输出特征数应该与输入特征数一致
+                expected_output_features = self.fit_feature_count_before_imputer_
+            else:
+                expected_output_features = self.fit_feature_count_after_imputer_
+
+            if X_dense.shape[1] != expected_output_features:
+                print(f"  -> 调整 X_dense 维度以符合 imputer 期望...")
+                if X_dense.shape[1] > expected_output_features:
+                    X_dense = X_dense[:, :expected_output_features]
+                    print(f"  -> 裁剪至 {expected_output_features} 个特征")
+                elif X_dense.shape[1] < expected_output_features:
+                    zeros_to_add = expected_output_features - X_dense.shape[1]
+                    zeros = np.zeros((X_dense.shape[0], zeros_to_add))
+                    X_dense = np.concatenate([X_dense, zeros], axis=1)
+                    print(f"  -> 填充 {zeros_to_add} 个零特征列")
+
         X_dense = self.imputer_num.transform(X_dense)
+        # --- 新增：维度检查点 3 ---
+        print(f"  -> transform 阶段，经过 SimpleImputer transform 后的特征数: {X_dense.shape[1]}")
 
         # 2. 数据预处理
         if self.power_transformer is not None:
@@ -579,6 +705,17 @@ class AdvancedFeatureEngineer:
             X_dense = self.univariate_selector.transform(X_dense)
         if self.rf_selector is not None:
             X_dense = self.rf_selector.transform(X_dense)
+
+        # --- 新增：强制维度一致性检查 ---
+        if self.final_feature_count_after_engineering_ is not None:
+            if X_dense.shape[1] != self.final_feature_count_after_engineering_:
+                raise ValueError(
+                    f"transform 阶段最终特征数 ({X_dense.shape[1]}) 与 fit 阶段记录的特征数 "
+                    f"({self.final_feature_count_after_engineering_}) 不一致。"
+                    f"这通常是由于 fit 和 transform 阶段的处理逻辑不一致导致的。"
+                )
+            else:
+                print(f"  -> transform 阶段最终特征数校验通过: {X_dense.shape[1]}")
 
         # 输出格式控制
         if self.force_sparse_output:
@@ -831,8 +968,12 @@ def main():
     # 数据加载
     print("\n=== 数据加载 ===")
     try:
+        import dask.dataframe as dd
+        ddf = dd.read_csv('train_bert_embedded.csv')
+
+        data = ddf.compute()
         # 假设你的数据文件是 train_bert_embedded.csv
-        data = pd.read_csv("train_bert_embedded.csv", low_memory=False)
+        # data = pd.read_csv("train_bert_embedded.csv", engine='pyarrow')
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
         if "target" not in data.columns:
@@ -884,7 +1025,7 @@ def main():
 
     # 打印最终总结
     print("\n" + "=" * 50)
-    print("先进特征工程模型训练完成！")
+    print("特征工程训练完成！")
     print("=" * 50)
     print(f"最佳F1阈值: {results['threshold']:.4f}")
     print(f"测试集性能:")
