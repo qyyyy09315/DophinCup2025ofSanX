@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
 
-# 1. 加载模型（直接强制使用 GPU，如果可用）
+# 1. 加载模型（强制使用 GPU，如果可用）
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -26,16 +26,12 @@ class AttentionPooling(nn.Module):
         )
 
     def forward(self, hidden_states, mask=None):
-        # hidden_states: [batch_size, seq_len, hidden_size]
         weights = self.attention(hidden_states)  # [batch_size, seq_len, 1]
-
         if mask is not None:
             mask = mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
             weights = weights.masked_fill(mask == 0, -1e9)
-
         weights = torch.softmax(weights, dim=1)  # [batch_size, seq_len, 1]
         pooled = torch.sum(hidden_states * weights, dim=1)  # [batch_size, hidden_size]
-
         return pooled, weights.squeeze(-1)
 
 
@@ -63,56 +59,39 @@ industry_hierarchy = {
 
 
 # 5. 改进的 BERT 嵌入函数（加入注意力池化）
-def get_bert_embedding(texts, batch_size=32, use_attention=True):
-    texts = [str(text) if not pd.isna(text) else "" for text in texts]
+def get_bert_embedding(texts, batch_size=32, use_attention=False):
     embeddings = []
-    attention_weights = [] if use_attention else None
+    attention_weights = []
 
-    for i in tqdm(range(0, len(texts), batch_size), desc="BERT Embedding"):
-        batch = texts[i:i + batch_size]
+    for i in tqdm(range(0, len(texts), batch_size), desc="Generating BERT embeddings"):
+        batch_texts = texts[i:i + batch_size]
+        inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt").to(device)  # 确保输入在正确设备上
 
         with torch.no_grad():
-            inputs = tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_attention_mask=True
-            ).to(device)
-
             outputs = model(**inputs)
+
+        # 获取 [CLS] 嵌入
+        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()  # [batch_size, hidden_size]
+        embeddings.append(batch_embeddings)
+
+        if use_attention:
+            # 使用自定义注意力池化层
             hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+            mask = inputs['attention_mask']  # [batch_size, seq_len]
+            pooled_emb, attn_weights = attention_pooler(hidden_states, mask)
+            embeddings.append(pooled_emb.cpu().detach().numpy())  # 替换为注意力加权嵌入
+            attention_weights.append(attn_weights.cpu().detach().numpy())
 
-            if use_attention:
-                # 使用注意力池化
-                batch_embeddings, batch_weights = attention_pooler(
-                    hidden_states,
-                    inputs['attention_mask']
-                )
-                attention_weights.append(batch_weights.cpu().numpy())
-            else:
-                # 使用平均池化作为后备
-                mask = inputs['attention_mask'].unsqueeze(-1)
-                batch_embeddings = torch.sum(hidden_states * mask, dim=1) / torch.sum(mask, dim=1)
-
-            embeddings.append(batch_embeddings.cpu().numpy())
-
-            # 显式释放 GPU 缓存
-            del inputs, outputs, hidden_states
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-    embeddings = np.concatenate(embeddings, axis=0)
+    emb = np.concatenate(embeddings, axis=0)
     if use_attention:
-        attention_weights = np.concatenate(attention_weights, axis=0)
-        return embeddings, attention_weights
-    return embeddings
+        weights = np.concatenate(attention_weights, axis=0)
+        return emb, weights
+    else:
+        return emb, None
 
 
 # 6. 行业层次化嵌入处理
 def process_industry_hierarchy(df):
-    # 处理行业层次结构
     if 'industry_l1_name' not in df.columns:
         return None
 
@@ -130,23 +109,19 @@ def process_industry_hierarchy(df):
     hierarchical_embeddings = []
     for i in range(len(df)):
         # 初始化层次化嵌入（使用L1的嵌入作为基础）
-        if 'industry_l1_name' in industry_embeddings:
+        if 'industry_l1_name' in industry_embeddings and not pd.isna(df.loc[i, 'industry_l1_name']):
             hier_emb = industry_embeddings['industry_l1_name'][0][i].copy()
         else:
             hier_emb = np.zeros(model.config.hidden_size)
 
         # 逐层加权融合
         for col, children in industry_hierarchy.items():
-            if col in industry_embeddings and col in df.columns and not pd.isna(df.loc[i, col]):
-                # 当前层级的权重
-                current_weight = np.mean(industry_embeddings[col][1][i])
-
-                # 子层级的加权融合
+            if col in industry_embeddings and not pd.isna(df.loc[i, col]):
+                current_weight = np.mean(industry_embeddings[col][1][i])  # 当前层级的平均注意力权重
                 for child in children:
-                    if child in industry_embeddings and child in df.columns and not pd.isna(df.loc[i, child]):
+                    if child in industry_embeddings and not pd.isna(df.loc[i, child]):
                         child_weight = np.mean(industry_embeddings[child][1][i])
                         child_emb = industry_embeddings[child][0][i]
-
                         # 加权融合（当前层级和子层级）
                         hier_emb = hier_emb * current_weight + child_emb * child_weight
                         hier_emb /= np.linalg.norm(hier_emb)  # 归一化
@@ -183,10 +158,7 @@ def process_data(df):
 
         print(f"Processing column: {col}")
         texts = df[col].fillna("").tolist()
-        embeddings = get_bert_embedding(texts, batch_size=32, use_attention=True)
-
-        if isinstance(embeddings, tuple):  # 如果返回了(embeddings, weights)
-            embeddings = embeddings[0]
+        embeddings, _ = get_bert_embedding(texts, batch_size=32, use_attention=False)  # 不重复计算注意力权重
 
         embed_df = pd.DataFrame(
             embeddings,
