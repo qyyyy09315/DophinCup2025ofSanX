@@ -12,33 +12,26 @@ import pandas as pd
 import seaborn as sns
 import torch
 from imblearn.combine import SMOTETomek
-from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
-
+# --- 导入稀疏矩阵支持 ---
+from scipy import sparse
+from scipy.stats import skew, kurtosis
+# --- 导入聚类和异常检测用于特征工程 ---
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.ensemble import IsolationForest
 # --- 导入先进的特征工程库 ---
-from sklearn.decomposition import TruncatedSVD, FastICA, FactorAnalysis
-from sklearn.feature_selection import RFE, SelectFromModel, VarianceThreshold, SelectKBest, f_classif, \
-    mutual_info_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
                              precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
                                    PowerTransformer, MinMaxScaler)
-
-# --- 导入聚类和异常检测用于特征工程 ---
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-
-# --- 导入 XGBoost ---
+# --- 导入 XGBoost 和 CatBoost ---
 from xgboost import XGBClassifier
-
-# --- 导入稀疏矩阵支持 ---
-from scipy import sparse
-from scipy.stats import skew, kurtosis
+from catboost import CatBoostClassifier
 
 warnings.filterwarnings('ignore')
 
@@ -49,39 +42,6 @@ os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
-
-
-def moo_smotetomek_func(X, y):
-    """
-    使用一组固定的参数应用 SMOTETomek 进行重采样。
-    """
-    print("  -> 应用固定参数的 SMOTETomek...")
-
-    if len(np.unique(y)) < 2:
-        print("    -> 标签类别不足，跳过SMOTETomek.")
-        return X, y
-
-    try:
-        if sparse.issparse(X):
-            print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
-            X_dense = X.toarray()
-        else:
-            X_dense = X
-
-        smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
-            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
-            random_state=SEED
-        )
-
-        X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
-
-        print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
-        return X_resampled_dense, y_resampled
-
-    except Exception as e:
-        print(f"    -> 应用 SMOTETomek 失败: {e}。回退到原始数据。")
-        return X, y
 
 
 class AdvancedFeatureEngineer:
@@ -708,7 +668,7 @@ def find_best_f1_threshold(y_true, y_proba):
     return best_threshold
 
 
-def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
+def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.5):
     """寻找能获得最高召回率且精确率不低于 min_precision 的阈值"""
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
     valid_indices = np.where(precisions[:-1] >= min_precision)[0]
@@ -769,21 +729,49 @@ def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="M
     print("-" * 40)
 
 
+def ensemble_predict_proba(models, X):
+    """对多个模型的预测概率进行平均"""
+    probas = []
+    for model in models:
+        proba = model.predict_proba(X)[:, 1]
+        probas.append(proba)
+    # 计算平均概率
+    avg_proba = np.mean(probas, axis=0)
+    return avg_proba
+
+
 def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
     """使用先进特征工程的训练评估流程"""
     print("\n=== 构建先进特征工程管道 ===")
 
     # 特征工程
     feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
-    classifier = XGBClassifier(
+
+    # XGBoost 模型 - 关注少数类
+    xgb_classifier = XGBClassifier(
         n_estimators=500,
-        max_depth=6,
-        learning_rate=0.1,
+        max_depth=10,
+        learning_rate=0.01,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=SEED,
         n_jobs=-1,
-        eval_metric='logloss'
+        eval_metric='logloss',
+        scale_pos_weight=1.0 / np.mean(y_train),  # 关注少数类
+        verbosity=1
+    )
+
+    # CatBoost 模型 - 关注少数类
+    cat_classifier = CatBoostClassifier(
+        iterations=500,
+        depth=10,
+        learning_rate=0.01,
+        subsample=0.8,
+        random_strength=0.8,
+        random_seed=SEED,
+        verbose=False,
+        class_weights=[1.0, 1.0 / np.mean(y_train)],  # 关注少数类
+        eval_metric='Logloss'
     )
 
     # 1. 拟合特征工程器
@@ -791,42 +779,50 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     feature_engineer.fit(X_train, y_train)
     X_train_engineered = feature_engineer.transform(X_train)
 
-    # 2. 应用 SMOTETomek
-    print("\n=== 应用 SMOTETomek 重采样 ===")
-    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered, y_train)
-
-    # 3. 模型训练
-    print("\n=== 开始模型训练 ===")
+    # 2. 模型训练
+    print("\n=== 开始 XGBoost 模型训练 ===")
     start_time = time.time()
-    classifier.fit(X_train_resampled, y_train_resampled)
+    xgb_classifier.fit(X_train_engineered, y_train)
     end_time = time.time()
-    print(f"模型训练耗时: {end_time - start_time:.2f} 秒")
+    print(f"XGBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
 
-    # 4. 保存模型
+    print("\n=== 开始 CatBoost 模型训练 ===")
+    start_time = time.time()
+    cat_classifier.fit(X_train_engineered, y_train, eval_set=(feature_engineer.transform(X_val), y_val),
+                       early_stopping_rounds=50)
+    end_time = time.time()
+    print(f"CatBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
+
+    # 3. 保存模型
     trained_pipeline = Pipeline([
         ('feature_engineer', feature_engineer),
-        ('classifier', classifier)
+        ('xgb_classifier', xgb_classifier),
+        ('cat_classifier', cat_classifier)
     ])
-    save_model(trained_pipeline, 'advanced_feature_engineering_model.pkl')
+    save_model(trained_pipeline, 'advanced_feature_engineering_ensemble_model.pkl')
 
-    # 5. 验证集阈值选择
+    # 4. 验证集阈值选择
     print("\n=== 验证集阈值选择 ===")
     X_val_engineered = feature_engineer.transform(X_val)
-    val_proba = classifier.predict_proba(X_val_engineered)[:, 1]
+    val_proba_xgb = xgb_classifier.predict_proba(X_val_engineered)[:, 1]
+    val_proba_cat = cat_classifier.predict_proba(X_val_engineered)[:, 1]
+    val_proba_ensemble = (val_proba_xgb + val_proba_cat) / 2.0
 
-    threshold_f1 = find_best_f1_threshold(y_val, val_proba)
-    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
+    threshold_f1 = find_best_f1_threshold(y_val, val_proba_ensemble)
+    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba_ensemble, min_precision=0.4)
 
-    # 6. 测试集评估
+    # 5. 测试集评估
     print("\n=== 测试集评估 ===")
     X_test_engineered = feature_engineer.transform(X_test)
-    test_proba = classifier.predict_proba(X_test_engineered)[:, 1]
+    test_proba_xgb = xgb_classifier.predict_proba(X_test_engineered)[:, 1]
+    test_proba_cat = cat_classifier.predict_proba(X_test_engineered)[:, 1]
+    test_proba_ensemble = (test_proba_xgb + test_proba_cat) / 2.0
 
     # F1优化阈值评估
     print("\n--- 使用 F1 优化阈值评估 ---")
-    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
+    y_pred_f1 = (test_proba_ensemble >= threshold_f1).astype(int)
     recall_f1 = recall_score(y_test, y_pred_f1)
-    auc_f1 = roc_auc_score(y_test, test_proba)
+    auc_f1 = roc_auc_score(y_test, test_proba_ensemble)
     precision_f1 = precision_score(y_test, y_pred_f1)
     f1_f1 = f1_score(y_test, y_pred_f1)
     accuracy_f1 = accuracy_score(y_test, y_pred_f1)
@@ -840,9 +836,9 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # 高召回率阈值评估
     print("\n--- 使用高召回率阈值评估 ---")
-    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
+    y_pred_hr = (test_proba_ensemble >= threshold_high_recall).astype(int)
     recall_hr = recall_score(y_test, y_pred_hr)
-    auc_hr = roc_auc_score(y_test, test_proba)
+    auc_hr = roc_auc_score(y_test, test_proba_ensemble)
     precision_hr = precision_score(y_test, y_pred_hr)
     f1_hr = f1_score(y_test, y_pred_hr)
     accuracy_hr = accuracy_score(y_test, y_pred_hr)
@@ -856,8 +852,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # 可视化评估结果
     print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall,
-                      model_name="Advanced Feature Engineering XGBoost")
+    evaluate_and_plot(y_test, test_proba_ensemble, threshold_f1, threshold_high_recall,
+                      model_name="Advanced Feature Engineering Ensemble (XGBoost & CatBoost)")
 
     return {
         'recall': recall_f1,
@@ -865,7 +861,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         'precision': precision_f1,
         'f1': f1_f1,
         'accuracy': accuracy_f1,
-        'y_proba': test_proba,
+        'y_proba': test_proba_ensemble,
         'y_pred': y_pred_f1,
         'threshold': threshold_f1,
         'high_recall_results': {
@@ -874,7 +870,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
             'f1': f1_hr,
             'threshold': threshold_high_recall
         },
-        'trained_model': trained_pipeline
+        'trained_model': trained_pipeline,
+        'individual_models': [xgb_classifier, cat_classifier]
     }
 
 
@@ -910,12 +907,12 @@ def main():
         'use_multiple_decomposition': False,  # 关闭降维
         'svd_components': 80,  # 降维已取消
         'ica_components': 50,  # 降维已取消
-        'fa_components': 30,   # 降维已取消
+        'fa_components': 30,  # 降维已取消
 
         # 取消特征选择配置
         'variance_threshold': 0.01,  # 特征选择已取消
-        'univariate_k_best': None,     # 取消单变量选择
-        'rf_n_features_to_select': None, # 取消随机森林选择
+        'univariate_k_best': None,  # 取消单变量选择
+        'rf_n_features_to_select': None,  # 取消随机森林选择
 
         # 输出格式
         'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
