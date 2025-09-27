@@ -350,7 +350,7 @@ if __name__ == "__main__":
         window_sizes=[10, 25],
         scan_n_trees=50,
         scan_max_depth=2,
-        use_scan=False,  # 修复: 跳过扫描避免维度问题
+        use_scan=False,
         min_delta=0.0005,
         random_state=42
     )
@@ -368,23 +368,22 @@ if __name__ == "__main__":
         final_estimator=GaussianNB(),
         n_jobs=-1
     )
-    print("集成模型结构:")
-    print(f"  - 基分类器: {stacking_model.estimators_}")
-    print(f"  - 最终分类器: {stacking_model.final_estimator_}")
 
-    # 11. 训练模型
+    # 11. 训练模型（关键：必须先fit才能访问estimators_）
     print("开始训练模型...")
     stacking_model.fit(X_train, y_train)
     print("模型训练完成！")
 
-    # 12. 保存模型
+    # 12. 修复：现在在fit之后打印模型结构
+    print("\n" + "=" * 50)
+    print("集成模型结构:")
+    print(f"  - 基分类器: {stacking_model.estimators_}")  # 现在可以安全访问
+    print(f"  - 最终分类器: {stacking_model.final_estimator_}")
+    print("=" * 50)
+
+    # 13. 保存模型
     save_object(stacking_model, './model_pipeline_xgboost_cemmdan.pkl')
     print("模型已保存至: ./model_pipeline_xgboost_cemmdan.pkl")
-
-    # 13. 评估模型
-    print("\n" + "=" * 50)
-    print("模型评估结果:")
-    print("=" * 50)
 
     y_pred_test = stacking_model.predict(X_test)
     y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
