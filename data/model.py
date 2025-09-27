@@ -2,8 +2,7 @@ import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, RandomTreesEmbedding
-from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.decomposition import TruncatedSVD
 import pickle
 from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
@@ -14,20 +13,18 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectFromModel
 import xgboost as xgb
+from sklearn.utils.validation import check_X_y
 
 
-# --- 自定义深度森林实现 (已修复维度问题) ---
+# --- 自定义深度森林实现 (已移除多粒度扫描) ---
 class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
     """
-    增强版深度森林实现，包含多粒度扫描和动态级联结构。
+    增强版深度森林实现（已移除多粒度扫描功能）。
 
     Attributes:
         n_estimators (int): 每个子模型中的树的数量。
         max_layers (int): 级联的最大层数。
-        window_sizes (list of int): 多粒度扫描使用的窗口大小列表。
-        scan_n_trees (int): 扫描阶段使用的随机树嵌入的树数量。
-        scan_max_depth (int): 扫描阶段使用的随机树嵌入的最大深度。
-        use_scan (bool): 是否启用多粒度扫描。
+        use_scan (bool): 已禁用多粒度扫描（始终为False）。
         min_delta (float): 触发新增层级所需的最小精度差异阈值。
         random_state (int or None): 控制随机种子。
 
@@ -40,24 +37,17 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
     def __init__(self,
                  n_estimators=100,
                  max_layers=5,
-                 window_sizes=[20, 50],
-                 scan_n_trees=100,
-                 scan_max_depth=3,
-                 use_scan=True,
+                 use_scan=False,  # 已固定为False
                  min_delta=0.001,
                  random_state=None):
         self.n_estimators = n_estimators
         self.max_layers = max_layers
-        self.window_sizes = window_sizes
-        self.scan_n_trees = scan_n_trees
-        self.scan_max_depth = scan_max_depth
-        self.use_scan = use_scan
+        self.use_scan = use_scan  # 始终为False
         self.min_delta = min_delta
         self.random_state = random_state
-        self.scan_layers_ = []  # 存储扫描后的表示转换器
         self.cascade_layers_ = []  # 存储每层的基分类器组
         self.classes_ = None
-        self._fitted_feature_count = None  # 记录训练时的特征数量
+        self._fitted_feature_count = None
 
     def _create_base_estimators(self):
         """创建一组基础分类器"""
@@ -70,91 +60,29 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
                                         n_jobs=-1))
         ]
 
-    def _scan_fit_transform(self, X, y=None, is_fitting=False):
-        """
-        应用多粒度扫描到输入数据X。
-        优化：当use_scan=False时直接返回原始数据（避免维度计算错误）
-        """
-        if not self.use_scan:
-            return X
-
-        transformed_parts = [X]
-
-        # 仅在fit阶段执行扫描逻辑（避免预测时维度不一致）
-        if is_fitting:
-            for size in self.window_sizes:
-                try:
-                    # 使用随机树嵌入进行扫描
-                    rte = RandomTreesEmbedding(
-                        n_estimators=self.scan_n_trees,
-                        max_depth=self.scan_max_depth,
-                        random_state=self.random_state)
-
-                    d = X.shape[1]
-                    step = max(1, d // size)
-
-                    slice_idx = 0
-                    for start in range(0, d - step * size + 1, step):
-                        end = start + step * size
-                        slice_data = X[:, start:end]
-
-                        # 跳过不足窗口大小的片段
-                        if slice_data.shape[1] != step * size:
-                            continue
-
-                        # 重塑为 [样本数, 窗口数, 特征数]
-                        reshaped_slice = slice_data.reshape(slice_data.shape[0], size, -1).mean(axis=2)
-
-                        # 应用嵌入和SVD降维
-                        embedded = rte.fit_transform(reshaped_slice)
-                        svd_reducer = TruncatedSVD(n_components=min(embedded.shape) - 1,
-                                                   random_state=self.random_state)
-                        reduced_features = svd_reducer.fit_transform(embedded)
-
-                        transformed_parts.append(reduced_features)
-                        slice_idx += 1
-
-                except Exception as e:
-                    print(f"警告: 窗口大小{size}的多粒度扫描失败: {e}")
-                    continue
-
-            result = np.hstack(transformed_parts)
-            if is_fitting:
-                self._fitted_feature_count = result.shape[1]  # 记录训练时的特征数
-            return result.astype(np.float32)
-        else:
-            # 预测阶段直接返回原始数据（避免维度计算）
-            return X
-
     def _evaluate_layer_gain(self, prev_X, current_X, y_true):
         """
         评估当前层带来的性能增益
         """
-        # 使用简单分类器评估增益（避免随机森林维度问题）
+        # 使用简单分类器评估增益
         prev_score = cross_val_score(GaussianNB(), prev_X, y_true, cv=3, scoring='accuracy').mean()
         curr_score = cross_val_score(GaussianNB(), current_X, y_true, cv=3, scoring='accuracy').mean()
         return (curr_score - prev_score) >= self.min_delta, curr_score - prev_score
 
     def fit(self, X, y):
         """
-        训练深度森林模型（修复维度问题）
+        训练深度森林模型（已移除多粒度扫描）
         """
-        # 1. 强制转换输入为NumPy数组（避免DataFrame导致的维度混淆）
-        X = np.asarray(X)
+        # 1. 强制转换输入为NumPy数组并验证
+        X, y = check_X_y(X, y, ensure_min_features=1)
         print(f"深度森林输入数据类型: {type(X)}, 形状: {X.shape}")
 
         self.classes_ = np.unique(y)
-        original_X_shape = X.shape
+        self._fitted_feature_count = X.shape[1]  # 记录初始特征数
 
-        # 2. 执行多粒度扫描（仅当use_scan=True时）
-        if self.use_scan:
-            print("开始多粒度扫描...")
-            scanned_X = self._scan_fit_transform(X.copy(), is_fitting=True)
-            current_input = scanned_X
-            print(f"扫描后特征维度: {current_input.shape[1]}")
-        else:
-            current_input = X.copy()
-            print("跳过多粒度扫描（use_scan=False）")
+        # 2. 直接使用原始数据（已移除扫描）
+        print("已移除多粒度扫描，直接使用原始特征数据")
+        current_input = X.copy()
 
         # 3. 级联层训练
         print(f"开始级联层训练（最大层数: {self.max_layers}）")
@@ -204,33 +132,42 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         print(f"最终输入特征数: {current_input.shape[1]}")
         return self
 
+    def _ensure_feature_dimension(self, X, expected_features):
+        """确保输入特征维度与预期一致"""
+        if X.shape[1] < expected_features:
+            # 填充零值
+            padding = np.zeros((X.shape[0], expected_features - X.shape[1]))
+            return np.hstack([X, padding])
+        elif X.shape[1] > expected_features:
+            # 截断多余特征
+            return X[:, :expected_features]
+        return X
+
     def predict_proba(self, X):
         """获取测试集上的类别概率分布"""
         if not hasattr(self, 'cascade_layers_') or len(self.cascade_layers_) == 0:
             raise RuntimeError("必须先调用fit训练模型！")
 
-        # 1. 强制转换输入为NumPy数组
+        # 1. 强制转换输入为NumPy数组并验证
         X = np.asarray(X)
+        if X.ndim != 2:
+            raise ValueError(f"期望2D数组，得到{X.ndim}D数组")
+
         print(f"预测输入数据类型: {type(X)}, 形状: {X.shape}")
 
-        # 2. 执行扫描（如果启用）
-        if self.use_scan:
-            X = self._scan_fit_transform(X.copy())
-            print(f"扫描后预测特征数: {X.shape[1]}")
+        # 2. 确保初始特征维度一致
+        if not hasattr(self, '_fitted_feature_count'):
+            raise RuntimeError("模型未正确训练，缺少特征计数信息")
+
+        X = self._ensure_feature_dimension(X, self._fitted_feature_count)
 
         # 3. 级联层前向传播
         for layer_idx, layer_estimators in enumerate(self.cascade_layers_, 1):
             print(f"级联层 {layer_idx} 输入特征数: {X.shape[1]}")
             all_preds = []
             for clf in layer_estimators.values():
-                # 确保特征数匹配（修复维度不一致问题）
-                if X.shape[1] != clf.n_features_in_:
-                    print(f"警告: 级联层 {layer_idx} 特征数不匹配! 期望: {clf.n_features_in_}, 实际: {X.shape[1]}")
-                    # 尝试修复：填充或截断
-                    if X.shape[1] < clf.n_features_in_:
-                        X = np.pad(X, ((0, 0), (0, clf.n_features_in_ - X.shape[1])), 'constant')
-                    else:
-                        X = X[:, :clf.n_features_in_]
+                # 确保特征数匹配
+                X = self._ensure_feature_dimension(X, clf.n_features_in_)
                 all_preds.append(clf.predict_proba(X))
             new_features = np.hstack(all_preds)
             X = np.hstack([X, new_features])
@@ -329,7 +266,9 @@ if __name__ == "__main__":
     print("特征选择...")
     selector = SelectFromModel(xgb.XGBClassifier(n_estimators=100, random_state=42))
     X_selected = selector.fit_transform(X_resampled, y_resampled)
+    selected_features = selector.get_support(indices=True)
     print(f"选择后特征数: {X_selected.shape[1]}")
+    print(f"被选中的特征索引: {selected_features}")
 
     # 保存特征选择器
     save_object(selector, './feature_selector_xgboost_cemmdan.pkl')
@@ -342,15 +281,12 @@ if __name__ == "__main__":
         X_selected, y_resampled, test_size=0.1, random_state=42)
     print(f"训练集形状: {X_train.shape}, 测试集形状: {X_test.shape}")
 
-    # 9. 初始化增强深度森林
+    # 9. 初始化增强深度森林（已移除多粒度扫描）
     print("初始化增强深度森林模型...")
     base_enhanced_df = EnhancedDeepForest(
         n_estimators=80,
         max_layers=4,
-        window_sizes=[10, 25],
-        scan_n_trees=50,
-        scan_max_depth=2,
-        use_scan=False,
+        use_scan=False,  # 已显式设置为False
         min_delta=0.0005,
         random_state=42
     )
@@ -366,10 +302,11 @@ if __name__ == "__main__":
             ('adaboost', adaboost)
         ],
         final_estimator=GaussianNB(),
-        n_jobs=-1
+        n_jobs=-1,
+        cv=3  # 添加交叉验证折数
     )
 
-    # 11. 训练模型（关键：必须先fit才能访问estimators_）
+    # 11. 训练模型
     print("开始训练模型...")
     stacking_model.fit(X_train, y_train)
     print("模型训练完成！")
@@ -385,6 +322,7 @@ if __name__ == "__main__":
     save_object(stacking_model, './model_pipeline_xgboost_cemmdan.pkl')
     print("模型已保存至: ./model_pipeline_xgboost_cemmdan.pkl")
 
+    # 14. 评估模型
     y_pred_test = stacking_model.predict(X_test)
     y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
 
@@ -394,6 +332,7 @@ if __name__ == "__main__":
 
     final_score = 30 * recall + 50 * auc + 20 * precision
 
+    print("\n模型评估结果:")
     print(f"召回率 (Recall):    {recall:.6f}")
     print(f"AUC:               {auc:.6f}")
     print(f"精确率 (Precision): {precision:.6f}")
