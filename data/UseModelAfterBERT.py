@@ -1,42 +1,88 @@
-import pickle
-import pandas as pd
-import numpy as np
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# --- 导入特征工程类 ---
-# 这里需要包含您提供的 AdvancedFeatureEngineer 类的完整定义
-# 为保持代码完整性，将类定义直接包含在此脚本中
-
 import multiprocessing
 import os
+import pickle
 import random
 import time
+import warnings
+
+# --- 导入绘图库 ---
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
 from imblearn.combine import SMOTETomek
 from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import TomekLinks
+
+# --- 导入先进的特征工程库 ---
 from sklearn.decomposition import TruncatedSVD, FastICA, FactorAnalysis
 from sklearn.feature_selection import RFE, SelectFromModel, VarianceThreshold, SelectKBest, f_classif, \
     mutual_info_classif
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
+                             precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
                                    PowerTransformer, MinMaxScaler)
+
+# --- 导入聚类和异常检测用于特征工程 ---
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
+
+# --- 导入 XGBoost ---
+from xgboost import XGBClassifier
+
+# --- 导入稀疏矩阵支持 ---
 from scipy import sparse
 from scipy.stats import skew, kurtosis
 
+warnings.filterwarnings('ignore')
 
-# 环境配置 - 最大化CPU利用率
+# 环境配置
 NUM_CORES = multiprocessing.cpu_count()
 print(f"检测到 {NUM_CORES} 个CPU核心")
 os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+
+
+def moo_smotetomek_func(X, y):
+    """
+    使用一组固定的参数应用 SMOTETomek 进行重采样。
+    """
+    print("  -> 应用固定参数的 SMOTETomek...")
+
+    if len(np.unique(y)) < 2:
+        print("    -> 标签类别不足，跳过SMOTETomek.")
+        return X, y
+
+    try:
+        if sparse.issparse(X):
+            print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
+            X_dense = X.toarray()
+        else:
+            X_dense = X
+
+        smotetomek = SMOTETomek(
+            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
+            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
+            random_state=SEED
+        )
+
+        X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
+
+        print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
+        return X_resampled_dense, y_resampled
+
+    except Exception as e:
+        print(f"    -> 应用 SMOTETomek 失败: {e}。回退到原始数据。")
+        return X, y
+
 
 class AdvancedFeatureEngineer:
     """
@@ -56,7 +102,7 @@ class AdvancedFeatureEngineer:
 
                  # 统计特征参数
                  create_statistical_features=True,
-                 rolling_windows=None,  # 滚动统计窗口
+                 rolling_windows=[3, 5, 10],  # 滚动统计窗口
 
                  # 聚类特征参数
                  create_cluster_features=True,
@@ -87,7 +133,7 @@ class AdvancedFeatureEngineer:
         self.scaler_type = scaler_type
         self.power_method = power_method
         self.create_statistical_features = create_statistical_features
-        self.rolling_windows = rolling_windows or [3, 5, 10]  # 默认值
+        self.rolling_windows = rolling_windows
         self.create_cluster_features = create_cluster_features
         self.n_clusters_kmeans = n_clusters_kmeans
         self.dbscan_eps = dbscan_eps
@@ -133,12 +179,13 @@ class AdvancedFeatureEngineer:
         self.fit_feature_count_before_imputer_ = None
         self.fit_feature_count_after_imputer_ = None
 
+        # Flag to indicate if the estimator is fitted
+        self._fitted = False
 
     def _identify_embedding_groups(self, feature_names):
         """识别并分组 *_emb_* 形式的特征"""
         print("  -> 识别嵌入特征组...")
         emb_pattern = "_emb_"  # 修改为新的模式
-        self.embedding_groups.clear()
         emb_dict = {}
 
         for feat in feature_names:
@@ -297,7 +344,7 @@ class AdvancedFeatureEngineer:
         print(f"    -> 创建了 {stat_features_array.shape[1]} 个统计特征")
         return np.concatenate([X_dense, stat_features_array], axis=1)
 
-    def _create_cluster_features(self, X_dense):
+    def _create_cluster_features(self, X_dense, training_phase=False):
         """创建聚类特征"""
         if not self.create_cluster_features:
             return X_dense
@@ -306,43 +353,71 @@ class AdvancedFeatureEngineer:
         cluster_features = []
 
         # K-Means 聚类
-        if self.kmeans is None:
+        if training_phase and self.kmeans is None:
+            # Fit on training data
             self.kmeans = KMeans(n_clusters=self.n_clusters_kmeans,
                                  random_state=SEED, n_init=10)
             kmeans_labels = self.kmeans.fit_predict(X_dense)
-        else:
+        elif not training_phase and self.kmeans is not None:
+            # Predict on non-training data using already fitted model
             kmeans_labels = self.kmeans.predict(X_dense)
+        else:
+            # This can happen if called during inference without fitting or other edge cases.
+            # For simplicity, we'll just add dummy labels here.
+            print("Warning: KMeans was not properly fitted. Adding dummy cluster features.")
+            kmeans_labels = np.zeros(X_dense.shape[0])
 
-        # K-Means 距离特征
-        kmeans_distances = self.kmeans.transform(X_dense)
-        cluster_features.append(kmeans_distances)
+        # K-Means 距离特征 - Always transform based on fitted centroids
+        if self.kmeans is not None:
+            kmeans_distances = self.kmeans.transform(X_dense)
+            cluster_features.append(kmeans_distances)
 
-        # DBSCAN 聚类 (仅在训练时)
-        if self.dbscan is None:
+            # Add label only once per call
+            cluster_features.append(kmeans_labels.reshape(-1, 1))
+
+        # DBSCAN 聚类
+        if training_phase and self.dbscan is None:
+            # Only fit/predict on training set due to lack of .predict()
             self.dbscan = DBSCAN(eps=self.dbscan_eps,
                                  min_samples=self.dbscan_min_samples, n_jobs=-1)
             dbscan_labels = self.dbscan.fit_predict(X_dense)
+        elif not training_phase and self.dbscan is not None:
+            # Inference phase uses previously computed clusters (dummy prediction approach).
+            # As DBSCAN has no direct predict(), re-fitting might be needed but that's expensive.
+            # Here we simply assign all points to one default cluster (-1 often means noise).
+            print("Info: Using dummy assignment for DBSCAN predictions during transformation/inference.")
+            # A simple workaround could involve nearest neighbor search against core samples,
+            # but for now let's assume a constant value like -1 which indicates noise/outliers.
+            # Alternatively you may want to store indices from original clustering step.
+            # Let's go with assigning everything to most common class found in training.
+            unique_labels_in_training = np.unique(self.dbscan.labels_)
+            mode_label = unique_labels_in_training[
+                np.argmax(np.bincount(self.dbscan.labels_[self.dbscan.labels_ >= 0]))] if any(
+                self.dbscan.labels_ >= 0) else -1
+            dbscan_labels = np.full(shape=X_dense.shape[0], fill_value=mode_label)
         else:
-            # DBSCAN 没有 predict 方法，需要重新拟合或使用其他方法
-            # 这里简化处理，跳过测试集的DBSCAN标签
+            # Handle case where DBSCAN wasn't used at all (either intentionally disabled or error state)
+            print("Warning: DBSCAN was not properly initialized/fitted. Assigning placeholder values.")
             dbscan_labels = np.zeros(X_dense.shape[0])
 
-        # 添加聚类标签作为特征 (one-hot编码可能更好，但这里简化)
-        cluster_features.append(kmeans_labels.reshape(-1, 1))
+        # Append both distance matrix and predicted/assigned cluster labels
+        if hasattr(self, 'kmeans') and self.kmeans is not None:
+            pass  # Already appended above when computing distances
+
         cluster_features.append(dbscan_labels.reshape(-1, 1))
 
         # 合并聚类特征
         cluster_features_array = np.concatenate(cluster_features, axis=1)
 
         # 添加特征名称
-        cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)]
+        cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)] if self.kmeans is not None else []
         cluster_names.extend(['kmeans_label', 'dbscan_label'])
         self.feature_names.extend(cluster_names)
 
         print(f"    -> 创建了 {cluster_features_array.shape[1]} 个聚类特征")
         return np.concatenate([X_dense, cluster_features_array], axis=1)
 
-    def _create_anomaly_features(self, X_dense):
+    def _create_anomaly_features(self, X_dense, training_phase=False):
         """创建异常检测特征"""
         if not self.create_anomaly_features:
             return X_dense
@@ -351,25 +426,31 @@ class AdvancedFeatureEngineer:
         anomaly_features = []
 
         # Isolation Forest
-        if self.isolation_forest is None:
+        if training_phase and self.isolation_forest is None:
             self.isolation_forest = IsolationForest(
                 contamination=self.isolation_contamination,
                 random_state=SEED, n_jobs=-1)
             iso_scores = self.isolation_forest.fit(X_dense).decision_function(X_dense)
-        else:
+        elif not training_phase and self.isolation_forest is not None:
             iso_scores = self.isolation_forest.decision_function(X_dense)
+        else:
+            print("Warning: IsolationForest not fitted correctly; adding zeros instead.")
+            iso_scores = np.zeros((X_dense.shape[0],))
 
         anomaly_features.append(iso_scores.reshape(-1, 1))
 
         # Local Outlier Factor
-        if self.lof is None:
+        if training_phase and self.lof is None:
             self.lof = LocalOutlierFactor(
                 n_neighbors=self.lof_n_neighbors,
                 novelty=True, n_jobs=-1)
             self.lof.fit(X_dense)
             lof_scores = self.lof.decision_function(X_dense)
-        else:
+        elif not training_phase and self.lof is not None:
             lof_scores = self.lof.decision_function(X_dense)
+        else:
+            print("Warning: LOF not fitted correctly; adding zeros instead.")
+            lof_scores = np.zeros((X_dense.shape[0],))
 
         anomaly_features.append(lof_scores.reshape(-1, 1))
 
@@ -474,8 +555,8 @@ class AdvancedFeatureEngineer:
         # 3. 高级特征工程
         print("步骤 3: 高级特征工程...")
         X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
+        X_dense = self._create_cluster_features(X_dense, training_phase=True)  # Indicate this is training phase
+        X_dense = self._create_anomaly_features(X_dense, training_phase=True)  # Same logic applies here too.
 
         print(f"特征工程后特征数: {X_dense.shape[1]}")
 
@@ -534,10 +615,15 @@ class AdvancedFeatureEngineer:
         # 记录最终特征数
         self.final_feature_count_after_engineering_ = X_dense.shape[1]
         print(f"特征工程拟合完成！最终特征数: {self.final_feature_count_after_engineering_}")
+        self._fitted = True
         return self
 
     def transform(self, X):
         """应用特征工程变换"""
+        if not self._fitted:
+            raise RuntimeError(
+                "This AdvancedFeatureEngineer instance is not fitted yet. Call 'fit' with appropriate arguments before using this estimator.")
+
         # 处理输入格式
         if isinstance(X, pd.DataFrame):
             # 新增：处理嵌入特征 (使用在fit中识别的组)
@@ -590,7 +676,7 @@ class AdvancedFeatureEngineer:
             if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
                 print(
                     f"  -> transform 阶段，经过 DataFrame 处理后的特征数 ({X_dense.shape[1]}) 与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 不一致。")
-                print(f"  -> 尝试调整 X_dense 维度以匹配...")
+                print(f"  -> 调整 X_dense 维度以匹配...")
                 if X_dense.shape[1] > self.fit_feature_count_before_imputer_:
                     # 如果 transform 时特征数更多，裁剪
                     X_dense = X_dense[:, :self.fit_feature_count_before_imputer_]
@@ -644,8 +730,9 @@ class AdvancedFeatureEngineer:
 
         # 3. 特征工程 (注意：聚类和异常检测需要特殊处理)
         X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
+        X_dense = self._create_cluster_features(X_dense,
+                                                training_phase=False)  # Apply learned models rather than refit them
+        X_dense = self._create_anomaly_features(X_dense, training_phase=False)  # Again apply learned ones vs retraining
 
         # 4. 多重降维
         if self.use_multiple_decomposition:
@@ -684,126 +771,320 @@ class AdvancedFeatureEngineer:
         return self.fit(X, y).transform(X)
 
 
-def moo_smotetomek_func(X, y):
-    """
-    使用一组固定的参数应用 SMOTETomek 进行重采样。
-    """
-    print("  -> 应用固定参数的 SMOTETomek...")
+# 其他函数保持不变
+def save_model(model, filename):
+    """保存模型到文件"""
+    with open(filename, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"\n模型已保存为 {filename}")
 
-    if len(np.unique(y)) < 2:
-        print("    -> 标签类别不足，跳过SMOTETomek.")
-        return X, y
 
+def find_best_f1_threshold(y_true, y_proba):
+    """在验证集上寻找最佳阈值以优化 F1 分数"""
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+    f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+    best_idx = np.argmax(f_scores)
+    best_threshold = thresholds[best_idx]
+    best_f_score = f_scores[best_idx]
+    best_precision = precisions[best_idx]
+    best_recall = recalls[best_idx]
+
+    print(f"最佳 F1 阈值: {best_threshold:.4f}")
+    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}, F1: {best_f_score:.4f}")
+
+    return best_threshold
+
+
+def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
+    """寻找能获得最高召回率且精确率不低于 min_precision 的阈值"""
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+    valid_indices = np.where(precisions[:-1] >= min_precision)[0]
+
+    if len(valid_indices) == 0:
+        print(f"警告: 没有阈值能满足精确率 >= {min_precision}。返回默认阈值 0.5。")
+        return 0.5
+
+    best_valid_idx = valid_indices[np.argmax(recalls[valid_indices])]
+    best_threshold = thresholds[best_valid_idx]
+    best_precision = precisions[best_valid_idx]
+    best_recall = recalls[best_valid_idx]
+
+    print(f"高召回率阈值 (Precision >= {min_precision}): {best_threshold:.4f}")
+    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}")
+
+    return best_threshold
+
+
+def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="Model"):
+    """评估模型并绘制 ROC, PR, Confusion Matrix"""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # ROC Curve
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+    roc_auc = auc(fpr, tpr)
+    axes[0].plot(fpr, tpr, color='darkorange', lw=2, label=f'{model_name} (AUC = {roc_auc:.2f})')
+    axes[0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    axes[0].set_xlim([0.0, 1.0])
+    axes[0].set_ylim([0.0, 1.05])
+    axes[0].set_xlabel('False Positive Rate')
+    axes[0].set_ylabel('True Positive Rate')
+    axes[0].set_title('Receiver Operating Characteristic')
+    axes[0].legend(loc="lower right")
+
+    # Precision-Recall Curve
+    precision, recall, _ = precision_recall_curve(y_true, y_proba)
+    pr_auc = auc(recall, precision)
+    axes[1].plot(recall, precision, color='b', lw=2, label=f'{model_name} (AUC = {pr_auc:.2f})')
+    axes[1].set_xlabel('Recall')
+    axes[1].set_ylabel('Precision')
+    axes[1].set_title('Precision-Recall Curve')
+    axes[1].legend(loc="lower left")
+
+    # Confusion Matrix
+    y_pred_f1 = (y_proba >= threshold_f1).astype(int)
+    cm = confusion_matrix(y_true, y_pred_f1)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[2])
+    axes[2].set_title(f'Confusion Matrix (Threshold={threshold_f1:.4f})')
+    axes[2].set_xlabel('Predicted Label')
+    axes[2].set_ylabel('True Label')
+
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n=== {model_name} 详细评估报告 ===")
+    print(classification_report(y_true, y_pred_f1, target_names=['Negative', 'Positive']))
+    print("-" * 40)
+
+
+def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
+    """使用先进特征工程的训练评估流程"""
+    print("\n=== 构建先进特征工程管道 ===")
+
+    # 特征工程
+    feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
+    classifier = XGBClassifier(
+        n_estimators=500,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=SEED,
+        n_jobs=-1,
+        eval_metric='logloss'
+    )
+
+    # 1. 拟合特征工程器
+    print("\n=== 拟合特征工程器 ===")
+    feature_engineer.fit(X_train, y_train)
+    X_train_engineered = feature_engineer.transform(X_train)
+
+    # 2. 应用 SMOTETomek
+    print("\n=== 应用 SMOTETomek 重采样 ===")
+    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered, y_train)
+
+    # 3. 模型训练
+    print("\n=== 开始模型训练 ===")
+    start_time = time.time()
+    classifier.fit(X_train_resampled, y_train_resampled)
+    end_time = time.time()
+    print(f"模型训练耗时: {end_time - start_time:.2f} 秒")
+
+    # 4. 保存模型
+    trained_pipeline = Pipeline([
+        ('feature_engineer', feature_engineer),
+        ('classifier', classifier)
+    ])
+    save_model(trained_pipeline, 'advanced_feature_engineering_model.pkl')
+
+    # 5. 验证集阈值选择
+    print("\n=== 验证集阈值选择 ===")
+    X_val_engineered = feature_engineer.transform(X_val)
+    val_proba = classifier.predict_proba(X_val_engineered)[:, 1]
+
+    threshold_f1 = find_best_f1_threshold(y_val, val_proba)
+    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
+
+    # 6. 测试集评估
+    print("\n=== 测试集评估 ===")
+    X_test_engineered = feature_engineer.transform(X_test)
+    test_proba = classifier.predict_proba(X_test_engineered)[:, 1]
+
+    # F1优化阈值评估
+    print("\n--- 使用 F1 优化阈值评估 ---")
+    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
+    recall_f1 = recall_score(y_test, y_pred_f1)
+    auc_f1 = roc_auc_score(y_test, test_proba)
+    precision_f1 = precision_score(y_test, y_pred_f1)
+    f1_f1 = f1_score(y_test, y_pred_f1)
+    accuracy_f1 = accuracy_score(y_test, y_pred_f1)
+    print(f"阈值: {threshold_f1:.4f}")
+    print(f"Recall: {recall_f1:.4f}")
+    print(f"AUC: {auc_f1:.4f}")
+    print(f"Precision: {precision_f1:.4f}")
+    print(f"F1 Score: {f1_f1:.4f}")
+    print(f"Accuracy: {accuracy_f1:.4f}")
+    print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_f1 + 50 * auc_f1 + 30 * recall_f1:.4f}")
+
+    # 高召回率阈值评估
+    print("\n--- 使用高召回率阈值评估 ---")
+    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
+    recall_hr = recall_score(y_test, y_pred_hr)
+    auc_hr = roc_auc_score(y_test, test_proba)
+    precision_hr = precision_score(y_test, y_pred_hr)
+    f1_hr = f1_score(y_test, y_pred_hr)
+    accuracy_hr = accuracy_score(y_test, y_pred_hr)
+    print(f"阈值: {threshold_high_recall:.4f}")
+    print(f"Recall: {recall_hr:.4f}")
+    print(f"AUC: {auc_hr:.4f}")
+    print(f"Precision: {precision_hr:.4f}")
+    print(f"F1 Score: {f1_hr:.4f}")
+    print(f"Accuracy: {accuracy_hr:.4f}")
+    print(f"TestScore (20*P+50*AUC+30*R): {20 * precision_hr + 50 * auc_hr + 30 * recall_hr:.4f}")
+
+    # 可视化评估结果
+    print("\n=== 绘制评估图表 ===")
+    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall,
+                      model_name="Advanced Feature Engineering XGBoost")
+
+    return {
+        'recall': recall_f1,
+        'auc': auc_f1,
+        'precision': precision_f1,
+        'f1': f1_f1,
+        'accuracy': accuracy_f1,
+        'y_proba': test_proba,
+        'y_pred': y_pred_f1,
+        'threshold': threshold_f1,
+        'high_recall_results': {
+            'recall': recall_hr,
+            'precision': precision_hr,
+            'f1': f1_hr,
+            'threshold': threshold_high_recall
+        },
+        'trained_model': trained_pipeline
+    }
+
+
+def main():
+    # 检查CUDA可用性
+    print("CUDA 可用性 (PyTorch):", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("当前 CUDA 设备:", torch.cuda.current_device())
+        print("CUDA 设备名称:", torch.cuda.get_device_name(0))
+
+    # 配置先进特征工程参数
+    feature_engineer_params = {
+        # 预处理配置
+        'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
+        'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
+
+        # 统计特征配置
+        'create_statistical_features': True,
+        'rolling_windows': [3, 5, 10],
+
+        # 聚类特征配置
+        'create_cluster_features': True,
+        'n_clusters_kmeans': 15,  # 增加聚类数量
+        'dbscan_eps': 0.3,
+        'dbscan_min_samples': 5,
+
+        # 异常检测特征配置
+        'create_anomaly_features': True,
+        'isolation_contamination': 0.05,  # 假设5%的数据是异常值
+        'lof_n_neighbors': 20,
+
+        # 多重降维配置
+        'use_multiple_decomposition': True,
+        'svd_components': 80,  # 增加SVD成分
+        'ica_components': 50,  # 增加ICA成分
+        'fa_components': 30,  # 增加FA成分
+
+        # 特征选择配置
+        'variance_threshold': 0.01,
+        'univariate_k_best': 1500,  # 增加单变量选择的特征数
+        'rf_n_features_to_select': 1000,  # 最终保留1000个特征
+
+        # 输出格式
+        'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
+    }
+
+    # 数据加载
+    print("\n=== 数据加载 ===")
     try:
-        if sparse.issparse(X):
-            print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
-            X_dense = X.toarray()
-        else:
-            X_dense = X
+        import dask.dataframe as dd
+        ddf = dd.read_csv('train_bert_embedded.csv')
 
-        smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=42, n_jobs=-1),
-            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
-            random_state=42
-        )
+        data = ddf.compute()
+        # 假设你的数据文件是 train_bert_embedded.csv
+        # data = pd.read_csv("train_bert_embedded.csv", engine='pyarrow')
+        if "company_id" in data.columns:
+            data = data.drop(columns=["company_id"])
+        if "target" not in data.columns:
+            raise ValueError("数据中必须包含'target'列")
 
-        X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
+        # 分离特征和目标
+        y = data["target"].values.astype(int)
+        feature_data = data.drop(columns=["target"])
+        X = feature_data  # 传递DataFrame给特征工程器
 
-        print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
-        return X_resampled_dense, y_resampled
-
+        print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
+        print(f"正样本比例: {np.mean(y):.4f}")
+        print(f"使用的特征工程参数: {feature_engineer_params}")
     except Exception as e:
-        print(f"    -> 应用 SMOTETomek 失败: {e}。回退到原始数据。")
-        return X, y
+        print(f"数据加载失败: {str(e)}")
+        return
 
+    # 移除y中的NaN
+    if np.isnan(y).any():
+        print("移除y中的NaN...")
+        mask = ~np.isnan(y)
+        X = X.iloc[mask]  # 使用iloc进行索引
+        y = y[mask]
 
-def load_and_apply_model():
-    # 1. 加载测试数据
-    test_data_path = '../UseBert/train_bert_embedded.csv'  # 修改数据路径
-    print(f"正在加载测试数据: {test_data_path}")
-    test_data = pd.read_csv(test_data_path)
-    print(f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1]}")
+    # 数据划分
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.1, random_state=SEED, stratify=y)
+    print(f"\n初步数据划分: 临时集={X_temp.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # 2. 加载完整的训练管道 (特征工程器 + 分类器)
-    # 请确保 'advanced_feature_engineering_model.pkl' 文件与脚本在同一目录下，或提供完整路径
-    model_path = 'advanced_feature_engineering_model.pkl'
-    print(f"正在加载模型: {model_path}")
-    with open(model_path, 'rb') as f:
-        trained_pipeline = pickle.load(f)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp)
+    print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-    print("模型加载成功。")
+    # 启动先进特征工程训练流程
+    print("\n=== 启动先进特征工程训练流程 ===")
+    results = train_and_evaluate_advanced(
+        X_train, y_train, X_val, y_val, X_test, y_test,
+        feature_engineer_params=feature_engineer_params
+    )
 
-    # 从加载的管道中提取特征工程器和分类器
-    feature_engineer = trained_pipeline.named_steps['feature_engineer']
-    classifier = trained_pipeline.named_steps['classifier']
-    if not hasattr(feature_engineer, 'embedding_groups'):
-        feature_engineer.embedding_groups = {}
-        print("  -> 已修复模型: 添加缺失的embedding_groups属性")
+    # 保存预测结果
+    if 'y_proba' in results and 'y_pred' in results:
+        pd.DataFrame({
+            'true_label': y_test,
+            'pred_prob': results['y_proba'],
+            'pred_label_f1_optimized': results['y_pred']
+        }).to_csv("advanced_predictions.csv", index=False)
+        print("\n预测结果已保存到 advanced_predictions.csv")
 
-    # 3. 准备测试特征并应用特征工程
-    # 假设测试数据不包含 'target' 列，如果包含则移除
-    feature_columns = [col for col in test_data.columns if col != 'target']
-    if 'company_id' in feature_columns:
-        X_test_raw = test_data[feature_columns].drop(columns=['company_id'])
-        uuid_column = test_data['company_id']
-    else:
-        X_test_raw = test_data[feature_columns]
-        uuid_column = test_data.index  # 如果没有company_id，使用索引
+    # 打印最终总结
+    print("\n" + "=" * 50)
+    print("特征工程训练完成！")
+    print("=" * 50)
+    print(f"最佳F1阈值: {results['threshold']:.4f}")
+    print(f"测试集性能:")
+    print(f"  - Precision: {results['precision']:.4f}")
+    print(f"  - Recall: {results['recall']:.4f}")
+    print(f"  - F1-Score: {results['f1']:.4f}")
+    print(f"  - AUC-ROC: {results['auc']:.4f}")
+    print(f"  - Accuracy: {results['accuracy']:.4f}")
 
-    print(f"用于特征工程的特征数: {X_test_raw.shape[1]}")
-
-    print("正在进行特征工程变换...")
-    X_test_engineered = feature_engineer.transform(X_test_raw)
-    print(f"特征工程完成，变换后特征数: {X_test_engineered.shape[1]}")
-
-    # 4. 应用模型预测
-    print("正在进行预测...")
-    # 获取预测概率
-    y_proba = classifier.predict_proba(X_test_engineered)[:, 1]  # 获取正类概率
-    print(f"预测完成，获得 {len(y_proba)} 个概率值。")
-
-    # 5. 应用阈值进行分类
-    # 使用与训练时相同的阈值选择方法或固定阈值
-    # 这里我们使用一个示例阈值，实际应用中应根据验证集性能选择
-    # 为了演示，假设我们使用0.5作为阈值，但在实际应用中应使用验证集找到的最佳阈值
-    # 例如，如果在训练脚本中找到的阈值是 results['threshold']，则应加载并使用该值
-    # 为了兼容性，这里先使用一个示例阈值
-
-    # 为了更准确，我们可以根据模型性能报告选择一个阈值
-    # 例如，在训练脚本中，最佳F1阈值是 find_best_f1_threshold 的返回值
-    # 为了演示，我们假设一个阈值，实际使用时应从训练结果中获取
-    # 如果有验证集上的最佳阈值文件，可以加载它
-    # 例如，如果训练脚本保存了阈值到文件，可以加载
-    # 或者，我们在这里使用一个常见的默认值，或者基于训练时的阈值
-    # 由于我们无法直接访问训练时的阈值，这里使用一个示例值
-    # 实际上，您应该在训练完成后将阈值保存到文件，然后在这里加载
-    # 例如，您可以将 find_best_f1_threshold 的返回值保存为 'best_threshold.pkl'
-    # 下面是一个示例，假设阈值为0.5，但实际应用中应使用训练时确定的阈值
-
-    # 为了演示，我们使用0.5作为默认阈值，但更推荐使用训练时找到的最佳阈值
-    # 假设我们知道最佳阈值是0.55（这需要从训练脚本中获取）
-    threshold = 0.7  # 这应该替换为训练时找到的最佳阈值
-    print(f"应用分类阈值: {threshold}")
-    y_pred = (y_proba >= threshold).astype(int)
-    print(f"分类完成。")
-
-    # 6. 创建结果数据框
-    results_df = pd.DataFrame({
-        'uuid': uuid_column,
-        'proba': y_proba,
-        'prediction': y_pred
-    })
-    print("结果数据框创建成功。")
-
-    # 7. 保存结果
-    output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'  # 修改输出文件名
-    print(f"正在保存结果到: {output_path}")
-    results_df.to_csv(output_path, index=False)
-    print(f"预测完成，使用阈值 {threshold} 进行分类，结果已保存到 {output_path}")
+    test_score = 20 * results['precision'] + 50 * results['auc'] + 30 * results['recall']
+    print(f"  - 综合得分: {test_score:.4f}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
-    load_and_apply_model()
+    main()
 
 
 
