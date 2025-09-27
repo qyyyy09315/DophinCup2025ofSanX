@@ -1,768 +1,462 @@
-import multiprocessing
-import os
-import pickle
-import random
-import time
-import warnings
-
-# --- 导入绘图库 ---
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from imblearn.combine import SMOTETomek
-from imblearn.ensemble import BalancedRandomForestClassifier
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
-
-# --- 导入先进的特征工程库 ---
-from sklearn.decomposition import TruncatedSVD, FastICA, FactorAnalysis
-from sklearn.feature_selection import RFE, SelectFromModel, VarianceThreshold, SelectKBest, f_classif, \
-    mutual_info_classif
+from imblearn.combine import SMOTEENN
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, RandomTreesEmbedding
+from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD  # For dimensionality reduction after scanning
+import pickle
+from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
-                             precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
-                                   PowerTransformer, MinMaxScaler)
-
-# --- 导入聚类和异常检测用于特征工程 ---
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-
-# --- 导入稀疏矩阵支持 ---
-from scipy import sparse
-from scipy.stats import skew, kurtosis
-
-warnings.filterwarnings('ignore')
-
-# 环境配置
-NUM_CORES = multiprocessing.cpu_count()
-print(f"检测到 {NUM_CORES} 个CPU核心")
-os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
-SEED = 42
-np.random.seed(SEED)
-random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+from sklearn.metrics import recall_score, roc_auc_score, precision_score, accuracy_score
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.naive_bayes import GaussianNB
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectFromModel
+import xgboost as xgb
+from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.multiclass import unique_labels
 
 
-# --- 神经网络模型定义 ---
-class SimpleNN(nn.Module):
-    """一个简单的前馈神经网络"""
-
-    def __init__(self, input_dim, hidden_dims=[128, 64], dropout_rate=0.3):
-        super(SimpleNN, self).__init__()
-        layers = []
-        prev_dim = input_dim
-        for dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            prev_dim = dim
-        layers.append(nn.Linear(prev_dim, 1))  # 输出一个logit
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
-
-
-class MultiScaleNNEnsemble:
-    """多尺度神经网络集群"""
-
-    def __init__(self, base_model_class, model_params_list, device='cpu'):
-        self.base_model_class = base_model_class
-        self.model_params_list = model_params_list  # 每个模型的参数字典列表
-        self.device = device
-        self.models = []
-        self.weights = []  # 存储每个模型的权重
-
-    def fit(self, X_train_list, y_train, X_val_list, y_val, epochs=50, batch_size=1024, lr=0.001):
-        """训练所有模型"""
-        self.models = []
-        self.weights = []
-        # 确保 y_train 是 numpy 数组，并且形状正确
-        if not isinstance(y_train, np.ndarray):
-            y_train_np = np.array(y_train)
-        else:
-            y_train_np = y_train
-
-        if not isinstance(y_val, np.ndarray):
-            y_val_np = np.array(y_val)
-        else:
-            y_val_np = y_val
-
-        y_train_tensor = torch.tensor(y_train_np, dtype=torch.float32).unsqueeze(1).to(self.device)
-        y_val_tensor = torch.tensor(y_val_np, dtype=torch.float32).unsqueeze(1).to(self.device)
-
-        for i, (X_train, X_val, model_params) in enumerate(zip(X_train_list, X_val_list, self.model_params_list)):
-            print(f"训练模型 {i + 1}/{len(self.model_params_list)}...")
-            input_dim = X_train.shape[1]
-            model = self.base_model_class(input_dim, **model_params).to(self.device)
-
-            # 数据加载器 - 确保 X_train 也是 numpy 数组
-            if not isinstance(X_train, np.ndarray):
-                X_train_np = np.array(X_train)
-            else:
-                X_train_np = X_train
-
-            if not isinstance(X_val, np.ndarray):
-                X_val_np = np.array(X_val)
-            else:
-                X_val_np = X_val
-
-            train_dataset = torch.utils.data.TensorDataset(
-                torch.tensor(X_train_np, dtype=torch.float32), y_train_tensor)
-            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-            criterion = nn.BCEWithLogitsLoss()
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-
-            model.train()
-            for epoch in range(epochs):
-                for data, target in train_loader:
-                    data, target = data.to(self.device), target.to(self.device)
-                    optimizer.zero_grad()
-                    output = model(data)
-                    loss = criterion(output, target)
-                    loss.backward()
-                    optimizer.step()
-
-            # 在验证集上评估以确定权重
-            model.eval()
-            with torch.no_grad():
-                val_preds = torch.sigmoid(
-                    model(torch.tensor(X_val_np, dtype=torch.float32).to(self.device))).cpu().numpy().flatten()
-            try:
-                val_auc = roc_auc_score(y_val_np, val_preds)
-            except:
-                val_auc = 0.5  # 防止AUC计算错误
-            print(f"  -> 模型 {i + 1} 验证集 AUC: {val_auc:.4f}")
-
-            self.models.append(model)
-            self.weights.append(val_auc)  # 使用AUC作为权重
-
-    def predict_proba(self, X_test_list):
-        """预测概率，返回正类概率"""
-        if not self.models:
-            raise ValueError("模型尚未训练，请先调用 fit 方法。")
-
-        all_probs = []
-        normalized_weights = np.array(self.weights) / np.sum(self.weights)  # 归一化权重
-
-        for model, X_test, weight in zip(self.models, X_test_list, normalized_weights):
-            model.eval()
-            with torch.no_grad():
-                # 确保 X_test 是 numpy 数组
-                if not isinstance(X_test, np.ndarray):
-                    X_test_np = np.array(X_test)
-                else:
-                    X_test_np = X_test
-                test_tensor = torch.tensor(X_test_np, dtype=torch.float32).to(self.device)
-                probs = torch.sigmoid(model(test_tensor)).cpu().numpy().flatten()
-            all_probs.append(probs * weight)  # 加权概率
-
-        # 对所有加权概率求和得到最终概率
-        final_probs = np.sum(np.array(all_probs), axis=0)
-        # 确保概率在 [0, 1] 范围内
-        final_probs = np.clip(final_probs, 0, 1)
-        return final_probs
-
-    def predict(self, X_test_list, threshold=0.5):
-        """预测类别"""
-        probs = self.predict_proba(X_test_list)
-        return (probs >= threshold).astype(int)
-
-
-def moo_smotetomek_func(X, y):
+# --- 自定义深度森林实现 ---
+class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
     """
-    使用一组固定的参数应用 SMOTETomek 进行重采样。
-    """
-    print("  -> 应用固定参数的 SMOTETomek...")
+    增强版深度森林实现，包含多粒度扫描和动态级联结构。
 
-    if len(np.unique(y)) < 2:
-        print("    -> 标签类别不足，跳过SMOTETomek.")
-        return X, y
+    Attributes:
+        n_estimators (int): 每个子模型中的树的数量。
+        max_layers (int): 级联的最大层数。
+        window_sizes (list of int): 多粒度扫描使用的窗口大小列表。
+        scan_n_trees (int): 扫描阶段使用的随机树嵌入的树数量。
+        scan_max_depth (int): 扫描阶段使用的随机树嵌入的最大深度。
+        use_scan (bool): 是否启用多粒度扫描。
+        min_delta (float): 触发新增层级所需的最小精度差异阈值。
+        random_state (int or None): 控制随机种子。
 
-    try:
-        if sparse.issparse(X):
-            print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
-            X_dense = X.toarray()
-        else:
-            X_dense = X
-
-        smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=SEED, n_jobs=-1),
-            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
-            random_state=SEED
-        )
-
-        X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
-
-        print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
-        return X_resampled_dense, y_resampled
-
-    except Exception as e:
-        print(f"    -> 应用 SMOTETomek 失败: {e}。回退到原始数据。")
-        return X, y
-
-
-class AdvancedFeatureEngineer:
-    """
-    简化版的特征工程管道，仅包含：
-    1. 多种预处理技术
-    2. 智能特征选择 (方差过滤, 单变量选择, 基于模型的选择)
+    Methods:
+        fit(X, y): 训练模型。
+        predict_proba(X): 返回类别概率估计。
+        predict(X): 返回预测类别标签。
     """
 
     def __init__(self,
-                 # 预处理参数
-                 scaler_type='robust',  # 'standard', 'robust', 'quantile', 'power', 'minmax'
-                 power_method='yeo-johnson',  # PowerTransformer method
+                 n_estimators=100,
+                 max_layers=5,
+                 window_sizes=[20, 50],
+                 scan_n_trees=100,
+                 scan_max_depth=3,
+                 use_scan=True,
+                 min_delta=0.001,
+                 random_state=None):
+        self.n_estimators = n_estimators
+        self.max_layers = max_layers
+        self.window_sizes = window_sizes
+        self.scan_n_trees = scan_n_trees
+        self.scan_max_depth = scan_max_depth
+        self.use_scan = use_scan
+        self.min_delta = min_delta
+        self.random_state = random_state
+        # 移除在 __init__ 中初始化的非参数属性
+        # self.scan_layers_ = []
+        # self.cascade_layers_ = []
+        # self.classes_ = None
 
-                 # 特征选择参数
-                 variance_threshold=0.01,
-                 univariate_k_best=1000,
-                 rf_n_features_to_select=800,
+    def _create_base_estimators(self):
+        """创建一组基础分类器"""
+        return [
+            ('rf', RandomForestClassifier(n_estimators=self.n_estimators,
+                                          random_state=self.random_state,
+                                          n_jobs=-1)),
+            ('et', ExtraTreesClassifier(n_estimators=self.n_estimators,
+                                        random_state=self.random_state,
+                                        n_jobs=-1))
+        ]
 
-                 # 输出格式
-                 force_sparse_output=False):
+    def _scan_fit_transform(self, X, y=None, is_fitting=True):
+        """
+        应用多粒度扫描到输入数据X。
+        此处简化处理为对整个特征空间做一次随机映射后再分解。
+        更严格的做法是对序列型数据切片后分别处理。
+        """
+        if not self.use_scan:
+            return X
 
-        # 存储参数
-        self.scaler_type = scaler_type
-        self.power_method = power_method
-        self.variance_threshold = variance_threshold
-        self.univariate_k_best = univariate_k_best
-        self.rf_n_features_to_select = rf_n_features_to_select
-        self.force_sparse_output = force_sparse_output
+        # 在 fit 时初始化或在 transform 时使用已有的扫描器
+        if is_fitting:
+            self.scan_transformers_ = []
+            transformed_parts = [X]
+            for size in self.window_sizes:
+                try:
+                    # 使用随机树嵌入作为替代方案来进行扫描操作
+                    rte = RandomTreesEmbedding(
+                        n_estimators=self.scan_n_trees,
+                        max_depth=self.scan_max_depth,
+                        random_state=self.random_state)
 
-        # 初始化组件
-        self.imputer_num = None
-        self.scaler = None
-        self.power_transformer = None
-        self.variance_selector = None
-        self.univariate_selector = None
-        self.rf_selector = None
+                    # 因为此处不是真正的图像/序列数据，所以采用全局统计代替滑窗
+                    # 示例方式之一是取固定长度片段然后聚合
+                    # 这里假设所有样本具有相同维度 d=X.shape[1]
+                    d = X.shape[1]
+                    step = max(1, d // size)
+                    slices = []
+                    processed_slices = []
+                    for start in range(0, d - step * size + 1, step):
+                        end = start + step * size
+                        slice_data = X[:, start:end]
 
-        # 记录特征信息
-        self.numerical_features = None
-        self.original_feature_count = None
-        self.feature_names = []  # 特征名称列表
+                        # 如果不能整除则跳过末尾不足的部分
+                        if slice_data.shape[1] != step * size:
+                            continue
 
-    def fit(self, X, y=None):
-        """拟合特征工程管道"""
-        print("开始简化版特征工程拟合 (仅预处理+特征选择)...")
+                        # Reshape to batch_size x num_patches x patch_dim
+                        reshaped_slice = slice_data.reshape(slice_data.shape[0], size, -1).mean(axis=2)
+                        processed_slices.append(reshaped_slice)
 
-        # 处理输入格式
-        if isinstance(X, pd.DataFrame):
-            self.numerical_features = X.select_dtypes(include=[np.number]).columns.tolist()
-            X_dense = X.values
-        elif sparse.issparse(X):
-            X_dense = X.toarray()
-            self.numerical_features = list(range(X.shape[1]))
-        else:
-            X_dense = X
-            self.numerical_features = list(range(X.shape[1]))
+                    if processed_slices:
+                        # 合并所有处理过的片段
+                        combined_slices = np.hstack(processed_slices)
+                        # Apply embedding
+                        embedded = rte.fit_transform(combined_slices)
+                        self.scan_transformers_.append(rte)  # 保存transformer
 
-        self.original_feature_count = X_dense.shape[1]
-        print(f"-> 原始特征数: {self.original_feature_count}")
+                        # Reduce dimensions via SVD
+                        svd_reducer = TruncatedSVD(n_components=min(embedded.shape[1], 50),
+                                                   random_state=self.random_state)  # 限制组件数量
+                        reduced_features = svd_reducer.fit_transform(embedded.toarray())
+                        self.scan_svd_reducers_.append(svd_reducer)  # 保存SVD reducer
+                        transformed_parts.append(reduced_features)
+                    else:
+                        print(f"[Warning] No valid slices created for window size {size}. Skipping.")
 
-        # 1. 缺失值处理
-        print("-> 步骤 1: 缺失值处理...")
-        self.imputer_num = SimpleImputer(strategy='median')
-        X_dense = self.imputer_num.fit_transform(X_dense)
+                except Exception as e:
+                    print(f"[Warning] Failed during multi-grained scanning with window size {size}: {e}")
+                    # 确保即使失败也添加占位符，保持索引一致
+                    self.scan_transformers_.append(None)
+                    self.scan_svd_reducers_.append(None)
+                    continue
+        else:  # Transforming new data
+            check_is_fitted(self, ['scan_transformers_', 'scan_svd_reducers_'])
+            transformed_parts = [X]
+            transformer_idx = 0
+            for size in self.window_sizes:
+                try:
+                    rte = self.scan_transformers_[transformer_idx]
+                    svd_reducer = self.scan_svd_reducers_[transformer_idx]
 
-        # 2. 数据预处理和变换
-        print("-> 步骤 2: 数据预处理...")
+                    if rte is None or svd_reducer is None:
+                        print(f"[Warning] Skipping window size {size} as it failed during fitting.")
+                        transformer_idx += 1
+                        continue
 
-        # 选择缩放器
-        if self.scaler_type == 'standard':
-            self.scaler = StandardScaler()
-        elif self.scaler_type == 'robust':
-            self.scaler = RobustScaler()
-        elif self.scaler_type == 'quantile':
-            self.scaler = QuantileTransformer(output_distribution='uniform', random_state=SEED)
-        elif self.scaler_type == 'power':
-            self.power_transformer = PowerTransformer(method=self.power_method, standardize=True)
-            X_dense = self.power_transformer.fit_transform(X_dense)
-            self.scaler = StandardScaler()
-        elif self.scaler_type == 'minmax':
-            self.scaler = MinMaxScaler()
+                    d = X.shape[1]
+                    step = max(1, d // size)
+                    processed_slices = []
+                    for start in range(0, d - step * size + 1, step):
+                        end = start + step * size
+                        slice_data = X[:, start:end]
 
-        X_dense = self.scaler.fit_transform(X_dense)
+                        if slice_data.shape[1] != step * size:
+                            continue
 
-        # 3. 智能特征选择
-        print("-> 步骤 3: 智能特征选择...")
+                        reshaped_slice = slice_data.reshape(slice_data.shape[0], size, -1).mean(axis=2)
+                        processed_slices.append(reshaped_slice)
 
-        # 方差过滤
-        self.variance_selector = VarianceThreshold(threshold=self.variance_threshold)
-        X_dense = self.variance_selector.fit_transform(X_dense)
-        print(f"  -> 方差过滤后特征数: {X_dense.shape[1]}")
+                    if processed_slices:
+                        combined_slices = np.hstack(processed_slices)
+                        embedded = rte.transform(combined_slices)  # 使用transform
+                        reduced_features = svd_reducer.transform(embedded.toarray())  # 使用transform
+                        transformed_parts.append(reduced_features)
 
-        # 单变量特征选择
-        if y is not None and self.univariate_k_best:
-            k_best = min(self.univariate_k_best, X_dense.shape[1])
-            self.univariate_selector = SelectKBest(score_func=f_classif, k=k_best)
-            X_dense = self.univariate_selector.fit_transform(X_dense, y)
-            print(f"  -> 单变量选择后特征数: {X_dense.shape[1]}")
+                except Exception as e:
+                    print(f"[Warning] Error transforming with window size {size}: {e}")
+                finally:
+                    transformer_idx += 1
 
-        # 随机森林特征选择
-        if y is not None and self.rf_n_features_to_select:
-            n_rf_features = min(self.rf_n_features_to_select, X_dense.shape[1])
-            temp_rf = BalancedRandomForestClassifier(
-                n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
-            self.rf_selector = SelectFromModel(
-                temp_rf, max_features=n_rf_features, threshold=-np.inf)
-            X_dense = self.rf_selector.fit_transform(X_dense, y)
-            print(f"  -> 随机森林选择后特征数: {X_dense.shape[1]}")
+        result = np.hstack(transformed_parts)
+        return result.astype(np.float32)
 
-        print("特征工程拟合完成！")
+    def _evaluate_layer_gain(self, prev_X_with_preds, current_X_with_preds, y_true):
+        """
+        评估当前层带来的性能增益。
+        """
+        # 使用简单的验证集而不是交叉验证以提高速度
+        # 或者使用更轻量级的模型
+        try:
+            scores_prev = cross_val_score(GaussianNB(), prev_X_with_preds, y_true, cv=3, scoring='accuracy',
+                                          n_jobs=1)  # 限制n_jobs
+            score_prev_avg = np.mean(scores_prev)
+
+            scores_curr = cross_val_score(GaussianNB(), current_X_with_preds, y_true, cv=3, scoring='accuracy',
+                                          n_jobs=1)
+            score_curr_avg = np.mean(scores_curr)
+
+            gain = score_curr_avg - score_prev_avg
+            return gain >= self.min_delta, gain
+        except:
+            # 如果评估失败，默认认为有增益或第一层必须加入
+            return True, 0.0
+
+    def fit(self, X, y):
+        """
+        训练深度森林模型。
+        """
+        # 在 fit 开始时初始化所有实例变量
+        self.classes_ = unique_labels(y)
+        self.scan_layers_ = []
+        self.cascade_layers_ = []
+        self.scan_transformers_ = []
+        self.scan_svd_reducers_ = []
+
+        original_X_dtype = X.dtype
+
+        # Step 1: Multi-Grained Scanning
+        print("Starting Multi-Grained Scanning...")
+        scanned_X_train = self._scan_fit_transform(X.copy(), y, is_fitting=True) if self.use_scan else X.copy()
+        current_input_for_training = scanned_X_train.copy()
+
+        print(f"Initial shape after scanning: {current_input_for_training.shape}")
+
+        # Initialize variables for cascade structure learning loop
+        last_performance = float('-inf')
+        best_performance_so_far = float('-inf')
+        no_improvement_counter = 0
+        patience_limit = 2  # Number of layers without improvement before stopping early
+
+        layer_index = 0
+        while layer_index < self.max_layers:
+            print(f"\n--- Training Cascade Layer {layer_index + 1} ---")
+
+            estimators_in_this_layer = {}
+            temp_predictions_on_current_batch = []
+
+            # Train each estimator type on the current input features
+            for name, clf_class_instance in self._create_base_estimators():
+                # 确保克隆的分类器具有正确的参数
+                params = clf_class_instance.get_params()
+                # 特别注意 n_features 参数，它应该基于当前输入
+                cloned_clf = type(clf_class_instance)(**params)
+                cloned_clf.fit(current_input_for_training, y)
+                estimators_in_this_layer[name] = cloned_clf
+
+                # Predict probabilities on training set for next level inputs
+                pred_probs = cloned_clf.predict_proba(current_input_for_training)
+                temp_predictions_on_current_batch.append(pred_probs)
+
+            # Concatenate predictions from all models trained at this layer
+            concatenated_new_features_from_this_layer = np.hstack(temp_predictions_on_current_batch)
+
+            # Combine previous features with newly generated ones for evaluation & next iteration
+            combined_features_evaluating_this_level = np.hstack([
+                current_input_for_training,
+                concatenated_new_features_from_this_layer
+            ])
+
+            # Evaluate performance gain compared to just using old features alone
+            does_add_value_here, delta_acc = self._evaluate_layer_gain(
+                current_input_for_training,
+                combined_features_evaluating_this_level,
+                y
+            )
+
+            print(f"Evaluation Gain Check -> Improvement? : {does_add_value_here}, Delta Accuracy={delta_acc:.4f}")
+
+            # Update internal state only when beneficial
+            if does_add_value_here or len(self.cascade_layers_) == 0:  # Always keep first layer
+                self.cascade_layers_.append(estimators_in_this_layer)
+                current_input_for_training = combined_features_evaluating_this_level
+                best_performance_so_far = max(best_performance_so_far, delta_acc)
+                no_improvement_counter = 0
+            else:
+                no_improvement_counter += 1
+                print("[Info] No significant performance increase detected; considering pruning...")
+
+            # Early stopping condition based on lack of progress over several iterations
+            if no_improvement_counter >= patience_limit:
+                print("\nEarly Stopping Triggered due to stagnant performance!")
+                break
+
+            layer_index += 1
+
+        print(
+            f"\nFinal number of effective cascade layers built: {len(self.cascade_layers_)} / Max allowed was {self.max_layers}\n")
         return self
 
-    def transform(self, X):
-        """应用特征工程变换"""
-        # 处理输入格式
-        if isinstance(X, pd.DataFrame):
-            X_dense = X.values
-        elif sparse.issparse(X):
-            X_dense = X.toarray()
-        else:
-            X_dense = X
+    def predict_proba(self, X):
+        """
+        获取测试集上的类别概率分布。
+        """
+        check_is_fitted(self, ['cascade_layers_', 'classes_'])
 
-        # 1. 缺失值处理
-        X_dense = self.imputer_num.transform(X_dense)
+        # Perform initial transformation through scanner stage
+        processed_X = self._scan_fit_transform(X.copy(), is_fitting=False) if self.use_scan else X.copy()
 
-        # 2. 数据预处理
-        if self.power_transformer is not None:
-            X_dense = self.power_transformer.transform(X_dense)
-        X_dense = self.scaler.transform(X_dense)
+        # Propagate samples forward through cascaded levels
+        for idx, layer_models_dict in enumerate(self.cascade_layers_, 1):
+            individual_model_outputs = []
+            for model_name_key, fitted_model_obj in layer_models_dict.items():
+                probs_output_by_one_model = fitted_model_obj.predict_proba(processed_X)
+                individual_model_outputs.append(probs_output_by_one_model)
 
-        # 3. 特征选择
-        X_dense = self.variance_selector.transform(X_dense)
-        if self.univariate_selector is not None:
-            X_dense = self.univariate_selector.transform(X_dense)
-        if self.rf_selector is not None:
-            X_dense = self.rf_selector.transform(X_dense)
+            # Merge outputs into one expanded feature vector per sample
+            merged_probabilities_as_features = np.hstack(individual_model_outputs)
 
-        # 输出格式控制
-        if self.force_sparse_output:
-            return sparse.csr_matrix(X_dense)
-        else:
-            return X_dense
+            # Append these new synthetic features onto existing representation
+            processed_X = np.hstack([processed_X, merged_probabilities_as_features])
 
-    def fit_transform(self, X, y=None):
-        """组合fit和transform"""
-        return self.fit(X, y).transform(X)
+        # Final prediction uses average across final layer's classifiers
+        final_prediction_pool = []
+        for _, final_model_ref in self.cascade_layers_[-1].items():
+            predicted_distribution = final_model_ref.predict_proba(processed_X)
+            final_prediction_pool.append(predicted_distribution)
 
+        mean_of_final_distributions = np.mean(final_prediction_pool, axis=0)
+        return mean_of_final_distributions
 
-def save_model(model, filename):
-    """保存模型到文件"""
-    with open(filename, 'wb') as f:
-        pickle.dump(model, f)
-    print(f"\n模型已保存为 '{filename}'")
+    def predict(self, X):
+        """
+        根据最高置信度返回对应的类别索引。
+        """
+        probas = self.predict_proba(X)
+        return self.classes_[np.argmax(probas, axis=1)]
 
 
-def find_best_f1_threshold(y_true, y_proba):
-    """在验证集上寻找最佳阈值以优化 F1 分数"""
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-    f_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-    best_idx = np.argmax(f_scores)
-    best_threshold = thresholds[best_idx]
-    best_f_score = f_scores[best_idx]
-    best_precision = precisions[best_idx]
-    best_recall = recalls[best_idx]
+# --- 包装器保持一致 ---
+class CascadeForestWrapper(ClassifierMixin):
+    def __init__(self, cascade_forest, **kwargs):
+        self.cascade_forest = cascade_forest
+        # 不在 __init__ 中设置 self.classes_
 
-    print(f"最佳 F1 阈值: {best_threshold:.4f}")
-    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}, F1: {best_f_score:.4f}")
+    def fit(self, X, y):
+        self.cascade_forest.fit(X, y)
+        # fit 后再设置 classes_
+        self.classes_ = self.cascade_forest.classes_
+        return self
 
-    return best_threshold
+    def predict(self, X):
+        return self.cascade_forest.predict(X)
 
+    def predict_proba(self, X):
+        return self.cascade_forest.predict_proba(X)
 
-def find_threshold_for_max_recall(y_true, y_proba, min_precision=0.4):
-    """寻找能获得最高召回率且精确率不低于 min_precision 的阈值"""
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-    valid_indices = np.where(precisions[:-1] >= min_precision)[0]
+    def get_params(self, deep=True):
+        return {"cascade_forest": self.cascade_forest}
 
-    if len(valid_indices) == 0:
-        print(f"警告: 没有阈值能满足精确率 >= {min_precision}。返回默认阈值 0.5。")
-        return 0.5
-
-    best_valid_idx = valid_indices[np.argmax(recalls[valid_indices])]
-    best_threshold = thresholds[best_valid_idx]
-    best_precision = precisions[best_valid_idx]
-    best_recall = recalls[best_valid_idx]
-
-    print(f"高召回率阈值 (Precision >= {min_precision}): {best_threshold:.4f}")
-    print(f"  对应 Precision: {best_precision:.4f}, Recall: {best_recall:.4f}")
-
-    return best_threshold
+    def set_params(self, **params):
+        if 'cascade_forest' in params:
+            self.cascade_forest = params['cascade_forest']
+        return self
 
 
-def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="Model"):
-    """评估模型并绘制 ROC, PR, Confusion Matrix"""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    # ROC Curve
-    fpr, tpr, _ = roc_curve(y_true, y_proba)
-    roc_auc = auc(fpr, tpr)
-    axes[0].plot(fpr, tpr, color='darkorange', lw=2, label=f'{model_name} (AUC = {roc_auc:.2f})')
-    axes[0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    axes[0].set_xlim([0.0, 1.0])
-    axes[0].set_ylim([0.0, 1.05])
-    axes[0].set_xlabel('False Positive Rate')
-    axes[0].set_ylabel('True Positive Rate')
-    axes[0].set_title('Receiver Operating Characteristic')
-    axes[0].legend(loc="lower right")
-
-    # Precision-Recall Curve
-    precision, recall, _ = precision_recall_curve(y_true, y_proba)
-    pr_auc = auc(recall, precision)
-    axes[1].plot(recall, precision, color='b', lw=2, label=f'{model_name} (AUC = {pr_auc:.2f})')
-    axes[1].set_xlabel('Recall')
-    axes[1].set_ylabel('Precision')
-    axes[1].set_title('Precision-Recall Curve')
-    axes[1].legend(loc="lower left")
-
-    # Confusion Matrix
-    y_pred_f1 = (y_proba >= threshold_f1).astype(int)
-    cm = confusion_matrix(y_true, y_pred_f1)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[2])
-    axes[2].set_title(f'Confusion Matrix (Threshold={threshold_f1:.4f})')
-    axes[2].set_xlabel('Predicted Label')
-    axes[2].set_ylabel('True Label')
-
-    plt.tight_layout()
-    plt.show()
-
-    print(f"\n=== {model_name} 详细评估报告 ===")
-    print(classification_report(y_true, y_pred_f1, target_names=['Negative', 'Positive']))
-    print("-" * 40)
+def save_object(obj, filepath):
+    """辅助函数用于保存对象至磁盘文件"""
+    with open(filepath, 'wb') as f:
+        pickle.dump(obj, f)
 
 
-def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
-    """使用简化特征工程的训练评估流程，模型替换为多尺度神经网络集群"""
-    print("\n=== 构建简化特征工程管道 (多尺度神经网络集群) ===")
-
-    # 特征工程 - 创建特征工程器
-    print("\n=== 创建简化特征工程器 ===")
-    fe = AdvancedFeatureEngineer(**feature_engineer_params)
-    fe.fit(X_train, y_train)
-
-    X_train_engineered = fe.transform(X_train)
-    X_val_engineered = fe.transform(X_val)
-    X_test_engineered = fe.transform(X_test)
-    print(f"-> 特征工程器输出特征数: {X_train_engineered.shape[1]}")
-
-    # 应用 SMOTETomek
-    print("\n=== 应用 SMOTETomek 重采样 ===")
-    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered, y_train)
-
-    # 更新训练集
-    X_train_engineered_final = X_train_resampled
-
-    # 定义神经网络模型集群
-    print("\n=== 定义神经网络模型集群 ===")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"-> 使用设备: {device}")
-
-    ensemble_model_params_list = [
-        {'hidden_dims': [256, 128, 64], 'dropout_rate': 0.3},
-        {'hidden_dims': [128, 64], 'dropout_rate': 0.2},
-        {'hidden_dims': [512, 256, 128, 64], 'dropout_rate': 0.4},
-        {'hidden_dims': [64, 32], 'dropout_rate': 0.1},
-    ]
-
-    classifier = MultiScaleNNEnsemble(SimpleNN, ensemble_model_params_list, device=device)
-
-    # 模型训练
-    print("\n=== 开始模型集群训练 ===")
-    start_time = time.time()
-    classifier.fit([X_train_engineered_final] * len(ensemble_model_params_list), y_train_resampled,
-                   [X_val_engineered] * len(ensemble_model_params_list), y_val, epochs=50, batch_size=1024,
-                   lr=0.001)
-    training_time = time.time() - start_time
-    print(f"-> 模型集群训练耗时: {training_time:.2f} 秒")
-
-    # 保存模型 (保存特征工程器和分类器)
-    trained_pipeline = {
-        'feature_engineer': fe,
-        'classifier': classifier
-    }
-    save_model(trained_pipeline, 'simplified_feature_engineering_nn_ensemble_model.pkl')
-
-    # 验证集阈值选择
-    print("\n=== 验证集阈值选择 ===")
-    val_proba = classifier.predict_proba([X_val_engineered] * len(ensemble_model_params_list))
-
-    threshold_f1 = find_best_f1_threshold(y_val, val_proba)
-    threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
-
-    # 测试集评估
-    print("\n=== 测试集评估 ===")
-    test_proba = classifier.predict_proba([X_test_engineered] * len(ensemble_model_params_list))
-
-    # F1优化阈值评估
-    print("\n--- 使用 F1 优化阈值评估 ---")
-    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
-    recall_f1 = recall_score(y_test, y_pred_f1)
-    auc_f1 = roc_auc_score(y_test, test_proba)
-    precision_f1 = precision_score(y_test, y_pred_f1)
-    f1_f1 = f1_score(y_test, y_pred_f1)
-    accuracy_f1 = accuracy_score(y_test, y_pred_f1)
-    print(f"-> 阈值: {threshold_f1:.4f}")
-    print(f"-> Recall: {recall_f1:.4f}")
-    print(f"-> AUC: {auc_f1:.4f}")
-    print(f"-> Precision: {precision_f1:.4f}")
-    print(f"-> F1 Score: {f1_f1:.4f}")
-    print(f"-> Accuracy: {accuracy_f1:.4f}")
-    test_score_f1 = 20 * precision_f1 + 50 * auc_f1 + 30 * recall_f1
-    print(f"-> 综合得分 (20*P+50*AUC+30*R): {test_score_f1:.4f}")
-
-    # 高召回率阈值评估
-    print("\n--- 使用高召回率阈值评估 ---")
-    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
-    recall_hr = recall_score(y_test, y_pred_hr)
-    auc_hr = roc_auc_score(y_test, test_proba)
-    precision_hr = precision_score(y_test, y_pred_hr)
-    f1_hr = f1_score(y_test, y_pred_hr)
-    accuracy_hr = accuracy_score(y_test, y_pred_hr)
-    print(f"-> 阈值: {threshold_high_recall:.4f}")
-    print(f"-> Recall: {recall_hr:.4f}")
-    print(f"-> AUC: {auc_hr:.4f}")
-    print(f"-> Precision: {precision_hr:.4f}")
-    print(f"-> F1 Score: {f1_hr:.4f}")
-    print(f"-> Accuracy: {accuracy_hr:.4f}")
-    test_score_hr = 20 * precision_hr + 50 * auc_hr + 30 * recall_hr
-    print(f"-> 综合得分 (20*P+50*AUC+30*R): {test_score_hr:.4f}")
-
-    # 可视化评估结果
-    print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall,
-                      model_name="Simplified Feature Engineering NN Ensemble")
-
-    return {
-        'metrics': {
-            'f1_optimized': {
-                'threshold': threshold_f1,
-                'recall': recall_f1,
-                'auc': auc_f1,
-                'precision': precision_f1,
-                'f1': f1_f1,
-                'accuracy': accuracy_f1,
-                'test_score': test_score_f1
-            },
-            'high_recall': {
-                'threshold': threshold_high_recall,
-                'recall': recall_hr,
-                'auc': auc_hr,
-                'precision': precision_hr,
-                'f1': f1_hr,
-                'accuracy': accuracy_hr,
-                'test_score': test_score_hr
-            }
-        },
-        'predictions': {
-            'y_proba': test_proba,
-            'y_pred_f1_optimized': y_pred_f1,
-            'y_pred_high_recall': y_pred_hr
-        },
-        'trained_pipeline': trained_pipeline,  # 保存的是包含特征工程器和分类器的字典
-        'training_time': training_time
-    }
+def load_object(filepath):
+    """辅助函数加载已存在的pickle格式文件"""
+    with open(filepath, 'rb') as f:
+        return pickle.load(f)
 
 
-def load_model(filename):
-    """从文件加载模型"""
-    with open(filename, 'rb') as f:
-        model = pickle.load(f)
-    print(f"\n模型已从 '{filename}' 加载")
-    return model
-
-
-# --- 示例：如何加载和使用保存的模型 ---
-def example_load_and_predict():
-    """示例：加载模型并进行预测"""
-    print("\n=== 示例：加载模型并进行预测 ===")
+# --- 主程序入口 ---
+if __name__ == "__main__":
+    # 数据预处理流程保持不变...
+    print("Loading data...")
+    # 假设 clean.csv 存在且路径正确
     try:
-        # 1. 加载整个管道（包含特征工程和分类器）
-        loaded_pipeline = load_model('simplified_feature_engineering_nn_ensemble_model.pkl')
-
-        # 2. 获取特征工程器和分类器
-        loaded_fe = loaded_pipeline['feature_engineer']
-        loaded_classifier = loaded_pipeline['classifier']  # 这是 MultiScaleNNEnsemble 实例
-
-        # 3. 准备新数据 (这里用测试集数据作为示例)
-        # 注意：在实际应用中，你需要加载或生成新的原始特征数据 X_new
-        # 这里我们假设 X_new_raw 是与训练数据格式相同的原始特征数据
-        # data_new = pd.read_csv("new_data.csv")
-        # X_new_raw = data_new.drop(columns=["target"]) # 假设没有target列
-        # y_new_true = data_new["target"].values # 如果有的话，用于评估
-
-        # 为了演示，我们使用测试集数据
-        # 注意：在实际应用中，你应该有新的、未见过的数据
-        data = pd.read_csv("clean.csv", low_memory=False)
-        if "company_id" in data.columns:
-            data = data.drop(columns=["company_id"])
-        if "target" not in data.columns:
-            raise ValueError("数据中必须包含'target'列")
-        y_example = data["target"].values.astype(int)
-        feature_data_example = data.drop(columns=["target"])
-        X_example_raw = feature_data_example.values
-
-        # 划分示例数据
-        _, X_new_raw, _, y_new_true = train_test_split(
-            X_example_raw, y_example, test_size=0.05, random_state=SEED, stratify=y_example)  # 取一小部分作为新数据示例
-
-        print(f"示例新数据加载成功: 特征数={X_new_raw.shape[1]}, 样本数={X_new_raw.shape[0]}")
-
-        # 4. 应用特征工程
-        print("-> 对新数据应用特征工程...")
-        X_new_engineered = loaded_fe.transform(X_new_raw)  # 应用训练好的特征工程
-        print(f"-> 新数据特征工程后特征数: {X_new_engineered.shape[1]}")
-
-        # 5. 使用模型进行预测 (注意 MultiScaleNNEnsemble 需要输入列表)
-        print("-> 使用模型进行预测...")
-        new_proba = loaded_classifier.predict_proba([X_new_engineered] * len(loaded_classifier.model_params_list))
-        new_pred_f1_opt = loaded_classifier.predict([X_new_engineered] * len(loaded_classifier.model_params_list),
-                                                    threshold=0.5)  # 可以使用之前找到的最佳阈值
-
-        print(f"-> 新数据预测概率示例 (前5个): {new_proba[:5]}")
-        print(f"-> 新数据预测类别示例 (前5个, 阈值0.5): {new_pred_f1_opt[:5]}")
-
-        # 如果有真实标签，可以评估
-        if y_new_true is not None:
-            # 为了评估，需要对齐数据
-            _, _, _, y_new_aligned = train_test_split(
-                X_example_raw, y_example, test_size=0.05, random_state=SEED, stratify=y_example)
-            new_auc = roc_auc_score(y_new_aligned, new_proba)
-            new_f1 = f1_score(y_new_aligned, new_pred_f1_opt)
-            print(f"-> 在示例新数据上的 AUC: {new_auc:.4f}")
-            print(f"-> 在示例新数据上的 F1: {new_f1:.4f}")
-
+        data = pd.read_csv('./clean.csv').drop(columns=['company_id'])
     except FileNotFoundError:
-        print("模型文件 'simplified_feature_engineering_nn_ensemble_model.pkl' 未找到。请先运行训练流程。")
-    except Exception as e:
-        print(f"加载或预测过程中出错: {e}")
+        print("Error: File './clean.csv' not found. Please ensure the file exists.")
+        exit(1)
 
+    print("Encoding categorical variables...")
+    data = pd.get_dummies(data, drop_first=True)
 
-def main():
-    # 检查CUDA可用性
-    print("CUDA 可用性 (PyTorch):", torch.cuda.is_available())
-    if torch.cuda.is_available():
-        print("当前 CUDA 设备:", torch.cuda.current_device())
-        print("CUDA 设备名称:", torch.cuda.get_device_name(0))
+    X = data.drop(columns=['target'])
+    y = data['target']
 
-    # 配置简化版特征工程参数 (基础配置)
-    feature_engineer_params = {
-        # 预处理配置
-        'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
-        'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
+    print("Imputing missing values...")
+    imputer = SimpleImputer(strategy='mean')
+    X_imputed = imputer.fit_transform(X)
 
-        # 特征选择配置
-        'variance_threshold': 0.01,
-        'univariate_k_best': 1500,  # 单变量选择的特征数
-        'rf_n_features_to_select': 1000,  # 最终保留的特征数
+    print("Scaling features...")
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_imputed)
 
-        # 输出格式
-        'force_sparse_output': False  # 使用密集矩阵
-    }
+    print("Applying SMOTEENN resampling...")
+    smote_enn = SMOTEENN(random_state=42)
+    X_resampled, y_resampled = smote_enn.fit_resample(X_scaled, y)
 
-    # 数据加载
-    print("\n=== 数据加载 ===")
-    try:
-        data = pd.read_csv("clean.csv", low_memory=False)
-        if "company_id" in data.columns:
-            data = data.drop(columns=["company_id"])
-        if "target" not in data.columns:
-            raise ValueError("数据中必须包含'target'列")
+    print("Selecting features...")
+    selector = SelectFromModel(xgb.XGBClassifier(n_estimators=100, random_state=42))
+    X_selected = selector.fit_transform(X_resampled, y_resampled)
 
-        # 分离特征和目标
-        y = data["target"].values.astype(int)
-        feature_data = data.drop(columns=["target"])
-        X = feature_data.values
+    save_object(selector, './feature_selector_xgboost_cemmdan.pkl')
+    save_object(imputer, './imputer.pkl')
+    save_object(scaler, './scaler.pkl')
 
-        print(f"-> 数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
-        print(f"-> 正样本比例: {np.mean(y):.4f}")
-        print(f"-> 使用的特征工程参数: {feature_engineer_params}")
-    except Exception as e:
-        print(f"数据加载失败: {str(e)}")
-        return
+    print("Splitting data...")
+    X_train, X_test, y_train, y_test = train_test_split(X_selected, y_resampled, test_size=0.1, random_state=42)
+    print(f"Training set size: {X_train.shape}, Test set size: {X_test.shape}")
 
-    # 移除y中的NaN
-    if np.isnan(y).any():
-        print("-> 移除y中的NaN...")
-        mask = ~np.isnan(y)
-        X = X[mask]
-        y = y[mask]
+    # 替换为我们新的增强版本模型
+    print("Initializing enhanced deep forest model...")
+    # 为了快速测试，禁用扫描并减少层数和估计器数量
+    base_enhanced_df = EnhancedDeepForest(n_estimators=50, max_layers=3, window_sizes=[10, 25],
+                                          scan_n_trees=30, scan_max_depth=2, use_scan=False,  # 禁用扫描以避免复杂性
+                                          min_delta=0.0005, random_state=42)
 
-    # 数据划分
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=0.1, random_state=SEED, stratify=y)
-    print(f"\n-> 初步数据划分: 临时集={X_temp.shape[0]}, 测试集={X_test.shape[0]}")
+    enhanced_df = CascadeForestWrapper(base_enhanced_df)
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp)
-    print(f"-> 最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
+    # 简化AdaBoost配置
+    adaboost = AdaBoostClassifier(n_estimators=50, algorithm='SAMME', random_state=42)
 
-    # 启动简化版特征工程训练流程
-    print("\n=== 启动简化版特征工程训练流程 (多尺度神经网络集群) ===")
-    results = train_and_evaluate_advanced(
-        X_train, y_train, X_val, y_val, X_test, y_test,
-        feature_engineer_params=feature_engineer_params
+    print("Creating stacking classifier...")
+    stacking_model = StackingClassifier(
+        estimators=[
+            ('enhanced_df', enhanced_df),
+            ('adaboost', adaboost)
+        ],
+        final_estimator=GaussianNB(),
+        cv=3,  # 减少CV折数
+        n_jobs=1  # 限制并行度以避免潜在问题
     )
 
-    # 保存预测结果和概率
-    if 'predictions' in results:
-        pred_df = pd.DataFrame({
-            'true_label': y_test,
-            'pred_prob': results['predictions']['y_proba'],
-            'pred_label_f1_optimized': results['predictions']['y_pred_f1_optimized'],
-            'pred_label_high_recall': results['predictions']['y_pred_high_recall']
-        })
-        pred_df.to_csv("simplified_predictions_nn_ensemble.csv", index=False)
-        print("\n-> 预测结果和概率已保存到 'simplified_predictions_nn_ensemble.csv'")
+    print("Training stacking model...")
+    try:
+        stacking_model.fit(X_train, y_train)
+        print("Model training completed successfully.")
 
-    # 打印最终总结
-    print("\n" + "=" * 60)
-    print("简化版特征工程模型训练完成 (多尺度神经网络集群)！")
-    print("=" * 60)
-    print(f"-> 训练耗时: {results['training_time']:.2f} 秒")
-    print("\n-> 最佳F1阈值下的测试集性能:")
-    metrics_f1 = results['metrics']['f1_optimized']
-    print(f"  - 阈值: {metrics_f1['threshold']:.4f}")
-    print(f"  - Precision: {metrics_f1['precision']:.4f}")
-    print(f"  - Recall: {metrics_f1['recall']:.4f}")
-    print(f"  - F1-Score: {metrics_f1['f1']:.4f}")
-    print(f"  - AUC-ROC: {metrics_f1['auc']:.4f}")
-    print(f"  - Accuracy: {metrics_f1['accuracy']:.4f}")
-    print(f"  - 综合得分 (20*P+50*AUC+30*R): {metrics_f1['test_score']:.4f}")
+        save_object(stacking_model, '../model_pipeline_xgboost_cemmdan.pkl')
+        print("Model saved to '../model_pipeline_xgboost_cemmdan.pkl'")
 
-    print("\n-> 高召回率阈值下的测试集性能:")
-    metrics_hr = results['metrics']['high_recall']
-    print(f"  - 阈值: {metrics_hr['threshold']:.4f}")
-    print(f"  - Precision: {metrics_hr['precision']:.4f}")
-    print(f"  - Recall: {metrics_hr['recall']:.4f}")
-    print(f"  - F1-Score: {metrics_hr['f1']:.4f}")
-    print(f"  - AUC-ROC: {metrics_hr['auc']:.4f}")
-    print(f"  - Accuracy: {metrics_hr['accuracy']:.4f}")
-    print(f"  - 综合得分 (20*P+50*AUC+30*R): {metrics_hr['test_score']:.4f}")
-    print("=" * 60)
+        print("Evaluating model...")
+        y_pred_test = stacking_model.predict(X_test)
+        y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
 
-    # 运行示例加载和预测
-    example_load_and_predict()
-    print("=" * 60)
+        recall = recall_score(y_test, y_pred_test, zero_division=0)
+        auc = roc_auc_score(y_test, y_proba_test)
+        precision = precision_score(y_test, y_pred_test, zero_division=0)
+        accuracy = accuracy_score(y_test, y_pred_test)
+
+        # 假设这是评分公式
+        final_score = 30 * recall + 50 * auc + 20 * precision
+
+        print("--- Model Evaluation on Test Set ---")
+        print(f"Accuracy:  {accuracy:.6f}")
+        print(f"Recall:    {recall:.6f}")
+        print(f"AUC:       {auc:.6f}")
+        print(f"Precision: {precision:.6f}")
+        print(f"Final Score: {final_score:.6f}")
+        print("------------------------------------")
+    except Exception as e:
+        print(f"An error occurred during training or evaluation: {e}")
+        import traceback
+
+        traceback.print_exc()
 
 
-if __name__ == "__main__":
-    main()
 
 
 
