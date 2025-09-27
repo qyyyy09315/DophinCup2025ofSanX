@@ -420,7 +420,7 @@ if __name__ == "__main__":
     print("Training stacking model...")
     stacking_model.fit(X_train, y_train)
 
-    save_object(stacking_model, '../model_pipeline_xgboost_cemmdan.pkl')
+    save_object(stacking_model, './model_pipeline_xgboost_cemmdan.pkl')
 
     print("Evaluating model...")
     y_pred_test = stacking_model.predict(X_test)
