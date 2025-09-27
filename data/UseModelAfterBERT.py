@@ -1,42 +1,36 @@
+import multiprocessing
+import os
 import pickle
-import pandas as pd
-import numpy as np
+import random
 import warnings
+
+# --- 导入绘图库 ---
+import numpy as np
+import pandas as pd
+# --- 导入稀疏矩阵支持 ---
+from scipy import sparse
+from scipy.stats import skew, kurtosis
+# --- 导入聚类和异常检测用于特征工程 ---
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.ensemble import IsolationForest
+# --- 导入先进的特征工程库 ---
+from sklearn.impute import SimpleImputer
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
+                                   PowerTransformer, MinMaxScaler)
+
+# --- 导入 XGBoost 和 CatBoost ---
 
 warnings.filterwarnings('ignore')
 
-# --- 导入特征工程类 ---
-# 这里需要包含您提供的 AdvancedFeatureEngineer 类的完整定义
-# 为保持代码完整性，将类定义直接包含在此脚本中
-
-import multiprocessing
-import os
-import random
-import time
-from imblearn.combine import SMOTETomek
-from imblearn.ensemble import BalancedRandomForestClassifier
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
-from sklearn.decomposition import TruncatedSVD, FastICA, FactorAnalysis
-from sklearn.feature_selection import RFE, SelectFromModel, VarianceThreshold, SelectKBest, f_classif, \
-    mutual_info_classif
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
-                                   PowerTransformer, MinMaxScaler)
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-from scipy import sparse
-from scipy.stats import skew, kurtosis
-
-
-# 环境配置 - 最大化CPU利用率
+# 环境配置
 NUM_CORES = multiprocessing.cpu_count()
 print(f"检测到 {NUM_CORES} 个CPU核心")
 os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+
 
 class AdvancedFeatureEngineer:
     """
@@ -45,8 +39,8 @@ class AdvancedFeatureEngineer:
     2. 统计特征生成
     3. 聚类特征
     4. 异常检测特征
-    5. 降维技术组合
-    6. 智能特征选择
+    5. 取消降维技术组合
+    6. 取消智能特征选择
     """
 
     def __init__(self,
@@ -56,7 +50,7 @@ class AdvancedFeatureEngineer:
 
                  # 统计特征参数
                  create_statistical_features=True,
-                 rolling_windows=None,  # 滚动统计窗口
+                 rolling_windows=[3, 5, 10],  # 滚动统计窗口
 
                  # 聚类特征参数
                  create_cluster_features=True,
@@ -69,16 +63,16 @@ class AdvancedFeatureEngineer:
                  isolation_contamination=0.1,
                  lof_n_neighbors=20,
 
-                 # 降维参数
-                 use_multiple_decomposition=True,
+                 # 取消降维参数
+                 use_multiple_decomposition=False,  # 设置为False以取消降维
                  svd_components=50,
                  ica_components=30,
                  fa_components=20,
 
-                 # 特征选择参数
+                 # 取消特征选择参数
                  variance_threshold=0.01,
-                 univariate_k_best=1000,
-                 rf_n_features_to_select=800,
+                 univariate_k_best=None,  # 设置为None以取消单变量选择
+                 rf_n_features_to_select=None,  # 设置为None以取消随机森林选择
 
                  # 输出格式
                  force_sparse_output=False):  # 改为False，因为高级特征工程通常产生密集特征
@@ -87,7 +81,7 @@ class AdvancedFeatureEngineer:
         self.scaler_type = scaler_type
         self.power_method = power_method
         self.create_statistical_features = create_statistical_features
-        self.rolling_windows = rolling_windows or [3, 5, 10]  # 默认值
+        self.rolling_windows = rolling_windows
         self.create_cluster_features = create_cluster_features
         self.n_clusters_kmeans = n_clusters_kmeans
         self.dbscan_eps = dbscan_eps
@@ -95,13 +89,13 @@ class AdvancedFeatureEngineer:
         self.create_anomaly_features = create_anomaly_features
         self.isolation_contamination = isolation_contamination
         self.lof_n_neighbors = lof_n_neighbors
-        self.use_multiple_decomposition = use_multiple_decomposition
+        self.use_multiple_decomposition = use_multiple_decomposition  # 降维已取消
         self.svd_components = svd_components
         self.ica_components = ica_components
         self.fa_components = fa_components
         self.variance_threshold = variance_threshold
-        self.univariate_k_best = univariate_k_best
-        self.rf_n_features_to_select = rf_n_features_to_select
+        self.univariate_k_best = univariate_k_best  # 特征选择已取消
+        self.rf_n_features_to_select = rf_n_features_to_select  # 特征选择已取消
         self.force_sparse_output = force_sparse_output
 
         # 初始化组件
@@ -112,43 +106,42 @@ class AdvancedFeatureEngineer:
         self.dbscan = None
         self.isolation_forest = None
         self.lof = None
+        # 取消降维组件
         self.svd = None
         self.ica = None
         self.fa = None
+        # 取消特征选择组件
         self.variance_selector = None
         self.univariate_selector = None
         self.rf_selector = None
 
         # 记录特征信息
-        self.numerical_features = None
-        self.original_feature_count = None
-        self.feature_names = []
-        # 新增：用于记录嵌入特征组
-        self.embedding_groups = {}
-        # 新增：用于记录向量特征列名
-        self.vector_feature_names = []
+        self.original_feature_names = []  # 原始DataFrame列名
+        self.final_feature_names_after_processing = []  # fit后经过所有预处理(包括emb展开)的特征名
+        self.feature_names_for_modeling = []  # 最终传给模型的特征名
+        self.embedding_groups = {}  # 记录*_emb_*形式的特征组
+
+        # 新增：用于记录向量特征列名及其对应的展开维度名
+        self.vector_expanded_feature_map = {}
+
         # 新增：记录经过所有工程处理后的特征数
         self.final_feature_count_after_engineering_ = None
         # 新增：记录在fit阶段的特征数，用于后续一致性检查
         self.fit_feature_count_before_imputer_ = None
         self.fit_feature_count_after_imputer_ = None
 
-
     def _identify_embedding_groups(self, feature_names):
         """识别并分组 *_emb_* 形式的特征"""
         print("  -> 识别嵌入特征组...")
-        emb_pattern = "_emb_"  # 修改为新的模式
-        self.embedding_groups.clear()
+        emb_pattern = "_emb_"
         emb_dict = {}
 
         for feat in feature_names:
             if emb_pattern in feat:
-                # 提取前缀 (例如 'industry_emb_0' -> 'industry')
                 parts = feat.split(emb_pattern)
                 if len(parts) >= 2:
-                    prefix = emb_pattern.join(parts[:-1])  # 处理 'a_emb_b_emb_0' 的情况
+                    prefix = emb_pattern.join(parts[:-1])
                     suffix = parts[-1]
-                    # 确保后缀是数字
                     if suffix.isdigit():
                         if prefix not in emb_dict:
                             emb_dict[prefix] = []
@@ -156,105 +149,148 @@ class AdvancedFeatureEngineer:
 
         # 按照编号排序每个组内的特征
         for prefix, feats in emb_dict.items():
-            # 根据后缀数字排序
             feats.sort(key=lambda x: int(x.split('_')[-1]))
             self.embedding_groups[prefix] = feats
             print(f"    -> 发现嵌入组 '{prefix}': 包含 {len(feats)} 个特征")
 
-    def _process_embedding_features(self, X_df):
-        """处理嵌入特征：将 *_emb_* 组合并为向量特征，并保留原始向量和范数"""
+    def _process_embedding_features_fit(self, X_df):
+        """FIT专用: 处理嵌入特征：将 *_emb_* 组合并为向量特征，并保留原始向量和范数"""
         if not self.embedding_groups:
             print("  -> 未发现嵌入特征组，跳过处理。")
             return X_df
 
-        print("  -> 处理嵌入特征组...")
+        print("  -> FIT: 处理嵌入特征组...")
         X_processed_df = X_df.copy()
+
+        # 清空旧映射
+        self.vector_expanded_feature_map = {}
 
         for prefix, emb_features in self.embedding_groups.items():
             print(f"    -> 处理组 '{prefix}' ({len(emb_features)} 个特征)...")
+
             # 提取嵌入向量
             emb_vectors = X_processed_df[emb_features].values
 
-            # 1. 为新特征命名 (例如 'industry_emb_vector')
+            # 为新特征命名
             new_vector_feature_name = f"{prefix}_emb_vector"
             new_norm_feature_name = f"{prefix}_emb_norm"
 
-            # 2. 将向量作为新列添加 (注意：这会创建一个包含数组的列)
-            #    这里我们将向量本身作为一个特征存储
+            # 将向量作为新列添加
             X_processed_df[new_vector_feature_name] = list(emb_vectors)
 
-            # 3. 计算向量的L2范数作为另一个特征
+            # 计算向量的L2范数作为另一个特征
             vector_norms = np.linalg.norm(emb_vectors, axis=1)
             X_processed_df[new_norm_feature_name] = vector_norms
 
-            # 4. 删除原始的嵌入特征列
+            # 删除原始的嵌入特征列
             X_processed_df = X_processed_df.drop(columns=emb_features)
             print(f"    -> 合并为特征 '{new_vector_feature_name}' 和 '{new_norm_feature_name}' 并移除原始列")
-            # 记录新创建的向量特征列名
-            self.vector_feature_names.append(new_vector_feature_name)
 
-        print(f"  -> 嵌入特征处理完成，剩余特征数: {X_processed_df.shape[1]}")
+            # 记录展开的新特征名 (用于transform时重建DataFrame)
+            # 关键改进：即使向量可能为空，也预先定义好维度名
+            # 假设维度是固定的，基于原始emb_features的数量
+            dim_names = [f"{prefix}_emb_dim_{i}" for i in range(len(emb_features))]
+            self.vector_expanded_feature_map[new_vector_feature_name] = dim_names
+
+        print(f"  -> FIT: 嵌入特征处理完成，剩余特征数: {X_processed_df.shape[1]}")
+        return X_processed_df
+
+    def _process_embedding_features_transform(self, X_df):
+        """TRANSFORM专用: 处理嵌入特征"""
+        if not self.embedding_groups:
+            print("  -> TRANSFORM: 未发现嵌入特征组，跳过处理。")
+            return X_df
+
+        print("  -> TRANSFORM: 处理嵌入特征组...")
+        X_processed_df = X_df.copy()
+
+        for prefix, emb_features in self.embedding_groups.items():
+            print(f"    -> TRANSFORM: 处理组 '{prefix}' ({len(emb_features)} 个特征)...")
+
+            # 提取嵌入向量
+            emb_vectors = X_processed_df[emb_features].values
+
+            # 为新特征命名
+            new_vector_feature_name = f"{prefix}_emb_vector"
+            new_norm_feature_name = f"{prefix}_emb_norm"
+
+            # 将向量作为新列添加
+            X_processed_df[new_vector_feature_name] = list(emb_vectors)
+
+            # 计算向量的L2范数作为另一个特征
+            vector_norms = np.linalg.norm(emb_vectors, axis=1)
+            X_processed_df[new_norm_feature_name] = vector_norms
+
+            # 删除原始的嵌入特征列
+            X_processed_df = X_processed_df.drop(columns=emb_features)
+            print(f"    -> TRANSFORM: 合并为特征 '{new_vector_feature_name}' 和 '{new_norm_feature_name}' 并移除原始列")
+
+        print(f"  -> TRANSFORM: 嵌入特征处理完成，剩余特征数: {X_processed_df.shape[1]}")
         return X_processed_df
 
     def _impute_vector_columns(self, X_df):
         """使用零向量填充向量列中的缺失值"""
-        if not self.vector_feature_names:
+        vector_feature_names = list(self.vector_expanded_feature_map.keys())  # 使用fit阶段学到的名字
+        if not vector_feature_names:
             print("  -> 未发现向量特征列，跳过向量缺失值填充。")
             return X_df
 
         print("  -> 使用零向量填充向量列缺失值...")
         X_imputed_df = X_df.copy()
 
-        for vec_col_name in self.vector_feature_names:
+        for vec_col_name in vector_feature_names:
+            if vec_col_name not in X_imputed_df.columns:
+                print(f"    -> 警告: 列 '{vec_col_name}' 在当前数据集中不存在，跳过。")
+                continue
+
             # 获取该列的第一个非空元素来确定向量维度
-            first_valid_entry = X_imputed_df[vec_col_name].dropna().iloc[0] if not X_imputed_df[
-                vec_col_name].dropna().empty else None
-            if first_valid_entry is not None:
-                # 确保第一个有效条目是数组或列表，然后获取其长度
-                if isinstance(first_valid_entry, (list, np.ndarray)):
-                    vector_dim = len(first_valid_entry)
-                else:
-                    # 如果第一个有效条目不是列表或数组（理论上不应该发生），跳过
-                    print(
-                        f"    -> 警告: 列 '{vec_col_name}' 的第一个有效条目不是列表或数组: {type(first_valid_entry)}，跳过填充。")
-                    continue
-                zero_vector = np.zeros(vector_dim)
+            # 关键改进：使用预先定义的维度名来确定维度
+            expected_dims = self.vector_expanded_feature_map.get(vec_col_name, [])
+            if not expected_dims:
+                print(f"    -> 警告: 列 '{vec_col_name}' 没有预定义的维度信息，跳过填充。")
+                continue
 
-                # 定义一个更安全的填充函数
-                def fill_na_with_zero_vector(x):
-                    # 检查是否为标量缺失值
-                    try:
-                        # 对于标量值，pd.isna 是安全的
-                        if not isinstance(x, (list, np.ndarray)):
-                            if pd.isna(x):
-                                return zero_vector
-                            else:
-                                return x
+            vector_dim = len(expected_dims)
+            zero_vector = np.zeros(vector_dim)
 
-                        # 对于数组或列表
-                        x_array = np.asarray(x)
-
-                        # 检查是否为空数组
-                        if x_array.size == 0:
+            def fill_na_with_zero_vector(x):
+                try:
+                    if not isinstance(x, (list, np.ndarray)):
+                        if pd.isna(x):
                             return zero_vector
-
-                        # 检查是否包含所有NaN
-                        if x_array.dtype.kind in ['f', 'c']:  # 浮点数或复数
-                            if np.all(np.isnan(x_array)):
+                        else:
+                            # 如果不是数组但不是NA，尝试转换，失败则用零向量
+                            try:
+                                x_array = np.asarray(x)
+                                if x_array.size == 0 or (
+                                        x_array.dtype.kind in ['f', 'c'] and np.all(np.isnan(x_array))):
+                                    return zero_vector
+                                return x_array
+                            except:
                                 return zero_vector
-
-                        # 如果是有效向量，保留原值
-                        return x
-
-                    except Exception as e:
-                        print(f"      -> 处理值时出错: {e}, 使用零向量填充")
+                    x_array = np.asarray(x)
+                    if x_array.size == 0:
                         return zero_vector
+                    if x_array.dtype.kind in ['f', 'c']:
+                        if np.all(np.isnan(x_array)):
+                            return zero_vector
+                    # 检查维度是否匹配
+                    if x_array.shape[0] != vector_dim:
+                        # 维度不匹配，用零向量填充或截断
+                        if x_array.shape[0] < vector_dim:
+                            padded = np.zeros(vector_dim)
+                            padded[:x_array.shape[0]] = x_array
+                            return padded
+                        else:  # x_array.shape[0] > vector_dim
+                            return x_array[:vector_dim]
+                    return x_array
+                except Exception as e:
+                    print(f"      -> 处理值时出错: {e}, 使用零向量填充")
+                    return zero_vector
 
-                # 应用填充函数
-                X_imputed_df[vec_col_name] = X_imputed_df[vec_col_name].apply(fill_na_with_zero_vector)
-                print(f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值/空向量/全NaN向量。")
-            else:
-                print(f"    -> 警告: 列 '{vec_col_name}' 没有有效数据来确定向量维度，跳过填充。")
+            X_imputed_df[vec_col_name] = X_imputed_df[vec_col_name].apply(fill_na_with_zero_vector)
+            print(
+                f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值/空向量/全NaN向量/维度不匹配向量。")
         return X_imputed_df
 
     def _create_statistical_features(self, X_dense):
@@ -265,34 +301,30 @@ class AdvancedFeatureEngineer:
         print("  -> 创建统计特征...")
         stat_features = []
 
-        # 基础统计特征
-        stat_features.append(np.mean(X_dense, axis=1, keepdims=True))  # 行均值
-        stat_features.append(np.std(X_dense, axis=1, keepdims=True))  # 行标准差
-        stat_features.append(np.max(X_dense, axis=1, keepdims=True))  # 行最大值
-        stat_features.append(np.min(X_dense, axis=1, keepdims=True))  # 行最小值
-        stat_features.append(np.median(X_dense, axis=1, keepdims=True))  # 行中位数
+        stat_features.append(np.mean(X_dense, axis=1, keepdims=True))
+        stat_features.append(np.std(X_dense, axis=1, keepdims=True))
+        stat_features.append(np.max(X_dense, axis=1, keepdims=True))
+        stat_features.append(np.min(X_dense, axis=1, keepdims=True))
+        stat_features.append(np.median(X_dense, axis=1, keepdims=True))
 
-        # 高级统计特征
-        stat_features.append(skew(X_dense, axis=1).reshape(-1, 1))  # 偏度
-        stat_features.append(kurtosis(X_dense, axis=1).reshape(-1, 1))  # 峰度
+        stat_features.append(skew(X_dense, axis=1).reshape(-1, 1))
+        stat_features.append(kurtosis(X_dense, axis=1).reshape(-1, 1))
 
-        # 百分位数特征
-        stat_features.append(np.percentile(X_dense, 25, axis=1, keepdims=True))  # 25%分位数
-        stat_features.append(np.percentile(X_dense, 75, axis=1, keepdims=True))  # 75%分位数
+        stat_features.append(np.percentile(X_dense, 25, axis=1, keepdims=True))
+        stat_features.append(np.percentile(X_dense, 75, axis=1, keepdims=True))
 
-        # 变异系数 (标准差/均值)
         mean_vals = np.mean(X_dense, axis=1, keepdims=True)
         std_vals = np.std(X_dense, axis=1, keepdims=True)
-        cv = np.divide(std_vals, mean_vals + 1e-8)  # 避免除零
+        cv = np.divide(std_vals, mean_vals + 1e-8)
         stat_features.append(cv)
 
-        # 合并统计特征
         stat_features_array = np.concatenate(stat_features, axis=1)
 
-        # 添加特征名称
         stat_names = ['row_mean', 'row_std', 'row_max', 'row_min', 'row_median',
                       'row_skew', 'row_kurtosis', 'row_q25', 'row_q75', 'row_cv']
-        self.feature_names.extend(stat_names)
+
+        # 更新建模特征名列表
+        self.feature_names_for_modeling.extend(stat_names)
 
         print(f"    -> 创建了 {stat_features_array.shape[1]} 个统计特征")
         return np.concatenate([X_dense, stat_features_array], axis=1)
@@ -305,7 +337,6 @@ class AdvancedFeatureEngineer:
         print("  -> 创建聚类特征...")
         cluster_features = []
 
-        # K-Means 聚类
         if self.kmeans is None:
             self.kmeans = KMeans(n_clusters=self.n_clusters_kmeans,
                                  random_state=SEED, n_init=10)
@@ -313,31 +344,26 @@ class AdvancedFeatureEngineer:
         else:
             kmeans_labels = self.kmeans.predict(X_dense)
 
-        # K-Means 距离特征
         kmeans_distances = self.kmeans.transform(X_dense)
         cluster_features.append(kmeans_distances)
 
-        # DBSCAN 聚类 (仅在训练时)
         if self.dbscan is None:
             self.dbscan = DBSCAN(eps=self.dbscan_eps,
                                  min_samples=self.dbscan_min_samples, n_jobs=-1)
             dbscan_labels = self.dbscan.fit_predict(X_dense)
         else:
-            # DBSCAN 没有 predict 方法，需要重新拟合或使用其他方法
-            # 这里简化处理，跳过测试集的DBSCAN标签
             dbscan_labels = np.zeros(X_dense.shape[0])
 
-        # 添加聚类标签作为特征 (one-hot编码可能更好，但这里简化)
         cluster_features.append(kmeans_labels.reshape(-1, 1))
         cluster_features.append(dbscan_labels.reshape(-1, 1))
 
-        # 合并聚类特征
         cluster_features_array = np.concatenate(cluster_features, axis=1)
 
-        # 添加特征名称
         cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)]
         cluster_names.extend(['kmeans_label', 'dbscan_label'])
-        self.feature_names.extend(cluster_names)
+
+        # 更新建模特征名列表
+        self.feature_names_for_modeling.extend(cluster_names)
 
         print(f"    -> 创建了 {cluster_features_array.shape[1]} 个聚类特征")
         return np.concatenate([X_dense, cluster_features_array], axis=1)
@@ -350,7 +376,6 @@ class AdvancedFeatureEngineer:
         print("  -> 创建异常检测特征...")
         anomaly_features = []
 
-        # Isolation Forest
         if self.isolation_forest is None:
             self.isolation_forest = IsolationForest(
                 contamination=self.isolation_contamination,
@@ -361,7 +386,6 @@ class AdvancedFeatureEngineer:
 
         anomaly_features.append(iso_scores.reshape(-1, 1))
 
-        # Local Outlier Factor
         if self.lof is None:
             self.lof = LocalOutlierFactor(
                 n_neighbors=self.lof_n_neighbors,
@@ -373,12 +397,12 @@ class AdvancedFeatureEngineer:
 
         anomaly_features.append(lof_scores.reshape(-1, 1))
 
-        # 合并异常检测特征
         anomaly_features_array = np.concatenate(anomaly_features, axis=1)
 
-        # 添加特征名称
         anomaly_names = ['isolation_score', 'lof_score']
-        self.feature_names.extend(anomaly_names)
+
+        # 更新建模特征名列表
+        self.feature_names_for_modeling.extend(anomaly_names)
 
         print(f"    -> 创建了 {anomaly_features_array.shape[1]} 个异常检测特征")
         return np.concatenate([X_dense, anomaly_features_array], axis=1)
@@ -389,73 +413,122 @@ class AdvancedFeatureEngineer:
 
         # 处理输入格式
         if isinstance(X, pd.DataFrame):
-            # 新增：识别嵌入特征组
-            self._identify_embedding_groups(X.columns.tolist())
-            # 新增：处理嵌入特征
-            X_processed_df = self._process_embedding_features(X)
-            # 新增：填充向量列缺失值
+            self.original_feature_names = X.columns.tolist()
+
+            # Step 1: Identify embedding groups
+            self._identify_embedding_groups(self.original_feature_names)
+
+            # Step 2: Process embeddings (Fit specific logic)
+            X_processed_df = self._process_embedding_features_fit(X)
+
+            # Record names after processing embeddings but before expanding vectors
+            post_emb_processing_names = X_processed_df.columns.tolist()
+
+            # Step 3: Impute vector columns
             X_imputed_df = self._impute_vector_columns(X_processed_df)
 
-            # 分离数值列和向量列
-            self.numerical_features = X_imputed_df.select_dtypes(include=[np.number]).columns.tolist()
-            vector_columns = [col for col in self.vector_feature_names if col in X_imputed_df.columns]
+            # Step 4: Expand vector features into individual numeric columns
+            expanded_dfs = []
+            other_cols = []
 
-            # 将向量列展开为数值列
-            vector_data_list = []
-            for col in vector_columns:
-                if len(X_imputed_df[col]) > 0:
-                    # 获取第一个有效向量来确定维度
-                    sample_vector = None
-                    for vec in X_imputed_df[col]:
-                        if isinstance(vec, (list, np.ndarray)) and len(vec) > 0:
-                            sample_vector = vec
-                            break
+            print(f"  -> 开始展开向量特征...")
+            for col in post_emb_processing_names:
+                if col in self.vector_expanded_feature_map:  # It's a vector column to expand
+                    print(f"    -> 展开向量列 '{col}'...")
+                    vec_data = X_imputed_df[col]
+                    expected_dims = self.vector_expanded_feature_map[col]
+                    expected_dim_count = len(expected_dims)
 
-                    if sample_vector is not None:
-                        expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
-                                                   columns=[f"{col}_dim_{i}" for i in range(len(sample_vector))])
-                        vector_data_list.append(expanded_df)
+                    if len(vec_data) > 0:
+                        # Convert list of arrays/vectors to a list of lists for DataFrame constructor
+                        # Ensure all vectors have the correct length
+                        validated_vectors = []
+                        for i, vec in enumerate(vec_data):
+                            try:
+                                vec_array = np.asarray(vec)
+                                if vec_array.size == 0:
+                                    validated_vectors.append(np.zeros(expected_dim_count))
+                                elif vec_array.shape[0] != expected_dim_count:
+                                    # Handle dimension mismatch
+                                    if vec_array.shape[0] < expected_dim_count:
+                                        padded = np.zeros(expected_dim_count)
+                                        padded[:vec_array.shape[0]] = vec_array
+                                        validated_vectors.append(padded)
+                                    else:
+                                        validated_vectors.append(vec_array[:expected_dim_count])
+                                else:
+                                    validated_vectors.append(vec_array)
+                            except Exception as e:
+                                print(f"      -> 警告: 处理第 {i} 个向量时出错 ({e})，使用零向量填充。")
+                                validated_vectors.append(np.zeros(expected_dim_count))
 
-            if vector_data_list:
-                vector_data_df = pd.concat(vector_data_list, axis=1)
-                numerical_data_df = X_imputed_df[self.numerical_features]
-                # 重置索引以避免合并时的索引冲突
-                numerical_data_df = numerical_data_df.reset_index(drop=True)
-                vector_data_df = vector_data_df.reset_index(drop=True)
-                X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
+                        try:
+                            expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                            expanded_dfs.append(expanded_df)
+                            print(f"      -> 成功展开 '{col}' 为 {len(expected_dims)} 个特征。")
+                        except Exception as e:
+                            print(f"      -> 错误: 无法从列 '{col}' 创建DataFrame ({e})，跳过该列。")
+                            # Even if expansion fails, we should not crash.
+                            # Add zero columns as placeholders if needed for consistency?
+                            # For now, we just skip. The final concat will handle missing parts.
+                    else:
+                        print(f"      -> 警告: 向量列 '{col}' 为空，跳过展开。")
+                        # Optionally add zero columns here too, but let's see if it's needed.
+                else:
+                    # Regular numeric or non-vector column
+                    other_cols.append(col)
+
+            # Combine all parts back together
+            final_parts = []
+            if other_cols:
+                final_parts.append(X_imputed_df[other_cols])
+                print(f"  -> 添加了 {len(other_cols)} 个非向量特征。")
+            if expanded_dfs:
+                final_parts.extend(expanded_dfs)
+                total_expanded_features = sum(df.shape[1] for df in expanded_dfs)
+                print(f"  -> 添加了 {len(expanded_dfs)} 个向量组，共 {total_expanded_features} 个展开特征。")
+
+            if final_parts:
+                X_final_df = pd.concat(final_parts, axis=1)
+                # Ensure consistent order by sorting column names alphabetically
+                sorted_cols = sorted(X_final_df.columns)
+                X_final_df = X_final_df.reindex(columns=sorted_cols)
+                print(f"  -> 合并后特征总数: {X_final_df.shape[1]} (行数: {X_final_df.shape[0]})")
             else:
-                X_final_df = X_imputed_df[self.numerical_features]
+                print("  -> 警告: 最终特征DataFrame为空！这将导致后续错误。")
+                X_final_df = pd.DataFrame(index=X.index)  # At least keep the index
+
+            # Store the final processed feature names that will go into imputer/scaler etc.
+            self.final_feature_names_after_processing = X_final_df.columns.tolist()
+            print(f"Final pre-imputation feature names count: {len(self.final_feature_names_after_processing)}")
 
             X_dense = X_final_df.values
+            print(f"  -> 转换为 NumPy 数组，形状: {X_dense.shape}")
 
         elif sparse.issparse(X):
             X_dense = X.toarray()
-            self.numerical_features = list(range(X.shape[1]))
+            # For sparse input, we assume no special preprocessing like embeddings was needed
+            self.final_feature_names_after_processing = [f"feature_{i}" for i in range(X_dense.shape[1])]
         else:
             X_dense = X
-            self.numerical_features = list(range(X.shape[1]))
+            self.final_feature_names_after_processing = [f"feature_{i}" for i in range(X_dense.shape[1])]
 
         self.original_feature_count = X_dense.shape[1]
-        print(f"原始特征数: {self.original_feature_count}")
+        print(f"原始特征数 (转换为dense array后): {self.original_feature_count}")
 
-        # 1. 缺失值处理 (现在处理的是纯数值型数组)
+        # 1. 缺失值处理
         print("步骤 1: 缺失值处理...")
         self.imputer_num = SimpleImputer(strategy='median')
-
-        # 记录 imputer 期望的特征数 before fit
         self.fit_feature_count_before_imputer_ = X_dense.shape[1]
-        print(f"  -> SimpleImputer 拟合前特征数: {self.fit_feature_count_before_imputer_}")
-
+        print(f"  -> SimpleImputer 拟合前特征数: {self.fit_feature_count_before_imputer_} (形状: {X_dense.shape})")
+        if X_dense.shape[0] == 0:
+            raise ValueError("错误：在SimpleImputer拟合前，特征矩阵行数为0。请检查数据预处理逻辑。")
         X_dense = self.imputer_num.fit_transform(X_dense)
-
-        # 记录 imputer 期望的特征数 after fit
         self.fit_feature_count_after_imputer_ = X_dense.shape[1]
-        print(f"  -> SimpleImputer 拟合后特征数: {self.fit_feature_count_after_imputer_}")
+        print(f"  -> SimpleImputer 拟合后特征数: {self.fit_feature_count_after_imputer_} (形状: {X_dense.shape})")
 
         # 2. 数据预处理和变换
         print("步骤 2: 数据预处理...")
-
-        # 选择缩放器
         if self.scaler_type == 'standard':
             self.scaler = StandardScaler()
         elif self.scaler_type == 'robust':
@@ -470,210 +543,219 @@ class AdvancedFeatureEngineer:
             self.scaler = MinMaxScaler()
 
         X_dense = self.scaler.fit_transform(X_dense)
+        print(f"  -> 预处理后特征矩阵形状: {X_dense.shape}")
 
-        # 3. 高级特征工程
+        # 3. 高级特征工程 - Initialize modeling feature names with base ones
+        self.feature_names_for_modeling = self.final_feature_names_after_processing.copy()
         print("步骤 3: 高级特征工程...")
         X_dense = self._create_statistical_features(X_dense)
         X_dense = self._create_cluster_features(X_dense)
         X_dense = self._create_anomaly_features(X_dense)
 
-        print(f"特征工程后特征数: {X_dense.shape[1]}")
+        print(f"特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 4. 多重降维
+        # 4. 取消多重降维
         if self.use_multiple_decomposition:
-            print("步骤 4: 多重降维...")
+            print("步骤 4: 多重降维... (已取消)")
+        else:
+            print("步骤 4: 多重降维已取消")
 
-            # TruncatedSVD
-            n_svd = min(self.svd_components, X_dense.shape[1] - 1)
-            self.svd = TruncatedSVD(n_components=n_svd, random_state=SEED)
-            X_svd = self.svd.fit_transform(X_dense)
-
-            # FastICA
-            n_ica = min(self.ica_components, X_dense.shape[1])
-            self.ica = FastICA(n_components=n_ica, random_state=SEED, max_iter=1000)
-            X_ica = self.ica.fit_transform(X_dense)
-
-            # Factor Analysis
-            n_fa = min(self.fa_components, X_dense.shape[1])
-            self.fa = FactorAnalysis(n_components=n_fa, random_state=SEED)
-            X_fa = self.fa.fit_transform(X_dense)
-
-            # 组合降维特征
-            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
-            print(f"  -> SVD: {X_svd.shape[1]}, ICA: {X_ica.shape[1]}, FA: {X_fa.shape[1]}")
-
-            # 将原始特征和降维特征结合
-            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
-            print(f"降维后总特征数: {X_dense.shape[1]}")
-
-        # 5. 智能特征选择
-        print("步骤 5: 智能特征选择...")
-
-        # 方差过滤
-        self.variance_selector = VarianceThreshold(threshold=self.variance_threshold)
-        X_dense = self.variance_selector.fit_transform(X_dense)
-        print(f"  -> 方差过滤后特征数: {X_dense.shape[1]}")
-
-        # 单变量特征选择
-        if y is not None and self.univariate_k_best:
-            k_best = min(self.univariate_k_best, X_dense.shape[1])
-            self.univariate_selector = SelectKBest(score_func=f_classif, k=k_best)
-            X_dense = self.univariate_selector.fit_transform(X_dense, y)
-            print(f"  -> 单变量选择后特征数: {X_dense.shape[1]}")
-
-        # 随机森林特征选择
-        if y is not None and self.rf_n_features_to_select:
-            n_rf_features = min(self.rf_n_features_to_select, X_dense.shape[1])
-            temp_rf = BalancedRandomForestClassifier(
-                n_estimators=100, max_depth=5, n_jobs=-1, random_state=SEED)
-            self.rf_selector = SelectFromModel(
-                temp_rf, max_features=n_rf_features, threshold=-np.inf)
-            X_dense = self.rf_selector.fit_transform(X_dense, y)
-            print(f"  -> 随机森林选择后特征数: {X_dense.shape[1]}")
+        # 5. 取消智能特征选择
+        print("步骤 5: 智能特征选择... (已取消)")
 
         # 记录最终特征数
         self.final_feature_count_after_engineering_ = X_dense.shape[1]
-        print(f"特征工程拟合完成！最终特征数: {self.final_feature_count_after_engineering_}")
+        print(f"特征工程拟合完成！最终特征数: {self.final_feature_count_after_engineering_} (形状: {X_dense.shape})")
+        if X_dense.shape[0] == 0:
+            raise ValueError("错误：特征工程完成后，特征矩阵行数为0。这是致命错误，请检查数据和特征工程逻辑。")
         return self
 
     def transform(self, X):
         """应用特征工程变换"""
         # 处理输入格式
         if isinstance(X, pd.DataFrame):
-            # 新增：处理嵌入特征 (使用在fit中识别的组)
-            X_processed_df = self._process_embedding_features(X)
-            # 新增：填充向量列缺失值
+            # Step 1: Process embeddings using fitted info (Transform specific logic)
+            X_processed_df = self._process_embedding_features_transform(X)
+
+            # Step 2: Impute vector columns based on what was learned during fit
             X_imputed_df = self._impute_vector_columns(X_processed_df)
 
-            # 分离数值列和向量列
-            # 注意：这里使用 self.numerical_features，它是在 fit 时确定的
-            numerical_data_df = X_imputed_df.reindex(columns=self.numerical_features, fill_value=0)  # 安全地选择列
-            vector_columns = [col for col in self.vector_feature_names if col in X_imputed_df.columns]
+            # Step 3: Expand vector features into individual numeric columns using mapping from fit
+            expanded_dfs = []
+            other_cols_from_fit = []
 
-            # 将向量列展开为数值列
-            vector_data_list = []
-            for col in vector_columns:
-                if len(X_imputed_df[col]) > 0:
-                    # 获取第一个有效向量来确定维度
-                    sample_vector = None
-                    for vec in X_imputed_df[col]:
-                        if isinstance(vec, (list, np.ndarray)) and len(vec) > 0:
-                            sample_vector = vec
-                            break
+            current_post_process_names = set(X_imputed_df.columns)
 
-                    if sample_vector is not None:
-                        expanded_df = pd.DataFrame(X_imputed_df[col].tolist(),
-                                                   columns=[f"{col}_dim_{i}" for i in range(len(sample_vector))])
-                        vector_data_list.append(expanded_df)
+            # Reconstruct structure similar to fit phase
+            print(f"  -> Transform: 开始展开向量特征...")
+            # Handle vector expansions first based on fit-time map
+            for vec_col_name, expected_dims in self.vector_expanded_feature_map.items():
+                if vec_col_name in X_imputed_df.columns:
+                    print(f"    -> Transform: 展开向量列 '{vec_col_name}'...")
+                    raw_vectors = X_imputed_df[vec_col_name].tolist()
+                    expected_dim_count = len(expected_dims)
 
-            if vector_data_list:
-                vector_data_df = pd.concat(vector_data_list, axis=1)
-                # 重置索引以避免合并时的索引冲突
-                numerical_data_df = numerical_data_df.reset_index(drop=True)
-                vector_data_df = vector_data_df.reset_index(drop=True)
-                X_final_df = pd.concat([numerical_data_df, vector_data_df], axis=1)
+                    # Validate dimensions match expectation from fit
+                    validated_vectors = []
+                    for i, v in enumerate(raw_vectors):
+                        try:
+                            if isinstance(v, (list, np.ndarray)):
+                                v_array = np.asarray(v)
+                                if v_array.size == 0:
+                                    validated_vectors.append(np.zeros(expected_dim_count))
+                                elif v_array.shape[0] != expected_dim_count:
+                                    # Handle dimension mismatch
+                                    if v_array.shape[0] < expected_dim_count:
+                                        padded = np.zeros(expected_dim_count)
+                                        padded[:v_array.shape[0]] = v_array
+                                        validated_vectors.append(padded)
+                                    else:
+                                        validated_vectors.append(v_array[:expected_dim_count])
+                                else:
+                                    validated_vectors.append(v_array)
+                            else:
+                                # If not array-like, try to convert or use zero vector
+                                print(f"      -> 警告: 第 {i} 个元素不是数组 ({type(v)})，使用零向量。")
+                                validated_vectors.append(np.zeros(expected_dim_count))
+                        except Exception as e:
+                            print(f"      -> 警告: 处理第 {i} 个向量时出错 ({e})，使用零向量。")
+                            validated_vectors.append(np.zeros(expected_dim_count))
+
+                    try:
+                        expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                        expanded_dfs.append(expanded_df)
+                        print(f"      -> Transform: 成功展开 '{vec_col_name}' 为 {len(expected_dims)} 个特征。")
+                    except Exception as e:
+                        print(f"      -> Transform: 错误: 无法从列 '{vec_col_name}' 创建DataFrame ({e})，添加零列。")
+                        # Add zero columns as fallback
+                        zero_df = pd.DataFrame(np.zeros((len(X), expected_dim_count)), columns=expected_dims)
+                        expanded_dfs.append(zero_df)
+                else:
+                    print(f"    -> Transform: 警告: 向量列 '{vec_col_name}' 在transform数据中不存在。")
+
+            # Now handle other columns that were present in fit
+            for original_col_name in self.final_feature_names_after_processing:
+                # Check if it's an expanded dimension name handled above
+                parent_vec_found = False
+                for _, dims in self.vector_expanded_feature_map.items():
+                    if original_col_name in dims:
+                        parent_vec_found = True
+                        break
+
+                if not parent_vec_found and original_col_name in current_post_process_names:
+                    other_cols_from_fit.append(original_col_name)
+
+            # Combine everything again
+            final_parts_transform = []
+            if other_cols_from_fit:
+                final_parts_transform.append(X_imputed_df[other_cols_from_fit])
+                print(f"  -> Transform: 添加了 {len(other_cols_from_fit)} 个非向量特征。")
+            if expanded_dfs:
+                final_parts_transform.extend(expanded_dfs)
+                total_expanded_features = sum(df.shape[1] for df in expanded_dfs)
+                print(f"  -> Transform: 添加了 {len(expanded_dfs)} 个向量组，共 {total_expanded_features} 个展开特征。")
+
+            if final_parts_transform:
+                X_final_df_transform = pd.concat(final_parts_transform, axis=1)
+                # Align column order with fit stage result
+                aligned_cols = [col for col in self.final_feature_names_after_processing
+                                if col in X_final_df_transform.columns]
+                missing_cols = [col for col in self.final_feature_names_after_processing
+                                if col not in X_final_df_transform.columns]
+
+                if missing_cols:
+                    print(f"Warning: Missing columns in transform data compared to fit: {missing_cols[:5]}...")
+                    # Add missing columns filled with zeros
+                    for mc in missing_cols:
+                        X_final_df_transform[mc] = 0.0
+
+                # Final reordering to ensure exact match with fit output schema
+                X_final_df_transform = X_final_df_transform.reindex(columns=self.final_feature_names_after_processing)
+                print(
+                    f"  -> Transform: 合并后特征总数: {X_final_df_transform.shape[1]} (行数: {X_final_df_transform.shape[0]})")
             else:
-                X_final_df = numerical_data_df  # 如果没有向量特征，就只用 numerical_data_df
+                print("  -> Transform: 警告: 最终特征DataFrame为空！这将导致后续错误。")
+                # Fallback: Create empty dataframe matching expected schema
+                X_final_df_transform = pd.DataFrame(columns=self.final_feature_names_after_processing, index=X.index)
+                # Fill with zeros if needed
+                if len(self.final_feature_names_after_processing) > 0:
+                    X_final_df_transform = X_final_df_transform.fillna(0.0)
 
-            X_dense = X_final_df.values
+            X_dense = X_final_df_transform.values
+            print(f"  -> Transform: 转换为 NumPy 数组，形状: {X_dense.shape}")
 
         elif sparse.issparse(X):
             X_dense = X.toarray()
         else:
             X_dense = X
 
-        # --- 新增：维度检查点 1 ---
-        print(f"  -> transform 阶段，经过 DataFrame 处理后的特征数: {X_dense.shape[1]}")
+        # Dimension check points remain largely unchanged since core issue fixed above
+        print(
+            f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # --- 新增：维度一致性检查 before imputer ---
-        if self.fit_feature_count_before_imputer_ is not None:
-            if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
-                print(
-                    f"  -> transform 阶段，经过 DataFrame 处理后的特征数 ({X_dense.shape[1]}) 与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 不一致。")
-                print(f"  -> 尝试调整 X_dense 维度以匹配...")
-                if X_dense.shape[1] > self.fit_feature_count_before_imputer_:
-                    # 如果 transform 时特征数更多，裁剪
-                    X_dense = X_dense[:, :self.fit_feature_count_before_imputer_]
-                    print(f"  -> 裁剪至 {self.fit_feature_count_before_imputer_} 个特征")
-                elif X_dense.shape[1] < self.fit_feature_count_before_imputer_:
-                    # 如果 transform 时特征数更少，用零填充
-                    zeros_to_add = self.fit_feature_count_before_imputer_ - X_dense.shape[1]
-                    zeros = np.zeros((X_dense.shape[0], zeros_to_add))
-                    X_dense = np.concatenate([X_dense, zeros], axis=1)
-                    print(f"  -> 填充 {zeros_to_add} 个零特征列")
-            else:
-                print(f"  -> transform 阶段，经过 DataFrame 处理后的特征数校验通过: {X_dense.shape[1]}")
-
-        # 1. 缺失值处理 (现在处理的是纯数值型数组)
-        # --- 新增：维度检查点 2 ---
-        print(f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数: {X_dense.shape[1]}")
-
-        # --- 新增：维度一致性检查 during imputer ---
-        if X_dense.shape[1] != self.fit_feature_count_after_imputer_:
-            # Imputer 在 fit 时会根据输入调整，但 transform 时要求输入维度一致
-            # 我们需要确保 X_dense 的列数与 fit 时一致
+        # Consistency checks adjusted slightly
+        if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
             print(
-                f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数 ({X_dense.shape[1]}) 与 fit 阶段的 imputer 输出特征数 ({self.fit_feature_count_after_imputer_}) 不一致。")
-            if X_dense.shape[1] != self.fit_feature_count_before_imputer_:
-                print(
-                    f"  -> 但是，它与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 相同，这可能意味着 imputer 没有改变特征数。")
-                # 在这种情况下，我们假设 imputer 的输出特征数应该与输入特征数一致
-                expected_output_features = self.fit_feature_count_before_imputer_
-            else:
-                expected_output_features = self.fit_feature_count_after_imputer_
+                f"  -> transform 阶段，准备进行 SimpleImputer transform 的特征数 ({X_dense.shape[1]}) "
+                f"与 fit 阶段的 imputer 输入特征数 ({self.fit_feature_count_before_imputer_}) 不一致。"
+            )
 
-            if X_dense.shape[1] != expected_output_features:
-                print(f"  -> 调整 X_dense 维度以符合 imputer 期望...")
-                if X_dense.shape[1] > expected_output_features:
-                    X_dense = X_dense[:, :expected_output_features]
-                    print(f"  -> 裁剪至 {expected_output_features} 个特征")
-                elif X_dense.shape[1] < expected_output_features:
-                    zeros_to_add = expected_output_features - X_dense.shape[1]
-                    zeros = np.zeros((X_dense.shape[0], zeros_to_add))
-                    X_dense = np.concatenate([X_dense, zeros], axis=1)
-                    print(f"  -> 填充 {zeros_to_add} 个零特征列")
+            # Adjust shape to match exactly what imputer expects
+            required_shape = (X_dense.shape[0], self.fit_feature_count_before_imputer_)
+            if X_dense.shape[0] == required_shape[0]:  # Rows must match
+                if X_dense.shape[1] < required_shape[1]:
+                    pad_width = required_shape[1] - X_dense.shape[1]
+                    padding = np.zeros((required_shape[0], pad_width))
+                    X_dense = np.hstack([X_dense, padding])
+                    print(f"     -> Padding {pad_width} columns to reach correct width.")
 
+                elif X_dense.shape[1] > required_shape[1]:
+                    X_dense = X_dense[:, :required_shape[1]]
+                    print(f"     -> Truncating to {required_shape[1]} columns to match.")
+
+        print(f"  -> transform 阶段，SimpleImputer transform 前形状: {X_dense.shape}")
+        if X_dense.shape[0] == 0:
+            raise ValueError("错误：在SimpleImputer transform前，特征矩阵行数为0。")
+
+        # Apply transformations step-by-step ensuring shapes align properly now
         X_dense = self.imputer_num.transform(X_dense)
-        # --- 新增：维度检查点 3 ---
-        print(f"  -> transform 阶段，经过 SimpleImputer transform 后的特征数: {X_dense.shape[1]}")
+        print(
+            f"  -> transform 阶段，经过 SimpleImputer transform 后的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 2. 数据预处理
         if self.power_transformer is not None:
             X_dense = self.power_transformer.transform(X_dense)
         X_dense = self.scaler.transform(X_dense)
+        print(f"  -> transform 阶段，经过 Scaler transform 后的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 3. 特征工程 (注意：聚类和异常检测需要特殊处理)
+        # Recreate engineered features just like in fit
         X_dense = self._create_statistical_features(X_dense)
         X_dense = self._create_cluster_features(X_dense)
         X_dense = self._create_anomaly_features(X_dense)
+        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 4. 多重降维
+        # Skip decomposition steps as per config
         if self.use_multiple_decomposition:
-            X_svd = self.svd.transform(X_dense)
-            X_ica = self.ica.transform(X_dense)
-            X_fa = self.fa.transform(X_dense)
-            X_decomposed = np.concatenate([X_svd, X_ica, X_fa], axis=1)
-            X_dense = np.concatenate([X_dense, X_decomposed], axis=1)
+            print("  -> transform 阶段，多重降维... (已取消)")
+        else:
+            print("  -> transform 阶段，多重降维已取消")
 
-        # 5. 特征选择
-        X_dense = self.variance_selector.transform(X_dense)
-        if self.univariate_selector is not None:
-            X_dense = self.univariate_selector.transform(X_dense)
-        if self.rf_selector is not None:
-            X_dense = self.rf_selector.transform(X_dense)
+        # Skip selection steps as per config
+        print("  -> transform 阶段，特征选择... (已取消)")
 
-        # --- 新增：强制维度一致性检查 ---
+        # Final consistency check enforced strictly
         if self.final_feature_count_after_engineering_ is not None:
             if X_dense.shape[1] != self.final_feature_count_after_engineering_:
-                raise ValueError(
+                error_msg = (
                     f"transform 阶段最终特征数 ({X_dense.shape[1]}) 与 fit 阶段记录的特征数 "
-                    f"({self.final_feature_count_after_engineering_}) 不一致。"
-                    f"这通常是由于 fit 和 transform 阶段的处理逻辑不一致导致的。"
+                    f"({self.final_feature_count_after_engineering_}) 不一致。\n"
+                    f"这通常是由于 fit 和 transform 阶段的处理逻辑不一致导致的。\n"
+                    f"请检查是否有新增/遗漏字段或者类型变化等问题。"
                 )
+                raise ValueError(error_msg)
             else:
                 print(f"  -> transform 阶段最终特征数校验通过: {X_dense.shape[1]}")
 
-        # 输出格式控制
+        # Output format control
         if self.force_sparse_output:
             return sparse.csr_matrix(X_dense)
         else:
@@ -684,110 +766,134 @@ class AdvancedFeatureEngineer:
         return self.fit(X, y).transform(X)
 
 
-def moo_smotetomek_func(X, y):
-    """
-    使用一组固定的参数应用 SMOTETomek 进行重采样。
-    """
-    print("  -> 应用固定参数的 SMOTETomek...")
-
-    if len(np.unique(y)) < 2:
-        print("    -> 标签类别不足，跳过SMOTETomek.")
-        return X, y
-
-    try:
-        if sparse.issparse(X):
-            print("    -> 将稀疏矩阵转换为密集矩阵以进行 SMOTETomek...")
-            X_dense = X.toarray()
-        else:
-            X_dense = X
-
-        smotetomek = SMOTETomek(
-            smote=SMOTE(k_neighbors=5, sampling_strategy='auto', random_state=42, n_jobs=-1),
-            tomek=TomekLinks(sampling_strategy='majority', n_jobs=-1),
-            random_state=42
-        )
-
-        X_resampled_dense, y_resampled = smotetomek.fit_resample(X_dense, y)
-
-        print(f"    -> 应用 SMOTETomek 后，样本数: {X_resampled_dense.shape[0]}")
-        return X_resampled_dense, y_resampled
-
-    except Exception as e:
-        print(f"    -> 应用 SMOTETomek 失败: {e}。回退到原始数据。")
-        return X, y
-
-
-def load_and_apply_model():
-    # 1. 加载测试数据
-    test_data_path = '../UseBert/train_bert_embedded.csv'  # 修改数据路径
-    print(f"正在加载测试数据: {test_data_path}")
-    test_data = pd.read_csv(test_data_path)
-    print(f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1]}")
-
-    # 2. 加载完整的训练管道 (特征工程器 + 分类器)
-    # 请确保 'advanced_feature_engineering_model.pkl' 文件与脚本在同一目录下，或提供完整路径
-    model_path = 'advanced_feature_engineering_model.pkl'
-    print(f"正在加载模型: {model_path}")
+# 以上填写对象
+def load_model(model_path):
+    """加载已保存的模型"""
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"模型文件 {model_path} 不存在。")
     with open(model_path, 'rb') as f:
-        trained_pipeline = pickle.load(f)
+        model = pickle.load(f)
+    print(f"模型已从 {model_path} 加载。")
+    return model
 
-    print("模型加载成功。")
 
-    # 从加载的管道中提取特征工程器和分类器
-    feature_engineer = trained_pipeline.named_steps['feature_engineer']
-    classifier = trained_pipeline.named_steps['classifier']
-    if not hasattr(feature_engineer, 'embedding_groups'):
-        feature_engineer.embedding_groups = {}
-        print("  -> 已修复模型: 添加缺失的embedding_groups属性")
+def predict_with_model(model, test_data_path, output_path):
+    """
+    使用加载的模型对新的测试数据进行预测。
+    修改此函数以处理可能不是 sklearn Pipeline 的模型。
 
-    # 3. 准备测试特征并应用特征工程
-    # 假设测试数据不包含 'target' 列，如果包含则移除
-    feature_columns = [col for col in test_data.columns if col != 'target']
-    if 'company_id' in feature_columns:
-        X_test_raw = test_data[feature_columns].drop(columns=['company_id'])
+    参数:
+    model: 通过pickle加载的完整训练模型（可能包含特征工程管道）。
+    test_data_path (str): 待分类的 parquet 文件路径。
+    output_path (str): 预测结果保存的 CSV 文件路径。
+    """
+    print(f"\n=== 开始加载测试数据 ===")
+    # 1. 加载测试数据
+    try:
+        test_data = pd.read_parquet(test_data_path)
+        print(f"测试数据加载成功: 特征数={test_data.shape[1]}, 样本数={test_data.shape[0]}")
+    except Exception as e:
+        print(f"加载测试数据失败: {e}")
+        return
+
+    # 2. 处理 'company_id' 列
+    if 'company_id' in test_data.columns:
         uuid_column = test_data['company_id']
+        # 从特征中移除 'company_id'
+        feature_data = test_data.drop(columns=['company_id'])
+        print("已找到 'company_id' 列，将用作 uuid。")
     else:
-        X_test_raw = test_data[feature_columns]
-        uuid_column = test_data.index  # 如果没有company_id，使用索引
+        print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
+        uuid_column = test_data.index
+        feature_data = test_data
 
-    print(f"用于特征工程的特征数: {X_test_raw.shape[1]}")
+    # 3. 应用模型进行预测
+    print(f"\n=== 开始进行预测 ===")
+    try:
+        # 尝试不同的模型结构
+        # 情况 1: 模型是一个 sklearn Pipeline
+        if hasattr(model, 'steps'):
+            print("检测到模型为 sklearn Pipeline...")
+            # 检查最后一步是否是分类器
+            if hasattr(model.steps[-1][1], 'predict_proba'):
+                print("Pipeline 最后一步是分类器，直接调用 predict_proba...")
+                y_proba = model.predict_proba(feature_data)[:, 1]
+            else:
+                # 如果最后一步不是分类器，假设倒数第二步是特征工程，最后一步是分类器
+                # 或者模型结构有问题，需要特殊处理
+                print("Pipeline 最后一步不是分类器，尝试手动处理...")
+                # 获取特征工程部分
+                feature_engineer = model.named_steps.get('feature_engineer', None)
+                if feature_engineer is None:
+                    # 如果没有命名为 'feature_engineer' 的步骤，尝试获取第一个非分类器步骤
+                    feature_engineer = None
+                    for name, step in model.steps[:-1]:
+                        if not hasattr(step, 'predict_proba'):  # 不是分类器
+                            feature_engineer = step
+                            break
+                if feature_engineer is None:
+                    raise ValueError("无法在 Pipeline 中找到特征工程步骤。")
 
-    print("正在进行特征工程变换...")
-    X_test_engineered = feature_engineer.transform(X_test_raw)
-    print(f"特征工程完成，变换后特征数: {X_test_engineered.shape[1]}")
+                # 获取分类器部分
+                classifier = model.steps[-1][1]
+                if not hasattr(classifier, 'predict_proba'):
+                    raise ValueError("Pipeline 的最后一步不是有效的分类器。")
 
-    # 4. 应用模型预测
-    print("正在进行预测...")
-    # 获取预测概率
-    y_proba = classifier.predict_proba(X_test_engineered)[:, 1]  # 获取正类概率
-    print(f"预测完成，获得 {len(y_proba)} 个概率值。")
+                # 应用特征工程
+                print("应用特征工程...")
+                X_transformed = feature_engineer.transform(feature_data)
+                print(f"特征工程完成，变换后形状: {X_transformed.shape}")
 
-    # 5. 应用阈值进行分类
-    # 使用与训练时相同的阈值选择方法或固定阈值
-    # 这里我们使用一个示例阈值，实际应用中应根据验证集性能选择
-    # 为了演示，假设我们使用0.5作为阈值，但在实际应用中应使用验证集找到的最佳阈值
-    # 例如，如果在训练脚本中找到的阈值是 results['threshold']，则应加载并使用该值
-    # 为了兼容性，这里先使用一个示例阈值
+                # 应用分类器
+                print("应用分类器进行预测...")
+                y_proba = classifier.predict_proba(X_transformed)[:, 1]
 
-    # 为了更准确，我们可以根据模型性能报告选择一个阈值
-    # 例如，在训练脚本中，最佳F1阈值是 find_best_f1_threshold 的返回值
-    # 为了演示，我们假设一个阈值，实际使用时应从训练结果中获取
-    # 如果有验证集上的最佳阈值文件，可以加载它
-    # 例如，如果训练脚本保存了阈值到文件，可以加载
-    # 或者，我们在这里使用一个常见的默认值，或者基于训练时的阈值
-    # 由于我们无法直接访问训练时的阈值，这里使用一个示例值
-    # 实际上，您应该在训练完成后将阈值保存到文件，然后在这里加载
-    # 例如，您可以将 find_best_f1_threshold 的返回值保存为 'best_threshold.pkl'
-    # 下面是一个示例，假设阈值为0.5，但实际应用中应使用训练时确定的阈值
+        # 情况 2: 模型是一个包含 'feature_engineer' 和 'classifier' 属性的对象
+        elif hasattr(model, 'feature_engineer') and hasattr(model, 'classifier'):
+            print("检测到模型为自定义对象 (包含 feature_engineer 和 classifier)...")
+            # 应用特征工程
+            print("应用特征工程...")
+            X_transformed = model.feature_engineer.transform(feature_data)
+            print(f"特征工程完成，变换后形状: {X_transformed.shape}")
 
-    # 为了演示，我们使用0.5作为默认阈值，但更推荐使用训练时找到的最佳阈值
-    # 假设我们知道最佳阈值是0.55（这需要从训练脚本中获取）
-    threshold = 0.7  # 这应该替换为训练时找到的最佳阈值
-    print(f"应用分类阈值: {threshold}")
-    y_pred = (y_proba >= threshold).astype(int)
-    print(f"分类完成。")
+            # 应用分类器
+            print("应用分类器进行预测...")
+            y_proba = model.classifier.predict_proba(X_transformed)[:, 1]
 
-    # 6. 创建结果数据框
+        # 情况 3: 模型本身就是一个已经训练好的分类器，假设特征工程已在外部完成或数据无需工程
+        elif hasattr(model, 'predict_proba'):
+            print("检测到模型为直接的分类器...")
+            y_proba = model.predict_proba(feature_data)[:, 1]
+
+        else:
+            raise ValueError("加载的模型对象格式未知，无法进行预测。请检查模型保存方式。")
+
+        # 使用模型在训练时找到的最佳阈值进行分类
+        # 假设模型 Pipeline 中存储了阈值，或者我们使用一个固定的阈值（例如 0.5）
+        # 这里我们尝试从模型对象中获取，如果获取不到则使用默认值
+        # 注意：原训练代码没有直接将阈值保存到模型对象中，
+        # 因此我们需要在预测时重新定义或使用默认值。
+        # 为了演示，我们在这里使用 0.7 作为默认阈值。
+        # 在实际应用中，最好将训练时的最佳阈值也保存下来。
+
+        # 尝试从模型或其属性中获取阈值（这部分依赖于训练脚本如何保存阈值）
+        # 一种方法是在训练后将阈值作为模型对象的属性保存
+        # 例如，在训练脚本的最后添加: trained_pipeline.threshold_ = threshold_f1
+        # 如果没有这样做，我们使用默认阈值
+        default_threshold = 0.7
+        # 尝试从模型对象中获取阈值 (假设在训练后有这一步)
+        threshold = getattr(model, 'threshold_', default_threshold)
+        print(f"使用阈值 {threshold} 进行分类。")
+
+        y_pred = (y_proba >= threshold).astype(int)
+        print("预测完成。")
+    except Exception as e:
+        print(f"预测过程中发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # 4. 创建结果 DataFrame
     results_df = pd.DataFrame({
         'uuid': uuid_column,
         'proba': y_proba,
@@ -795,15 +901,46 @@ def load_and_apply_model():
     })
     print("结果数据框创建成功。")
 
-    # 7. 保存结果
-    output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'  # 修改输出文件名
-    print(f"正在保存结果到: {output_path}")
-    results_df.to_csv(output_path, index=False)
-    print(f"预测完成，使用阈值 {threshold} 进行分类，结果已保存到 {output_path}")
+    # 5. 保存结果
+    try:
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        results_df.to_csv(output_path, index=False)
+        print(f"\n预测结果已保存到 {output_path}")
+    except Exception as e:
+        print(f"保存预测结果失败: {e}")
+
+
+def main():
+    """主函数"""
+    # --- 配置区域 ---
+    # 请根据实际情况修改以下路径
+    model_path = '../UseBert/advanced_feature_engineering_ensemble_model.pkl'  # 训练脚本保存的模型文件路径
+    test_data_path = '../UseBert/test_bert_embedded.parquet'  # 待分类的 parquet 文件路径
+    output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'  # 预测结果保存路径
+    # --- 配置区域结束 ---
+
+    if not os.path.exists(model_path):
+        print(f"错误: 找不到模型文件 '{model_path}'。请确保模型已训练并保存。")
+        return
+
+    if not os.path.exists(test_data_path):
+        print(f"错误: 找不到测试数据文件 '{test_data_path}'。")
+        return
+
+    # 加载模型
+    try:
+        model = load_model(model_path)
+    except Exception as e:
+        print(f"加载模型失败: {e}")
+        return
+
+    # 进行预测
+    predict_with_model(model, test_data_path, output_path)
 
 
 if __name__ == "__main__":
-    load_and_apply_model()
+    main()
 
 
 
