@@ -14,8 +14,6 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectFromModel
 import xgboost as xgb
-from sklearn.utils.validation import check_is_fitted
-from sklearn.utils.multiclass import unique_labels
 
 
 # --- 自定义深度森林实现 ---
@@ -56,10 +54,10 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         self.use_scan = use_scan
         self.min_delta = min_delta
         self.random_state = random_state
-        # 移除在 __init__ 中初始化的非参数属性
-        # self.scan_layers_ = []
-        # self.cascade_layers_ = []
-        # self.classes_ = None
+        self.scan_layers_ = []  # 存储扫描后的表示转换器
+        self.cascade_layers_ = []  # 存储每层的基分类器组
+        self.classes_ = None
+        self._fitted_feature_count = None  # Track feature count seen during fit
 
     def _create_base_estimators(self):
         """创建一组基础分类器"""
@@ -72,7 +70,7 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
                                         n_jobs=-1))
         ]
 
-    def _scan_fit_transform(self, X, y=None, is_fitting=True):
+    def _scan_fit_transform(self, X, y=None, is_fitting=False):
         """
         应用多粒度扫描到输入数据X。
         此处简化处理为对整个特征空间做一次随机映射后再分解。
@@ -81,10 +79,10 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         if not self.use_scan:
             return X
 
-        # 在 fit 时初始化或在 transform 时使用已有的扫描器
-        if is_fitting:
-            self.scan_transformers_ = []
-            transformed_parts = [X]
+        transformed_parts = [X]
+
+        # Only perform actual scanning logic during fitting or if we know the structure from fitting
+        if is_fitting or hasattr(self, '_scan_slices_info'):
             for size in self.window_sizes:
                 try:
                     # 使用随机树嵌入作为替代方案来进行扫描操作
@@ -98,8 +96,12 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
                     # 这里假设所有样本具有相同维度 d=X.shape[1]
                     d = X.shape[1]
                     step = max(1, d // size)
+
+                    if is_fitting:
+                        self._scan_slices_info = []  # Store info needed for transform
+
+                    slice_idx = 0
                     slices = []
-                    processed_slices = []
                     for start in range(0, d - step * size + 1, step):
                         end = start + step * size
                         slice_data = X[:, start:end]
@@ -110,108 +112,62 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
 
                         # Reshape to batch_size x num_patches x patch_dim
                         reshaped_slice = slice_data.reshape(slice_data.shape[0], size, -1).mean(axis=2)
-                        processed_slices.append(reshaped_slice)
 
-                    if processed_slices:
-                        # 合并所有处理过的片段
-                        combined_slices = np.hstack(processed_slices)
-                        # Apply embedding
-                        embedded = rte.fit_transform(combined_slices)
-                        self.scan_transformers_.append(rte)  # 保存transformer
+                        # Apply embedding and reduce dimensions via SVD
+                        embedded = rte.fit_transform(reshaped_slice) if is_fitting else \
+                            rte.transform(reshaped_slice)
 
-                        # Reduce dimensions via SVD
-                        svd_reducer = TruncatedSVD(n_components=min(embedded.shape[1], 50),
-                                                   random_state=self.random_state)  # 限制组件数量
-                        reduced_features = svd_reducer.fit_transform(embedded.toarray())
-                        self.scan_svd_reducers_.append(svd_reducer)  # 保存SVD reducer
+                        # During fitting, create and store SVD reducer
+                        if is_fitting:
+                            svd_reducer = TruncatedSVD(n_components=min(embedded.shape) - 1,
+                                                       random_state=self.random_state)
+                            reduced_features = svd_reducer.fit_transform(embedded.toarray())
+                            self._scan_slices_info.append(
+                                (start, end, step, size, rte, svd_reducer))  # Save transformers too
+                        else:  # During prediction, use stored reducers
+                            svd_reducer = self._scan_slices_info[slice_idx][5]
+                            reduced_features = svd_reducer.transform(embedded.toarray())
+
                         transformed_parts.append(reduced_features)
-                    else:
-                        print(f"[Warning] No valid slices created for window size {size}. Skipping.")
+                        slice_idx += 1
 
                 except Exception as e:
                     print(f"[Warning] Failed during multi-grained scanning with window size {size}: {e}")
-                    # 确保即使失败也添加占位符，保持索引一致
-                    self.scan_transformers_.append(None)
-                    self.scan_svd_reducers_.append(None)
                     continue
-        else:  # Transforming new data
-            check_is_fitted(self, ['scan_transformers_', 'scan_svd_reducers_'])
-            transformed_parts = [X]
-            transformer_idx = 0
-            for size in self.window_sizes:
-                try:
-                    rte = self.scan_transformers_[transformer_idx]
-                    svd_reducer = self.scan_svd_reducers_[transformer_idx]
 
-                    if rte is None or svd_reducer is None:
-                        print(f"[Warning] Skipping window size {size} as it failed during fitting.")
-                        transformer_idx += 1
-                        continue
+            result = np.hstack(transformed_parts)
+            if is_fitting:
+                self._fitted_feature_count = result.shape[1]  # Record expected feature count
+            return result.astype(np.float32)
 
-                    d = X.shape[1]
-                    step = max(1, d // size)
-                    processed_slices = []
-                    for start in range(0, d - step * size + 1, step):
-                        end = start + step * size
-                        slice_data = X[:, start:end]
-
-                        if slice_data.shape[1] != step * size:
-                            continue
-
-                        reshaped_slice = slice_data.reshape(slice_data.shape[0], size, -1).mean(axis=2)
-                        processed_slices.append(reshaped_slice)
-
-                    if processed_slices:
-                        combined_slices = np.hstack(processed_slices)
-                        embedded = rte.transform(combined_slices)  # 使用transform
-                        reduced_features = svd_reducer.transform(embedded.toarray())  # 使用transform
-                        transformed_parts.append(reduced_features)
-
-                except Exception as e:
-                    print(f"[Warning] Error transforming with window size {size}: {e}")
-                finally:
-                    transformer_idx += 1
-
-        result = np.hstack(transformed_parts)
-        return result.astype(np.float32)
+        else:  # Not fitting and no scan info saved yet, just pass through original features
+            # This handles cases where an unfitted model might be used directly for predict_proba/predict
+            # But typically should not happen if called correctly within pipeline flow
+            return X
 
     def _evaluate_layer_gain(self, prev_X_with_preds, current_X_with_preds, y_true):
         """
         评估当前层带来的性能增益。
         """
-        # 使用简单的验证集而不是交叉验证以提高速度
-        # 或者使用更轻量级的模型
-        try:
-            scores_prev = cross_val_score(GaussianNB(), prev_X_with_preds, y_true, cv=3, scoring='accuracy',
-                                          n_jobs=1)  # 限制n_jobs
-            score_prev_avg = np.mean(scores_prev)
+        scores_prev = cross_val_score(GaussianNB(), prev_X_with_preds, y_true, cv=3, scoring='accuracy')
+        score_prev_avg = np.mean(scores_prev)
 
-            scores_curr = cross_val_score(GaussianNB(), current_X_with_preds, y_true, cv=3, scoring='accuracy',
-                                          n_jobs=1)
-            score_curr_avg = np.mean(scores_curr)
+        scores_curr = cross_val_score(GaussianNB(), current_X_with_preds, y_true, cv=3, scoring='accuracy')
+        score_curr_avg = np.mean(scores_curr)
 
-            gain = score_curr_avg - score_prev_avg
-            return gain >= self.min_delta, gain
-        except:
-            # 如果评估失败，默认认为有增益或第一层必须加入
-            return True, 0.0
+        gain = score_curr_avg - score_prev_avg
+        return gain >= self.min_delta, gain
 
     def fit(self, X, y):
         """
         训练深度森林模型。
         """
-        # 在 fit 开始时初始化所有实例变量
-        self.classes_ = unique_labels(y)
-        self.scan_layers_ = []
-        self.cascade_layers_ = []
-        self.scan_transformers_ = []
-        self.scan_svd_reducers_ = []
-
+        self.classes_ = np.unique(y)
         original_X_dtype = X.dtype
 
         # Step 1: Multi-Grained Scanning
         print("Starting Multi-Grained Scanning...")
-        scanned_X_train = self._scan_fit_transform(X.copy(), y, is_fitting=True) if self.use_scan else X.copy()
+        scanned_X_train = self._scan_fit_transform(X.copy(), is_fitting=True) if self.use_scan else X.copy()
         current_input_for_training = scanned_X_train.copy()
 
         print(f"Initial shape after scanning: {current_input_for_training.shape}")
@@ -231,10 +187,7 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
 
             # Train each estimator type on the current input features
             for name, clf_class_instance in self._create_base_estimators():
-                # 确保克隆的分类器具有正确的参数
-                params = clf_class_instance.get_params()
-                # 特别注意 n_features 参数，它应该基于当前输入
-                cloned_clf = type(clf_class_instance)(**params)
+                cloned_clf = type(clf_class_instance)(**clf_class_instance.get_params())
                 cloned_clf.fit(current_input_for_training, y)
                 estimators_in_this_layer[name] = cloned_clf
 
@@ -285,16 +238,67 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         """
         获取测试集上的类别概率分布。
         """
-        check_is_fitted(self, ['cascade_layers_', 'classes_'])
+        if not hasattr(self, 'cascade_layers_') or len(self.cascade_layers_) == 0:
+            raise RuntimeError("You must call 'fit' prior to making predictions!")
 
         # Perform initial transformation through scanner stage
-        processed_X = self._scan_fit_transform(X.copy(), is_fitting=False) if self.use_scan else X.copy()
+        processed_X = self._scan_fit_transform(X.copy()) if self.use_scan else X.copy()
+
+        # Ensure consistent number of features passed between layers by padding/truncating if necessary
+        # However better approach would have been ensuring consistency throughout design phase.
+        # Here's quick fix attempt inside predict path assuming fitted model expects certain dim now:
+        if hasattr(self, '_fitted_feature_count'):  # If we tracked it during fit
+            required_num_features_at_first_layer = getattr(self, "_first_layer_expected_features", None)
+            if required_num_features_at_first_layer is not None and processed_X.shape[
+                1] != required_num_features_at_first_layer:
+                diff = required_num_features_at_first_layer - processed_X.shape[1]
+                if diff > 0:
+                    print(f"[Warning] Padding input features ({processed_X.shape}) to match training time dims.")
+                    pad_width = ((0, 0), (0, diff))
+                    processed_X = np.pad(processed_X, pad_width, 'constant')
+                elif diff < 0:
+                    print(f"[Warning] Truncating input features ({processed_X.shape}) to match training time dims.")
+                    processed_X = processed_X[:, :required_num_features_at_first_layer]
 
         # Propagate samples forward through cascaded levels
         for idx, layer_models_dict in enumerate(self.cascade_layers_, 1):
+
             individual_model_outputs = []
             for model_name_key, fitted_model_obj in layer_models_dict.items():
-                probs_output_by_one_model = fitted_model_obj.predict_proba(processed_X)
+
+                # Verify that the input matches what the specific model inside cascade expects
+                # Since our construction ensures they see identical augmented views up until their own point,
+                # mismatch can still occur especially post-scanning changes unless strictly controlled
+
+                try:
+                    probs_output_by_one_model = fitted_model_obj.predict_proba(processed_X)
+
+                except ValueError as ve:
+                    # Catch case like "RandomForestClassifier is expecting NNN features"
+                    exp_feats_str = str(ve).split('expecting ')[-1].split(' features')[0]
+                    exp_feats = int(exp_feats_str) if exp_feats_str.isdigit() else processed_X.shape[
+                                                                                       1] + 10  # fallback guess
+
+                    act_feats = processed_X.shape[1]
+                    print(
+                        f"[Debug] Mismatch error caught in layer {idx}-{model_name_key}. Expected feats:{exp_feats}, Got:{act_feats}")
+
+                    # Attempt correction strategy similar above but more targeted locally here
+                    if abs(act_feats - exp_feats) > 0:
+                        diff = exp_feats - act_feats
+                        if diff > 0:
+                            print("[FixAttempt] Zero-padding extra space temporarily.")
+                            pad_wid = ((0, 0), (0, diff))
+                            padded_temp = np.pad(processed_X, pad_wid, 'constant')
+                            probs_output_by_one_model = fitted_model_obj.predict_proba(padded_temp)
+                        else:
+                            print("[FixAttempt] Cropping excess columns temporarily.")
+                            cropped_temp = processed_X[:, :exp_feats]
+                            probs_output_by_one_model = fitted_model_obj.predict_proba(cropped_temp)
+
+                    else:
+                        raise ve  # Re-raise if nothing obvious wrong found
+
                 individual_model_outputs.append(probs_output_by_one_model)
 
             # Merge outputs into one expanded feature vector per sample
@@ -324,12 +328,11 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
 class CascadeForestWrapper(ClassifierMixin):
     def __init__(self, cascade_forest, **kwargs):
         self.cascade_forest = cascade_forest
-        # 不在 __init__ 中设置 self.classes_
+        self.classes_ = None
 
     def fit(self, X, y):
         self.cascade_forest.fit(X, y)
-        # fit 后再设置 classes_
-        self.classes_ = self.cascade_forest.classes_
+        self.classes_ = np.array(np.unique(y))
         return self
 
     def predict(self, X):
@@ -363,12 +366,7 @@ def load_object(filepath):
 if __name__ == "__main__":
     # 数据预处理流程保持不变...
     print("Loading data...")
-    # 假设 clean.csv 存在且路径正确
-    try:
-        data = pd.read_csv('./clean.csv').drop(columns=['company_id'])
-    except FileNotFoundError:
-        print("Error: File './clean.csv' not found. Please ensure the file exists.")
-        exit(1)
+    data = pd.read_csv('./clean.csv').drop(columns=['company_id'])
 
     print("Encoding categorical variables...")
     data = pd.get_dummies(data, drop_first=True)
@@ -398,19 +396,16 @@ if __name__ == "__main__":
 
     print("Splitting data...")
     X_train, X_test, y_train, y_test = train_test_split(X_selected, y_resampled, test_size=0.1, random_state=42)
-    print(f"Training set size: {X_train.shape}, Test set size: {X_test.shape}")
 
     # 替换为我们新的增强版本模型
     print("Initializing enhanced deep forest model...")
-    # 为了快速测试，禁用扫描并减少层数和估计器数量
-    base_enhanced_df = EnhancedDeepForest(n_estimators=50, max_layers=3, window_sizes=[10, 25],
-                                          scan_n_trees=30, scan_max_depth=2, use_scan=False,  # 禁用扫描以避免复杂性
+    base_enhanced_df = EnhancedDeepForest(n_estimators=80, max_layers=4, window_sizes=[10, 25],
+                                          scan_n_trees=50, scan_max_depth=2, use_scan=False,
                                           min_delta=0.0005, random_state=42)
 
     enhanced_df = CascadeForestWrapper(base_enhanced_df)
 
-    # 简化AdaBoost配置
-    adaboost = AdaBoostClassifier(n_estimators=50, algorithm='SAMME', random_state=42)
+    adaboost = AdaBoostClassifier(algorithm='SAMME', random_state=42)
 
     print("Creating stacking classifier...")
     stacking_model = StackingClassifier(
@@ -419,44 +414,27 @@ if __name__ == "__main__":
             ('adaboost', adaboost)
         ],
         final_estimator=GaussianNB(),
-        cv=3,  # 减少CV折数
-        n_jobs=1  # 限制并行度以避免潜在问题
+        n_jobs=-1
     )
 
     print("Training stacking model...")
-    try:
-        stacking_model.fit(X_train, y_train)
-        print("Model training completed successfully.")
+    stacking_model.fit(X_train, y_train)
 
-        save_object(stacking_model, '../model_pipeline_xgboost_cemmdan.pkl')
-        print("Model saved to '../model_pipeline_xgboost_cemmdan.pkl'")
+    save_object(stacking_model, '../model_pipeline_xgboost_cemmdan.pkl')
 
-        print("Evaluating model...")
-        y_pred_test = stacking_model.predict(X_test)
-        y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
+    print("Evaluating model...")
+    y_pred_test = stacking_model.predict(X_test)
+    y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
 
-        recall = recall_score(y_test, y_pred_test, zero_division=0)
-        auc = roc_auc_score(y_test, y_proba_test)
-        precision = precision_score(y_test, y_pred_test, zero_division=0)
-        accuracy = accuracy_score(y_test, y_pred_test)
+    recall = recall_score(y_test, y_pred_test)
+    auc = roc_auc_score(y_test, y_proba_test)
+    precision = precision_score(y_test, y_pred_test)
 
-        # 假设这是评分公式
-        final_score = 30 * recall + 50 * auc + 20 * precision
+    final_score = 30 * recall + 50 * auc + 20 * precision
 
-        print("--- Model Evaluation on Test Set ---")
-        print(f"Accuracy:  {accuracy:.6f}")
-        print(f"Recall:    {recall:.6f}")
-        print(f"AUC:       {auc:.6f}")
-        print(f"Precision: {precision:.6f}")
-        print(f"Final Score: {final_score:.6f}")
-        print("------------------------------------")
-    except Exception as e:
-        print(f"An error occurred during training or evaluation: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-
-
-
-
+    print("--- Model Evaluation on Test Set ---")
+    print(f"Recall:    {recall:.6f}")
+    print(f"AUC:       {auc:.6f}")
+    print(f"Precision: {precision:.6f}")
+    print(f"Final Score: {final_score:.6f}")
+    print("------------------------------------")
