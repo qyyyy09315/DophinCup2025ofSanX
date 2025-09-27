@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from imblearn.combine import SMOTETomek
 from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.over_sampling import SMOTE
@@ -33,9 +35,6 @@ from sklearn.cluster import KMeans, DBSCAN
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 
-# --- 导入 XGBoost ---
-from xgboost import XGBClassifier
-
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
 from scipy.stats import skew, kurtosis
@@ -49,6 +48,113 @@ os.environ["LOKY_MAX_CPU_COUNT"] = str(NUM_CORES)
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# --- 神经网络模型定义 ---
+class SimpleNN(nn.Module):
+    """一个简单的前馈神经网络"""
+
+    def __init__(self, input_dim, hidden_dims=[128, 64], dropout_rate=0.3):
+        super(SimpleNN, self).__init__()
+        layers = []
+        prev_dim = input_dim
+        for dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = dim
+        layers.append(nn.Linear(prev_dim, 1))  # 输出一个logit
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class MultiScaleNNEnsemble:
+    """多尺度神经网络集群"""
+
+    def __init__(self, base_model_class, model_params_list, device='cpu'):
+        self.base_model_class = base_model_class
+        self.model_params_list = model_params_list  # 每个模型的参数字典列表
+        self.device = device
+        self.models = []
+        self.weights = []  # 存储每个模型的权重
+
+    def fit(self, X_train_list, y_train, X_val_list, y_val, epochs=50, batch_size=1024, lr=0.001):
+        """训练所有模型"""
+        self.models = []
+        self.weights = []
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(self.device)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1).to(self.device)
+
+        for i, (X_train, X_val, model_params) in enumerate(zip(X_train_list, X_val_list, self.model_params_list)):
+            print(f"训练模型 {i + 1}/{len(self.model_params_list)}...")
+            input_dim = X_train.shape[1]
+            model = self.base_model_class(input_dim, **model_params).to(self.device)
+
+            # 数据加载器
+            train_dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32), y_train_tensor)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+            criterion = nn.BCEWithLogitsLoss()
+            optimizer = optim.Adam(model.parameters(), lr=lr)
+
+            model.train()
+            best_auc = 0
+            for epoch in range(epochs):
+                for data, target in train_loader:
+                    data, target = data.to(self.device), target.to(self.device)
+                    optimizer.zero_grad()
+                    output = model(data)
+                    loss = criterion(output, target)
+                    loss.backward()
+                    optimizer.step()
+
+            # 在验证集上评估以确定权重
+            model.eval()
+            with torch.no_grad():
+                val_preds = torch.sigmoid(
+                    model(torch.tensor(X_val, dtype=torch.float32).to(self.device))).cpu().numpy().flatten()
+            try:
+                val_auc = roc_auc_score(y_val, val_preds)
+            except:
+                val_auc = 0.5  # 防止AUC计算错误
+            print(f"  模型 {i + 1} 验证集 AUC: {val_auc:.4f}")
+
+            self.models.append(model)
+            self.weights.append(val_auc)  # 使用AUC作为权重
+
+    def predict_proba(self, X_test_list):
+        """预测概率，返回正类概率"""
+        if not self.models:
+            raise ValueError("模型尚未训练，请先调用 fit 方法。")
+
+        all_probs = []
+        normalized_weights = np.array(self.weights) / np.sum(self.weights)  # 归一化权重
+
+        for model, X_test, weight in zip(self.models, X_test_list, normalized_weights):
+            model.eval()
+            with torch.no_grad():
+                test_tensor = torch.tensor(X_test, dtype=torch.float32).to(self.device)
+                probs = torch.sigmoid(model(test_tensor)).cpu().numpy().flatten()
+            all_probs.append(probs * weight)  # 加权概率
+
+        # 对所有加权概率求和得到最终概率
+        final_probs = np.sum(np.array(all_probs), axis=0)
+        # 确保概率在 [0, 1] 范围内
+        final_probs = np.clip(final_probs, 0, 1)
+        return final_probs
+
+    def predict(self, X_test_list, threshold=0.5):
+        """预测类别"""
+        probs = self.predict_proba(X_test_list)
+        return (probs >= threshold).astype(int)
 
 
 def moo_smotetomek_func(X, y):
@@ -536,57 +642,85 @@ def evaluate_and_plot(y_true, y_proba, threshold_f1, threshold_hr, model_name="M
 
 
 def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
-    """使用先进特征工程的训练评估流程"""
-    print("\n=== 构建先进特征工程管道 ===")
+    """使用先进特征工程的训练评估流程，模型替换为多尺度神经网络集群"""
+    print("\n=== 构建先进特征工程管道 (多尺度神经网络集群) ===")
 
-    # 特征工程
-    feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
-    classifier = XGBClassifier(
-        n_estimators=500,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=SEED,
-        n_jobs=-1,
-        eval_metric='logloss'
-    )
+    # 特征工程 - 创建多个不同配置的特征工程器，形成多尺度输入
+    print("\n=== 创建多尺度特征工程器 ===")
+    fe_params_list = [
+        # 基础配置
+        feature_engineer_params,
+        # 配置2：更强的降维
+        {**feature_engineer_params, 'svd_components': 50, 'ica_components': 20, 'fa_components': 10,
+         'univariate_k_best': 800, 'rf_n_features_to_select': 500},
+        # 配置3：更少的降维，保留更多原始特征
+        {**feature_engineer_params, 'svd_components': 100, 'ica_components': 70, 'fa_components': 50,
+         'univariate_k_best': 1800, 'rf_n_features_to_select': 1200},
+    ]
 
-    # 1. 拟合特征工程器
-    print("\n=== 拟合特征工程器 ===")
-    feature_engineer.fit(X_train, y_train)
-    X_train_engineered = feature_engineer.transform(X_train)
+    feature_engineers = []
+    X_train_engineered_list = []
+    X_val_engineered_list = []
+    X_test_engineered_list = []
 
-    # 2. 应用 SMOTETomek
-    print("\n=== 应用 SMOTETomek 重采样 ===")
-    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered, y_train)
+    for i, params in enumerate(fe_params_list):
+        print(f"\n--- 拟合特征工程器 {i + 1}/{len(fe_params_list)} ---")
+        fe = AdvancedFeatureEngineer(**params)
+        fe.fit(X_train, y_train)
+        feature_engineers.append(fe)
 
-    # 3. 模型训练
-    print("\n=== 开始模型训练 ===")
+        X_train_engineered_list.append(fe.transform(X_train))
+        X_val_engineered_list.append(fe.transform(X_val))
+        X_test_engineered_list.append(fe.transform(X_test))
+        print(f"特征工程器 {i + 1} 输出特征数: {X_train_engineered_list[-1].shape[1]}")
+
+    # 2. 应用 SMOTETomek (对第一个特征工程器的结果应用，或对每个都应用，这里简化)
+    # 为了简化，我们只对第一个主要特征工程的结果应用重采样
+    print("\n=== 应用 SMOTETomek 重采样 (基于第一个特征工程器) ===")
+    X_train_resampled, y_train_resampled = moo_smotetomek_func(X_train_engineered_list[0], y_train)
+
+    # 更新列表中的第一个元素
+    X_train_engineered_list[0] = X_train_resampled
+
+    # 3. 定义神经网络模型集群
+    print("\n=== 定义神经网络模型集群 ===")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    ensemble_model_params_list = [
+        {'hidden_dims': [256, 128, 64], 'dropout_rate': 0.3},
+        {'hidden_dims': [128, 64], 'dropout_rate': 0.2},
+        {'hidden_dims': [512, 256, 128, 64], 'dropout_rate': 0.4},
+        {'hidden_dims': [64, 32], 'dropout_rate': 0.1},
+    ]
+
+    classifier = MultiScaleNNEnsemble(SimpleNN, ensemble_model_params_list, device=device)
+
+    # 4. 模型训练
+    print("\n=== 开始模型集群训练 ===")
     start_time = time.time()
-    classifier.fit(X_train_resampled, y_train_resampled)
+    classifier.fit(X_train_engineered_list, y_train_resampled, X_val_engineered_list, y_val, epochs=50, batch_size=1024,
+                   lr=0.001)
     end_time = time.time()
-    print(f"模型训练耗时: {end_time - start_time:.2f} 秒")
+    print(f"模型集群训练耗时: {end_time - start_time:.2f} 秒")
 
-    # 4. 保存模型
-    trained_pipeline = Pipeline([
-        ('feature_engineer', feature_engineer),
-        ('classifier', classifier)
-    ])
-    save_model(trained_pipeline, 'advanced_feature_engineering_model.pkl')
+    # 5. 保存模型 (保存整个特征工程器列表和分类器)
+    trained_pipeline = {
+        'feature_engineers': feature_engineers,
+        'classifier': classifier
+    }
+    save_model(trained_pipeline, 'advanced_feature_engineering_nn_ensemble_model.pkl')
 
-    # 5. 验证集阈值选择
+    # 6. 验证集阈值选择
     print("\n=== 验证集阈值选择 ===")
-    X_val_engineered = feature_engineer.transform(X_val)
-    val_proba = classifier.predict_proba(X_val_engineered)[:, 1]
+    val_proba = classifier.predict_proba(X_val_engineered_list)
 
     threshold_f1 = find_best_f1_threshold(y_val, val_proba)
     threshold_high_recall = find_threshold_for_max_recall(y_val, val_proba, min_precision=0.4)
 
-    # 6. 测试集评估
+    # 7. 测试集评估
     print("\n=== 测试集评估 ===")
-    X_test_engineered = feature_engineer.transform(X_test)
-    test_proba = classifier.predict_proba(X_test_engineered)[:, 1]
+    test_proba = classifier.predict_proba(X_test_engineered_list)
 
     # F1优化阈值评估
     print("\n--- 使用 F1 优化阈值评估 ---")
@@ -623,7 +757,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     # 可视化评估结果
     print("\n=== 绘制评估图表 ===")
     evaluate_and_plot(y_test, test_proba, threshold_f1, threshold_high_recall,
-                      model_name="Advanced Feature Engineering XGBoost")
+                      model_name="Advanced Feature Engineering NN Ensemble")
 
     return {
         'recall': recall_f1,
@@ -640,7 +774,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
             'f1': f1_hr,
             'threshold': threshold_high_recall
         },
-        'trained_model': trained_pipeline
+        'trained_model': trained_pipeline  # 保存的是包含特征工程器和分类器的字典
     }
 
 
@@ -651,7 +785,7 @@ def main():
         print("当前 CUDA 设备:", torch.cuda.current_device())
         print("CUDA 设备名称:", torch.cuda.get_device_name(0))
 
-    # 配置先进特征工程参数
+    # 配置先进特征工程参数 (基础配置)
     feature_engineer_params = {
         # 预处理配置
         'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
@@ -703,7 +837,7 @@ def main():
 
         print(f"数据加载成功: 特征数={X.shape[1]}, 样本数={X.shape[0]}")
         print(f"正样本比例: {np.mean(y):.4f}")
-        print(f"使用的特征工程参数: {feature_engineer_params}")
+        print(f"使用的特征工程参数基础配置: {feature_engineer_params}")
     except Exception as e:
         print(f"数据加载失败: {str(e)}")
         return
@@ -724,8 +858,8 @@ def main():
         X_temp, y_temp, test_size=0.1, random_state=SEED, stratify=y_temp)
     print(f"最终数据划分: 训练集={X_train.shape[0]}, 验证集={X_val.shape[0]}, 测试集={X_test.shape[0]}")
 
-    # 启动先进特征工程训练流程
-    print("\n=== 启动先进特征工程训练流程 ===")
+    # 启动先进特征工程训练流程 (使用修改后的函数)
+    print("\n=== 启动先进特征工程训练流程 (多尺度神经网络集群) ===")
     results = train_and_evaluate_advanced(
         X_train, y_train, X_val, y_val, X_test, y_test,
         feature_engineer_params=feature_engineer_params
@@ -737,12 +871,12 @@ def main():
             'true_label': y_test,
             'pred_prob': results['y_proba'],
             'pred_label_f1_optimized': results['y_pred']
-        }).to_csv("advanced_predictions.csv", index=False)
-        print("\n预测结果已保存到 advanced_predictions.csv")
+        }).to_csv("advanced_predictions_nn_ensemble.csv", index=False)
+        print("\n预测结果已保存到 advanced_predictions_nn_ensemble.csv")
 
     # 打印最终总结
     print("\n" + "=" * 50)
-    print("先进特征工程模型训练完成！")
+    print("先进特征工程模型训练完成 (多尺度神经网络集群)！")
     print("=" * 50)
     print(f"最佳F1阈值: {results['threshold']:.4f}")
     print(f"测试集性能:")
@@ -759,3 +893,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
