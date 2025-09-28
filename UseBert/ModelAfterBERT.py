@@ -19,7 +19,7 @@ from scipy import sparse
 from scipy.stats import skew, kurtosis
 # --- 导入聚类和异常检测用于特征工程 ---
 from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestRegressor
 # --- 导入先进的特征工程库 ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
@@ -48,10 +48,10 @@ class AdvancedFeatureEngineer:
     """
     先进的特征工程管道，包含：
     1. 多种预处理技术
-    2. 统计特征生成
-    3. 聚类特征
-    4. 异常检测特征
-    5. 取消降维技术组合
+    2. 统计特征生成 (已取消)
+    3. 聚类特征 (已取消)
+    4. 异常检测特征 (已取消)
+    5. 使用随机森林进行降维，但保留向量完整性
     6. 取消智能特征选择
     """
 
@@ -60,26 +60,25 @@ class AdvancedFeatureEngineer:
                  scaler_type='robust',  # 'standard', 'robust', 'quantile', 'power', 'minmax'
                  power_method='yeo-johnson',  # PowerTransformer method
 
-                 # 统计特征参数
-                 create_statistical_features=True,
+                 # 统计特征参数 (已取消)
+                 create_statistical_features=False,  # 设置为False以取消
                  rolling_windows=[3, 5, 10],  # 滚动统计窗口
 
-                 # 聚类特征参数
-                 create_cluster_features=True,
+                 # 聚类特征参数 (已取消)
+                 create_cluster_features=False,  # 设置为False以取消
                  n_clusters_kmeans=10,
                  dbscan_eps=0.5,
                  dbscan_min_samples=5,
 
-                 # 异常检测特征参数
-                 create_anomaly_features=True,
+                 # 异常检测特征参数 (已取消)
+                 create_anomaly_features=False,  # 设置为False以取消
                  isolation_contamination=0.1,
                  lof_n_neighbors=20,
 
-                 # 取消降维参数
-                 use_multiple_decomposition=False,  # 设置为False以取消降维
-                 svd_components=50,
-                 ica_components=30,
-                 fa_components=20,
+                 # 降维参数 (使用随机森林)
+                 use_rf_decomposition=True,  # 启用随机森林降维
+                 rf_n_components=50,  # 保留的特征数量
+                 rf_random_state=SEED,
 
                  # 取消特征选择参数
                  variance_threshold=0.01,
@@ -101,10 +100,9 @@ class AdvancedFeatureEngineer:
         self.create_anomaly_features = create_anomaly_features
         self.isolation_contamination = isolation_contamination
         self.lof_n_neighbors = lof_n_neighbors
-        self.use_multiple_decomposition = use_multiple_decomposition  # 降维已取消
-        self.svd_components = svd_components
-        self.ica_components = ica_components
-        self.fa_components = fa_components
+        self.use_rf_decomposition = use_rf_decomposition  # 启用随机森林降维
+        self.rf_n_components = rf_n_components
+        self.rf_random_state = rf_random_state
         self.variance_threshold = variance_threshold
         self.univariate_k_best = univariate_k_best  # 特征选择已取消
         self.rf_n_features_to_select = rf_n_features_to_select  # 特征选择已取消
@@ -114,18 +112,18 @@ class AdvancedFeatureEngineer:
         self.imputer_num = None
         self.scaler = None
         self.power_transformer = None
-        self.kmeans = None
-        self.dbscan = None
-        self.isolation_forest = None
-        self.lof = None
-        # 取消降维组件
-        self.svd = None
-        self.ica = None
-        self.fa = None
+        # 取消聚类和异常检测组件
+        # self.kmeans = None
+        # self.dbscan = None
+        # self.isolation_forest = None
+        # self.lof = None
+        # 降维组件
+        self.rf_regressor = None
+        self.selected_rf_features_ = None
         # 取消特征选择组件
-        self.variance_selector = None
-        self.univariate_selector = None
-        self.rf_selector = None
+        # self.variance_selector = None
+        # self.univariate_selector = None
+        # self.rf_selector = None
 
         # 记录特征信息
         self.original_feature_names = []  # 原始DataFrame列名
@@ -306,118 +304,25 @@ class AdvancedFeatureEngineer:
         return X_imputed_df
 
     def _create_statistical_features(self, X_dense):
-        """创建统计特征"""
+        """创建统计特征 (已取消)"""
         if not self.create_statistical_features:
             return X_dense
-
-        print("  -> 创建统计特征...")
-        stat_features = []
-
-        stat_features.append(np.mean(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.std(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.max(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.min(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.median(X_dense, axis=1, keepdims=True))
-
-        stat_features.append(skew(X_dense, axis=1).reshape(-1, 1))
-        stat_features.append(kurtosis(X_dense, axis=1).reshape(-1, 1))
-
-        stat_features.append(np.percentile(X_dense, 25, axis=1, keepdims=True))
-        stat_features.append(np.percentile(X_dense, 75, axis=1, keepdims=True))
-
-        mean_vals = np.mean(X_dense, axis=1, keepdims=True)
-        std_vals = np.std(X_dense, axis=1, keepdims=True)
-        cv = np.divide(std_vals, mean_vals + 1e-8)
-        stat_features.append(cv)
-
-        stat_features_array = np.concatenate(stat_features, axis=1)
-
-        stat_names = ['row_mean', 'row_std', 'row_max', 'row_min', 'row_median',
-                      'row_skew', 'row_kurtosis', 'row_q25', 'row_q75', 'row_cv']
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(stat_names)
-
-        print(f"    -> 创建了 {stat_features_array.shape[1]} 个统计特征")
-        return np.concatenate([X_dense, stat_features_array], axis=1)
+        # 此处不执行任何操作
+        return X_dense
 
     def _create_cluster_features(self, X_dense):
-        """创建聚类特征"""
+        """创建聚类特征 (已取消)"""
         if not self.create_cluster_features:
             return X_dense
-
-        print("  -> 创建聚类特征...")
-        cluster_features = []
-
-        if self.kmeans is None:
-            self.kmeans = KMeans(n_clusters=self.n_clusters_kmeans,
-                                 random_state=SEED, n_init=10)
-            kmeans_labels = self.kmeans.fit_predict(X_dense)
-        else:
-            kmeans_labels = self.kmeans.predict(X_dense)
-
-        kmeans_distances = self.kmeans.transform(X_dense)
-        cluster_features.append(kmeans_distances)
-
-        if self.dbscan is None:
-            self.dbscan = DBSCAN(eps=self.dbscan_eps,
-                                 min_samples=self.dbscan_min_samples, n_jobs=-1)
-            dbscan_labels = self.dbscan.fit_predict(X_dense)
-        else:
-            dbscan_labels = np.zeros(X_dense.shape[0])
-
-        cluster_features.append(kmeans_labels.reshape(-1, 1))
-        cluster_features.append(dbscan_labels.reshape(-1, 1))
-
-        cluster_features_array = np.concatenate(cluster_features, axis=1)
-
-        cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)]
-        cluster_names.extend(['kmeans_label', 'dbscan_label'])
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(cluster_names)
-
-        print(f"    -> 创建了 {cluster_features_array.shape[1]} 个聚类特征")
-        return np.concatenate([X_dense, cluster_features_array], axis=1)
+        # 此处不执行任何操作
+        return X_dense
 
     def _create_anomaly_features(self, X_dense):
-        """创建异常检测特征"""
+        """创建异常检测特征 (已取消)"""
         if not self.create_anomaly_features:
             return X_dense
-
-        print("  -> 创建异常检测特征...")
-        anomaly_features = []
-
-        if self.isolation_forest is None:
-            self.isolation_forest = IsolationForest(
-                contamination=self.isolation_contamination,
-                random_state=SEED, n_jobs=-1)
-            iso_scores = self.isolation_forest.fit(X_dense).decision_function(X_dense)
-        else:
-            iso_scores = self.isolation_forest.decision_function(X_dense)
-
-        anomaly_features.append(iso_scores.reshape(-1, 1))
-
-        if self.lof is None:
-            self.lof = LocalOutlierFactor(
-                n_neighbors=self.lof_n_neighbors,
-                novelty=True, n_jobs=-1)
-            self.lof.fit(X_dense)
-            lof_scores = self.lof.decision_function(X_dense)
-        else:
-            lof_scores = self.lof.decision_function(X_dense)
-
-        anomaly_features.append(lof_scores.reshape(-1, 1))
-
-        anomaly_features_array = np.concatenate(anomaly_features, axis=1)
-
-        anomaly_names = ['isolation_score', 'lof_score']
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(anomaly_names)
-
-        print(f"    -> 创建了 {anomaly_features_array.shape[1]} 个异常检测特征")
-        return np.concatenate([X_dense, anomaly_features_array], axis=1)
+        # 此处不执行任何操作
+        return X_dense
 
     def fit(self, X, y=None):
         """拟合特征工程管道"""
@@ -559,18 +464,44 @@ class AdvancedFeatureEngineer:
 
         # 3. 高级特征工程 - Initialize modeling feature names with base ones
         self.feature_names_for_modeling = self.final_feature_names_after_processing.copy()
-        print("步骤 3: 高级特征工程...")
-        X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
+        print("步骤 3: 高级特征工程... (已取消统计、聚类、异常检测)")
+        # X_dense = self._create_statistical_features(X_dense) # 已取消
+        # X_dense = self._create_cluster_features(X_dense) # 已取消
+        # X_dense = self._create_anomaly_features(X_dense) # 已取消
 
         print(f"特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 4. 取消多重降维
-        if self.use_multiple_decomposition:
-            print("步骤 4: 多重降维... (已取消)")
+        # 4. 使用随机森林进行降维
+        if self.use_rf_decomposition and y is not None:
+            print("步骤 4: 使用随机森林进行降维...")
+            # 训练一个随机森林回归器来评估特征重要性
+            # 使用 y 作为目标，因为它在 fit 阶段是可用的
+            self.rf_regressor = RandomForestRegressor(
+                n_estimators=100,
+                max_features='sqrt',
+                random_state=self.rf_random_state,
+                n_jobs=-1
+            )
+            print(f"  -> 训练随机森林回归器以计算特征重要性...")
+            self.rf_regressor.fit(X_dense, y)
+
+            # 获取特征重要性并排序
+            importances = self.rf_regressor.feature_importances_
+            indices = np.argsort(importances)[::-1]  # 降序排列
+
+            # 选择前 n 个最重要的特征
+            n_select = min(self.rf_n_components, len(importances))
+            self.selected_rf_features_ = indices[:n_select]
+
+            print(f"  -> 基于随机森林重要性选择 {n_select} 个特征...")
+            X_dense = X_dense[:, self.selected_rf_features_]
+
+            # 更新特征名
+            selected_names = [self.feature_names_for_modeling[i] for i in self.selected_rf_features_]
+            self.feature_names_for_modeling = selected_names
+
         else:
-            print("步骤 4: 多重降维已取消")
+            print("步骤 4: 随机森林降维未启用或目标变量不可用")
 
         # 5. 取消智能特征选择
         print("步骤 5: 智能特征选择... (已取消)")
@@ -739,17 +670,20 @@ class AdvancedFeatureEngineer:
         X_dense = self.scaler.transform(X_dense)
         print(f"  -> transform 阶段，经过 Scaler transform 后的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # Recreate engineered features just like in fit
-        X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
-        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
+        # Skip statistical, cluster, anomaly features as per config
+        print("  -> transform 阶段，高级特征工程... (已取消统计、聚类、异常检测)")
+        # X_dense = self._create_statistical_features(X_dense) # 已取消
+        # X_dense = self._create_cluster_features(X_dense) # 已取消
+        # X_dense = self._create_anomaly_features(X_dense) # 已取消
 
-        # Skip decomposition steps as per config
-        if self.use_multiple_decomposition:
-            print("  -> transform 阶段，多重降维... (已取消)")
+        # Apply random forest dimensionality reduction if fitted
+        if self.use_rf_decomposition and self.selected_rf_features_ is not None:
+            print("  -> transform 阶段，应用随机森林降维...")
+            X_dense = X_dense[:, self.selected_rf_features_]
         else:
-            print("  -> transform 阶段，多重降维已取消")
+            print("  -> transform 阶段，随机森林降维未应用")
+
+        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
         # Skip selection steps as per config
         print("  -> transform 阶段，特征选择... (已取消)")
@@ -917,11 +851,11 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     # 2. 模型训练
     print("\n=== 开始 XGBoost 模型训练 ===")
     print(f"  -> XGBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
-    
+
     # 关键修复：检查特征矩阵行数与标签向量长度是否匹配
     if X_train_engineered.shape[0] == 0:
         raise ValueError("致命错误：XGBoost训练数据特征矩阵行数为0！")
-    
+
     # 新添加：检查特征矩阵行数与标签向量长度是否一致
     if X_train_engineered.shape[0] != len(y_train):
         print(f"警告：特征矩阵行数({X_train_engineered.shape[0]})与标签向量长度({len(y_train)})不匹配")
@@ -931,7 +865,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         X_train_engineered = X_train_engineered[:min_len]
         y_train = y_train[:min_len]
         print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
-    
+
     start_time = time.time()
     xgb_classifier.fit(X_train_engineered, y_train)
     end_time = time.time()
@@ -940,7 +874,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     print("\n=== 开始 CatBoost 模型训练 ===")
     print(f"  -> CatBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
     start_time = time.time()
-    
+
     # 对验证集也进行同样的检查和修复
     X_val_engineered_temp = feature_engineer.transform(X_val)
     if X_val_engineered_temp.shape[0] != len(y_val):
@@ -952,7 +886,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered_temp.shape}, 标签形状: {y_val_temp.shape}")
     else:
         y_val_temp = y_val
-    
+
     cat_classifier.fit(X_train_engineered, y_train, eval_set=(X_val_engineered_temp, y_val_temp),
                        early_stopping_rounds=50)
     end_time = time.time()
@@ -972,7 +906,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     X_val_engineered = X_val_engineered_temp
     y_val_used = y_val_temp
     print(f"  -> 验证集特征工程后形状: {X_val_engineered.shape}")
-    
+
     # 对验证集也进行同样的检查和修复（如果需要）
     if X_val_engineered.shape[0] != len(y_val_used):
         print(f"警告：验证集特征矩阵行数({X_val_engineered.shape[0]})与标签向量长度({len(y_val_used)})不匹配")
@@ -981,7 +915,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         X_val_engineered = X_val_engineered[:min_len_val]
         y_val_used = y_val_used[:min_len_val]
         print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered.shape}, 标签形状: {y_val_used.shape}")
-    
+
     val_proba_xgb = xgb_classifier.predict_proba(X_val_engineered)[:, 1]
     val_proba_cat = cat_classifier.predict_proba(X_val_engineered)[:, 1]
     val_proba_ensemble = (val_proba_xgb + val_proba_cat) / 2.0
@@ -993,7 +927,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     print("\n=== 测试集评估 ===")
     X_test_engineered = feature_engineer.transform(X_test)
     print(f"  -> 测试集特征工程后形状: {X_test_engineered.shape}")
-    
+
     # 对测试集也进行同样的检查和修复
     if X_test_engineered.shape[0] != len(y_test):
         print(f"警告：测试集特征矩阵行数({X_test_engineered.shape[0]})与标签向量长度({len(y_test)})不匹配")
@@ -1004,7 +938,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         print(f"  -> 修复后 - 测试集特征矩阵形状: {X_test_engineered.shape}, 标签形状: {y_test_temp.shape}")
     else:
         y_test_temp = y_test
-    
+
     test_proba_xgb = xgb_classifier.predict_proba(X_test_engineered)[:, 1]
     test_proba_cat = cat_classifier.predict_proba(X_test_engineered)[:, 1]
     test_proba_ensemble = (test_proba_xgb + test_proba_cat) / 2.0
@@ -1079,26 +1013,25 @@ def main():
         'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
         'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
 
-        # 统计特征配置
-        'create_statistical_features': True,
+        # 统计特征配置 (已取消)
+        'create_statistical_features': False,  # 设置为False以取消
         'rolling_windows': [3, 5, 10],
 
-        # 聚类特征配置
-        'create_cluster_features': True,
+        # 聚类特征配置 (已取消)
+        'create_cluster_features': False,  # 设置为False以取消
         'n_clusters_kmeans': 15,  # 增加聚类数量
         'dbscan_eps': 0.3,
         'dbscan_min_samples': 5,
 
-        # 异常检测特征配置
-        'create_anomaly_features': True,
+        # 异常检测特征配置 (已取消)
+        'create_anomaly_features': False,  # 设置为False以取消
         'isolation_contamination': 0.05,  # 假设5%的数据是异常值
         'lof_n_neighbors': 20,
 
-        # 取消多重降维配置
-        'use_multiple_decomposition': False,  # 关闭降维
-        'svd_components': 80,  # 降维已取消
-        'ica_components': 50,  # 降维已取消
-        'fa_components': 30,  # 降维已取消
+        # 降维配置 (使用随机森林)
+        'use_rf_decomposition': True,  # 启用随机森林降维
+        'rf_n_components': 50,  # 保留的特征数量
+        'rf_random_state': SEED,
 
         # 取消特征选择配置
         'variance_threshold': 0.01,  # 特征选择已取消
@@ -1215,7 +1148,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
