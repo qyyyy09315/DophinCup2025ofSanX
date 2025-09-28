@@ -67,13 +67,28 @@ def get_enhanced_bert_embedding(texts, batch_size=32):
         batch_weighted_avg = torch.matmul(attention_weights, last_hidden_states).squeeze(1)
         embeddings_weighted_avg.append(batch_weighted_avg.cpu().numpy())
 
-        # --- 3. 最大池化 ---
+        # --- 3. 最大池化 (修复广播问题) ---
         # 将 padding 位置的值设为极小值，这样在 max 操作中会被忽略
         # extended_attention_mask: [batch_size, seq_len, 1]
-        extended_attention_mask_for_max = extended_attention_mask.transpose(-1, -2).unsqueeze(-1)
+        # 为了正确广播到 [batch_size, seq_len, hidden_size]，我们需要扩展到 [batch_size, seq_len, 1, 1]
+        # 然后 PyTorch 会自动广播 hidden_size 维度
+        extended_attention_mask_for_max = extended_attention_mask.transpose(-1, -2).unsqueeze(-1) # [batch_size, seq_len, 1, 1]
         # 将 last_hidden_states 中 padding 位置的值设为 -inf
+        # last_hidden_states: [batch_size, seq_len, hidden_size]
+        # 我们需要将它扩展为 [batch_size, seq_len, hidden_size, 1] 来匹配掩码的广播维度
+        # 或者更简单地，我们直接在 [batch_size, seq_len, hidden_size] 上应用 [batch_size, seq_len, 1] 的掩码
+        # PyTorch 会自动将 [batch_size, seq_len, 1] 广播到 [batch_size, seq_len, hidden_size]
+        # 因此，我们直接使用 unsqueeze(-1) 后的 [batch_size, seq_len, 1] 作为掩码
+        # 但是 unsqueeze(-1) 是 [batch_size, seq_len, 1]，我们需要的是 [batch_size, seq_len, 1] 广播到 [batch_size, seq_len, hidden_size]
+        # 实际上，unsqueeze(-1) 后是 [batch_size, seq_len, 1]，这正是我们需要的广播形状。
+        # 问题在于之前的 unsqueeze(-1) 是在 [batch_size, 1, seq_len] 上做的，得到了 [batch_size, 1, seq_len, 1]
+        # 正确的做法是先 transpose(-1, -2) 得到 [batch_size, seq_len, 1]，然后再 unsqueeze(-1) 得到 [batch_size, seq_len, 1, 1]
+        # 不过，其实我们只需要 [batch_size, seq_len, 1] 就可以广播到 [batch_size, seq_len, hidden_size]
+        # 所以，正确的掩码应该是:
+        mask_for_max_pooling = extended_attention_mask.transpose(-1, -2) # [batch_size, seq_len, 1]
         last_hidden_states_masked = last_hidden_states.clone()
-        last_hidden_states_masked.masked_fill_(extended_attention_mask_for_max == 0, float('-inf'))
+        # 这里直接使用 [batch_size, seq_len, 1] 的 mask，PyTorch 会自动广播 hidden_size 维度
+        last_hidden_states_masked.masked_fill_(mask_for_max_pooling == 0, float('-inf'))
         # 在序列长度维度 (dim=1) 上取最大值 -> [batch_size, hidden_size]
         batch_max_pool, _ = torch.max(last_hidden_states_masked, dim=1)
         embeddings_max_pool.append(batch_max_pool.cpu().numpy())
@@ -246,7 +261,3 @@ if __name__ == "__main__":
     print(f"处理完成！")
     print(f"训练集增强嵌入已保存至: {train_output_path} (Shape: {train_processed.shape})")
     print(f"测试集增强嵌入已保存至: {test_output_path} (Shape: {test_processed.shape})")
-
-
-
-
