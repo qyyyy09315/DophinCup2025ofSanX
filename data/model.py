@@ -1,23 +1,18 @@
-import os
-os.environ["OMP_NUM_THREADS"] = "24"
-os.environ["MKL_NUM_THREADS"] = "24"
-os.environ["OPENBLAS_NUM_THREADS"] = "24"
-os.environ["NUMEXPR_NUM_THREADS"] = "24"
+import pickle
+
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.feature_selection import SelectKBest, f_classif  # 更宽容的特征选择
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, f_classif  # 更宽容的特征选择
-import xgboost as xgb
 from sklearn.utils.validation import check_X_y
-from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
-import pickle
 
 
 # --- 修改后的深度森林：不生成新特征 ---
