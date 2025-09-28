@@ -1,3 +1,8 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "24"
+os.environ["MKL_NUM_THREADS"] = "24"
+os.environ["OPENBLAS_NUM_THREADS"] = "24"
+os.environ["NUMEXPR_NUM_THREADS"] = "24"
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN

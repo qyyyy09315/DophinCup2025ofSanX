@@ -798,8 +798,8 @@ class AdaptiveSampler:
             target_majority_count = n_majority
         elif self.strategy == 'hybrid':
             # 混合策略：轻微下采样多数类，轻微上采样少数类
-            reduction_factor = 0.8  # 将多数类减少到原来的80%
-            increase_factor = 1.2  # 将少数类增加到原来的120%
+            reduction_factor = 0.6  # 将多数类减少到原来的80%
+            increase_factor = 1.4  # 将少数类增加到原来的120%
             target_majority_count = int(n_majority * reduction_factor)
             target_minority_count = int(n_minority * increase_factor)
         else:
@@ -1171,7 +1171,7 @@ def main():
 
         # 特征选择配置 (使用随机森林) - 已启用
         'use_rf_selection': True,  # 启用特征选择
-        'rf_n_features_to_select': 150,  # 选择150个非向量特征
+        'rf_n_features_to_select': 80,  # 选择非向量特征
         'rf_selection_random_state': SEED,
 
         # 输出格式
