@@ -27,6 +27,10 @@ from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransfo
 # --- 导入 XGBoost 和 CatBoost ---
 from xgboost import XGBClassifier
 
+# --- 新增: 导入用于自适应采样的库 ---
+from sklearn.utils import resample
+from collections import Counter
+
 warnings.filterwarnings('ignore')
 
 # 环境配置
@@ -740,6 +744,103 @@ class AdvancedFeatureEngineer:
         return self.fit(X, y).transform(X)
 
 
+# --- 新增: 自适应采样策略类 ---
+class AdaptiveSampler:
+    """
+    实现多种自适应采样策略来处理不平衡数据集。
+    """
+
+    def __init__(self, strategy='smote', random_state=SEED, **kwargs):
+        """
+        初始化采样器。
+
+        :param strategy: 采样策略 ('undersample', 'oversample', 'hybrid')
+        :param random_state: 随机种子
+        :param kwargs: 其他参数，例如 n_samples_ratio (oversample/undersample 比例)
+        """
+        self.strategy = strategy.lower()
+        self.random_state = random_state
+        self.kwargs = kwargs
+        self.original_class_distribution = None
+
+    def fit_resample(self, X, y):
+        """
+        根据指定策略对数据进行采样。
+
+        :param X: 特征数据 (DataFrame 或 array)
+        :param y: 标签数据 (array)
+        :return: 采样后的 X_resampled, y_resampled
+        """
+        print(f"\n=== 使用自适应采样策略: {self.strategy.upper()} ===")
+        self.original_class_distribution = Counter(y)
+        print(f"原始类别分布: {dict(self.original_class_distribution)}")
+
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        y_series = pd.Series(y)
+
+        # 计算目标样本比例
+        n_samples_ratio = self.kwargs.get('n_samples_ratio', 1.0)  # 默认平衡到1:1
+        majority_class = max(self.original_class_distribution, key=self.original_class_distribution.get)
+        minority_class = min(self.original_class_distribution, key=self.original_class_distribution.get)
+        n_minority = self.original_class_distribution[minority_class]
+        n_majority = self.original_class_distribution[majority_class]
+
+        if self.strategy == 'undersample':
+            target_majority_count = int(n_minority * n_samples_ratio)
+            target_minority_count = n_minority
+        elif self.strategy == 'oversample':
+            target_minority_count = int(n_majority * n_samples_ratio)
+            target_majority_count = n_majority
+        elif self.strategy == 'hybrid':
+            # 混合策略：轻微下采样多数类，轻微上采样少数类
+            reduction_factor = 0.8  # 将多数类减少到原来的80%
+            increase_factor = 1.2   # 将少数类增加到原来的120%
+            target_majority_count = int(n_majority * reduction_factor)
+            target_minority_count = int(n_minority * increase_factor)
+        else:
+            raise ValueError(f"不支持的采样策略: {self.strategy}")
+
+        print(f"目标采样后类别分布: {minority_class}: {target_minority_count}, {majority_class}: {target_majority_count}")
+
+        # 分离多数类和少数类
+        df_majority = X_df[y_series == majority_class].copy()
+        df_minority = X_df[y_series == minority_class].copy()
+        df_majority['target'] = majority_class
+        df_minority['target'] = minority_class
+
+        # 执行采样
+        if self.strategy in ['undersample', 'hybrid']:
+            df_majority_downsampled = resample(df_majority,
+                                               replace=False,
+                                               n_samples=target_majority_count,
+                                               random_state=self.random_state)
+            print(f"  -> 下采样多数类: {len(df_majority)} -> {len(df_majority_downsampled)}")
+        else:
+            df_majority_downsampled = df_majority
+
+        if self.strategy in ['oversample', 'hybrid']:
+            df_minority_upsampled = resample(df_minority,
+                                             replace=True,
+                                             n_samples=target_minority_count,
+                                             random_state=self.random_state)
+            print(f"  -> 上采样少数类: {len(df_minority)} -> {len(df_minority_upsampled)}")
+        else:
+            df_minority_upsampled = df_minority
+
+        # 合并采样后的数据
+        df_resampled = pd.concat([df_majority_downsampled, df_minority_upsampled])
+        df_resampled = df_resampled.sample(frac=1, random_state=self.random_state).reset_index(drop=True) # Shuffle
+
+        X_resampled = df_resampled.drop('target', axis=1)
+        y_resampled = df_resampled['target'].values
+
+        final_distribution = Counter(y_resampled)
+        print(f"采样后最终类别分布: {dict(final_distribution)}")
+        print("=" * 40)
+
+        return X_resampled, y_resampled
+
+
 # --- 其他函数保持不变 ---
 
 def save_model(model, filename):
@@ -836,9 +937,19 @@ def ensemble_predict_proba(models, X):
     return avg_proba
 
 
-def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
-    """使用先进特征工程的训练评估流程"""
+def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
+                                feature_engineer_params=None, sampler_params=None):
+    """使用先进特征工程和自适应采样的训练评估流程"""
     print("\n=== 构建先进特征工程管道 ===")
+
+    # --- 新增: 初始化并应用自适应采样 ---
+    if sampler_params:
+        sampler = AdaptiveSampler(**sampler_params)
+        X_train_resampled, y_train_resampled = sampler.fit_resample(X_train, y_train)
+        print(f"训练集采样后形状: X={X_train_resampled.shape}, y={y_train_resampled.shape}")
+    else:
+        X_train_resampled, y_train_resampled = X_train, y_train
+        print("未使用自适应采样。")
 
     # 特征工程
     feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
@@ -853,7 +964,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         random_state=SEED,
         n_jobs=-1,
         eval_metric='logloss',
-        scale_pos_weight=1.0 / np.mean(y_train),  # 关注少数类
+        scale_pos_weight=1.0 / np.mean(y_train_resampled),  # 关注少数类
         verbosity=1
     )
 
@@ -866,41 +977,41 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         random_strength=0.8,
         random_seed=SEED,
         verbose=False,
-        class_weights=[1.0, 1.0 / np.mean(y_train)],  # 关注少数类
+        class_weights=[1.0, 1.0 / np.mean(y_train_resampled)],  # 关注少数类
         eval_metric='Logloss'
     )
 
     # 1. 拟合特征工程器
     print("\n=== 拟合特征工程器 ===")
-    feature_engineer.fit(X_train, y_train)
-    X_train_engineered = feature_engineer.transform(X_train)
+    feature_engineer.fit(X_train_resampled, y_train_resampled)
+    X_train_engineered = feature_engineer.transform(X_train_resampled)
     print(f"  -> 训练集特征工程后形状: {X_train_engineered.shape}")
 
     # 2. 模型训练
     print("\n=== 开始 XGBoost 模型训练 ===")
-    print(f"  -> XGBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
+    print(f"  -> XGBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
 
     # 关键修复：检查特征矩阵行数与标签向量长度是否匹配
     if X_train_engineered.shape[0] == 0:
         raise ValueError("致命错误：XGBoost训练数据特征矩阵行数为0！")
 
     # 新添加：检查特征矩阵行数与标签向量长度是否一致
-    if X_train_engineered.shape[0] != len(y_train):
-        print(f"警告：特征矩阵行数({X_train_engineered.shape[0]})与标签向量长度({len(y_train)})不匹配")
+    if X_train_engineered.shape[0] != len(y_train_resampled):
+        print(f"警告：特征矩阵行数({X_train_engineered.shape[0]})与标签向量长度({len(y_train_resampled)})不匹配")
         # 尝试修复：截断较长的一方以匹配较短的一方
-        min_len = min(X_train_engineered.shape[0], len(y_train))
+        min_len = min(X_train_engineered.shape[0], len(y_train_resampled))
         print(f"  -> 截断数据，保持行数一致: {min_len}")
         X_train_engineered = X_train_engineered[:min_len]
-        y_train = y_train[:min_len]
-        print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
+        y_train_resampled = y_train_resampled[:min_len]
+        print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
 
     start_time = time.time()
-    xgb_classifier.fit(X_train_engineered, y_train)
+    xgb_classifier.fit(X_train_engineered, y_train_resampled)
     end_time = time.time()
     print(f"XGBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
 
     print("\n=== 开始 CatBoost 模型训练 ===")
-    print(f"  -> CatBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
+    print(f"  -> CatBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
     start_time = time.time()
 
     # 对验证集也进行同样的检查和修复
@@ -915,7 +1026,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
     else:
         y_val_temp = y_val
 
-    cat_classifier.fit(X_train_engineered, y_train, eval_set=(X_val_engineered_temp, y_val_temp),
+    cat_classifier.fit(X_train_engineered, y_train_resampled, eval_set=(X_val_engineered_temp, y_val_temp),
                        early_stopping_rounds=50)
     end_time = time.time()
     print(f"CatBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
@@ -1024,7 +1135,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
             'threshold': threshold_high_recall
         },
         'trained_model': trained_pipeline,
-        'individual_models': [xgb_classifier, cat_classifier]
+        'individual_models': [xgb_classifier, cat_classifier],
+        'sampler': sampler if sampler_params else None # 保存采样器
     }
 
 
@@ -1054,6 +1166,14 @@ def main():
         # 输出格式
         'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
     }
+
+    # --- 新增: 配置自适应采样参数 ---
+    sampler_params = {
+        'strategy': 'hybrid',  # 'undersample', 'oversample', 'hybrid'
+        'n_samples_ratio': 1.0, # 目标多数类/少数类的比例
+        'random_state': SEED
+    }
+    print(f"使用的自适应采样参数: {sampler_params}")
 
     # 数据加载
     print("\n=== 数据加载 ===")
@@ -1100,7 +1220,8 @@ def main():
     try:
         results = train_and_evaluate_advanced(
             X_train, y_train, X_val, y_val, X_test, y_test,
-            feature_engineer_params=feature_engineer_params
+            feature_engineer_params=feature_engineer_params,
+            sampler_params=sampler_params # 传递采样参数
         )
     except Exception as e:
         print(f"训练流程发生错误: {e}")
