@@ -14,9 +14,9 @@ import torch
 from catboost import CatBoostClassifier
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
-# --- 导入聚类和异常检测用于特征工程 ---
-from sklearn.ensemble import RandomForestRegressor
 # --- 导入先进的特征工程库 ---
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier  # 导入 RandomForestClassifier
+# --- 导入预处理 ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
                              precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
@@ -42,11 +42,8 @@ class AdvancedFeatureEngineer:
     """
     先进的特征工程管道，包含：
     1. 多种预处理技术
-    2. 统计特征生成 (已取消)
-    3. 聚类特征 (已取消)
-    4. 异常检测特征 (已取消)
-    5. 使用随机森林进行降维，但保留向量完整性
-    6. 取消智能特征选择
+    2. 使用随机森林进行降维（可选）
+    3. 使用随机森林进行特征选择（可选，仅对非向量特征）
     """
 
     def __init__(self,
@@ -54,30 +51,15 @@ class AdvancedFeatureEngineer:
                  scaler_type='robust',  # 'standard', 'robust', 'quantile', 'power', 'minmax'
                  power_method='yeo-johnson',  # PowerTransformer method
 
-                 # 统计特征参数 (已取消)
-                 create_statistical_features=False,  # 设置为False以取消
-                 rolling_windows=[3, 5, 10],  # 滚动统计窗口
-
-                 # 聚类特征参数 (已取消)
-                 create_cluster_features=False,  # 设置为False以取消
-                 n_clusters_kmeans=10,
-                 dbscan_eps=0.5,
-                 dbscan_min_samples=5,
-
-                 # 异常检测特征参数 (已取消)
-                 create_anomaly_features=False,  # 设置为False以取消
-                 isolation_contamination=0.1,
-                 lof_n_neighbors=20,
-
                  # 降维参数 (使用随机森林)
-                 use_rf_decomposition=True,  # 启用随机森林降维
+                 use_rf_decomposition=False,  # 默认关闭降维
                  rf_n_components=50,  # 保留的特征数量
                  rf_random_state=SEED,
 
-                 # 取消特征选择参数
-                 variance_threshold=0.01,
-                 univariate_k_best=None,  # 设置为None以取消单变量选择
-                 rf_n_features_to_select=None,  # 设置为None以取消随机森林选择
+                 # 特征选择参数 (使用随机森林)
+                 use_rf_selection=True,  # 启用随机森林特征选择
+                 rf_n_features_to_select=100,  # 选择的特征数量，默认100
+                 rf_selection_random_state=SEED,
 
                  # 输出格式
                  force_sparse_output=False):  # 改为False，因为高级特征工程通常产生密集特征
@@ -85,39 +67,24 @@ class AdvancedFeatureEngineer:
         # 存储参数
         self.scaler_type = scaler_type
         self.power_method = power_method
-        self.create_statistical_features = create_statistical_features
-        self.rolling_windows = rolling_windows
-        self.create_cluster_features = create_cluster_features
-        self.n_clusters_kmeans = n_clusters_kmeans
-        self.dbscan_eps = dbscan_eps
-        self.dbscan_min_samples = dbscan_min_samples
-        self.create_anomaly_features = create_anomaly_features
-        self.isolation_contamination = isolation_contamination
-        self.lof_n_neighbors = lof_n_neighbors
-        self.use_rf_decomposition = use_rf_decomposition  # 启用随机森林降维
+        self.use_rf_decomposition = use_rf_decomposition
         self.rf_n_components = rf_n_components
         self.rf_random_state = rf_random_state
-        self.variance_threshold = variance_threshold
-        self.univariate_k_best = univariate_k_best  # 特征选择已取消
-        self.rf_n_features_to_select = rf_n_features_to_select  # 特征选择已取消
+        self.use_rf_selection = use_rf_selection
+        self.rf_n_features_to_select = rf_n_features_to_select
+        self.rf_selection_random_state = rf_selection_random_state
         self.force_sparse_output = force_sparse_output
 
         # 初始化组件
         self.imputer_num = None
         self.scaler = None
         self.power_transformer = None
-        # 取消聚类和异常检测组件
-        # self.kmeans = None
-        # self.dbscan = None
-        # self.isolation_forest = None
-        # self.lof = None
         # 降维组件
         self.rf_regressor = None
         self.selected_rf_features_ = None
-        # 取消特征选择组件
-        # self.variance_selector = None
-        # self.univariate_selector = None
-        # self.rf_selector = None
+        # 特征选择组件
+        self.rf_selector = None
+        self.selected_features_indices_ = None  # 用于记录最终选择的特征索引
 
         # 记录特征信息
         self.original_feature_names = []  # 原始DataFrame列名
@@ -297,27 +264,6 @@ class AdvancedFeatureEngineer:
                 f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值/空向量/全NaN向量/维度不匹配向量。")
         return X_imputed_df
 
-    def _create_statistical_features(self, X_dense):
-        """创建统计特征 (已取消)"""
-        if not self.create_statistical_features:
-            return X_dense
-        # 此处不执行任何操作
-        return X_dense
-
-    def _create_cluster_features(self, X_dense):
-        """创建聚类特征 (已取消)"""
-        if not self.create_cluster_features:
-            return X_dense
-        # 此处不执行任何操作
-        return X_dense
-
-    def _create_anomaly_features(self, X_dense):
-        """创建异常检测特征 (已取消)"""
-        if not self.create_anomaly_features:
-            return X_dense
-        # 此处不执行任何操作
-        return X_dense
-
     def fit(self, X, y=None):
         """拟合特征工程管道"""
         print("开始高级特征工程拟合...")
@@ -459,16 +405,13 @@ class AdvancedFeatureEngineer:
 
         # 3. 高级特征工程 - Initialize modeling feature names with base ones
         self.feature_names_for_modeling = self.final_feature_names_after_processing.copy()
-        print("步骤 3: 高级特征工程... (已取消统计、聚类、异常检测)")
-        # X_dense = self._create_statistical_features(X_dense) # 已取消
-        # X_dense = self._create_cluster_features(X_dense) # 已取消
-        # X_dense = self._create_anomaly_features(X_dense) # 已取消
+        print("步骤 3: 高级特征工程... (无额外统计、聚类、异常检测步骤)")
 
         print(f"特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 4. 使用随机森林进行降维
+        # 4. 使用随机森林进行降维 (可选)
         if self.use_rf_decomposition and y is not None:
-            print("步骤 4: 使用随机森林进行降维...")
+            print("步骤 4 (可选): 使用随机森林进行降维...")
             # 训练一个随机森林回归器来评估特征重要性
             # 使用 y 作为目标，因为它在 fit 阶段是可用的
             self.rf_regressor = RandomForestRegressor(
@@ -506,10 +449,88 @@ class AdvancedFeatureEngineer:
             self.feature_names_for_modeling = selected_names
 
         else:
-            print("步骤 4: 随机森林降维未启用或目标变量不可用")
+            print("步骤 4 (可选): 随机森林降维未启用或目标变量不可用")
 
-        # 5. 取消智能特征选择
-        print("步骤 5: 智能特征选择... (已取消)")
+        # 5. 使用随机森林进行特征选择 (可选)
+        if self.use_rf_selection and y is not None:
+            print("步骤 5 (可选): 使用随机森林进行特征选择...")
+
+            # 识别非向量特征的索引
+            non_vector_feature_indices = []
+            non_vector_feature_names = []
+            for i, name in enumerate(self.feature_names_for_modeling):
+                # 检查是否是向量特征（以 _emb_vector 结尾）
+                is_vector_feature = any(name.startswith(prefix) and name.endswith("_emb_vector")
+                                        for prefix in self.vector_expanded_feature_map.keys())
+                if not is_vector_feature:
+                    non_vector_feature_indices.append(i)
+                    non_vector_feature_names.append(name)
+
+            if not non_vector_feature_indices:
+                print("  -> 没有找到非向量特征，跳过特征选择。")
+            else:
+                print(f"  -> 识别出 {len(non_vector_feature_indices)} 个非向量特征用于选择。")
+
+                # 提取非向量特征
+                X_non_vector = X_dense[:, non_vector_feature_indices]
+
+                # 训练随机森林分类器
+                self.rf_selector = RandomForestClassifier(
+                    n_estimators=100,
+                    max_features='sqrt',
+                    random_state=self.rf_selection_random_state,
+                    n_jobs=-1,
+                    class_weight='balanced'  # 处理不平衡数据
+                )
+                print(f"  -> 训练随机森林分类器以计算特征重要性...")
+
+                # 再次检查X_non_vector和y的行数
+                if X_non_vector.shape[0] != len(y):
+                    print(f"  -> 警告：非向量特征矩阵行数({X_non_vector.shape[0]})与标签向量长度({len(y)})不匹配")
+                    min_len = min(X_non_vector.shape[0], len(y))
+                    print(f"  -> 截断数据，保持行数一致: {min_len}")
+                    X_non_vector_selected = X_non_vector[:min_len]
+                    y_selected = y[:min_len]
+                else:
+                    X_non_vector_selected = X_non_vector
+                    y_selected = y
+
+                self.rf_selector.fit(X_non_vector_selected, y_selected)
+
+                # 获取特征重要性并排序
+                importances = self.rf_selector.feature_importances_
+                indices = np.argsort(importances)[::-1]  # 降序排列
+
+                # 选择前 n 个最重要的特征 (非向量)
+                n_select = min(self.rf_n_features_to_select, len(importances))
+                selected_non_vector_indices_local = indices[:n_select]  # 本地索引
+
+                # 转换为全局特征索引
+                selected_non_vector_indices_global = [non_vector_feature_indices[i] for i in
+                                                      selected_non_vector_indices_local]
+
+                # 识别向量特征的全局索引
+                vector_feature_indices_global = [i for i, name in enumerate(self.feature_names_for_modeling)
+                                                 if any(name.startswith(prefix) and name.endswith("_emb_vector")
+                                                        for prefix in self.vector_expanded_feature_map.keys())]
+
+                # 合并最终选择的特征索引 (向量特征 + 选择的非向量特征)，并排序以保持顺序
+                self.selected_features_indices_ = sorted(
+                    vector_feature_indices_global + selected_non_vector_indices_global)
+
+                print(f"  -> 保留所有 {len(vector_feature_indices_global)} 个向量特征。")
+                print(f"  -> 基于随机森林重要性选择了 {len(selected_non_vector_indices_global)} 个非向量特征。")
+                print(f"  -> 最终特征总数: {len(self.selected_features_indices_)}")
+
+                # 应用特征选择
+                X_dense = X_dense[:, self.selected_features_indices_]
+
+                # 更新特征名
+                selected_names = [self.feature_names_for_modeling[i] for i in self.selected_features_indices_]
+                self.feature_names_for_modeling = selected_names
+
+        else:
+            print("步骤 5 (可选): 随机森林特征选择未启用或目标变量不可用")
 
         # 记录最终特征数
         self.final_feature_count_after_engineering_ = X_dense.shape[1]
@@ -677,10 +698,7 @@ class AdvancedFeatureEngineer:
         print(f"  -> transform 阶段，经过 Scaler transform 后的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
         # Skip statistical, cluster, anomaly features as per config
-        print("  -> transform 阶段，高级特征工程... (已取消统计、聚类、异常检测)")
-        # X_dense = self._create_statistical_features(X_dense) # 已取消
-        # X_dense = self._create_cluster_features(X_dense) # 已取消
-        # X_dense = self._create_anomaly_features(X_dense) # 已取消
+        print("  -> transform 阶段，高级特征工程... (无额外统计、聚类、异常检测步骤)")
 
         # Apply random forest dimensionality reduction if fitted
         if self.use_rf_decomposition and self.selected_rf_features_ is not None:
@@ -689,10 +707,14 @@ class AdvancedFeatureEngineer:
         else:
             print("  -> transform 阶段，随机森林降维未应用")
 
-        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
+        # Apply random forest feature selection if fitted
+        if self.use_rf_selection and self.selected_features_indices_ is not None:
+            print("  -> transform 阶段，应用随机森林特征选择...")
+            X_dense = X_dense[:, self.selected_features_indices_]
+        else:
+            print("  -> transform 阶段，随机森林特征选择未应用")
 
-        # Skip selection steps as per config
-        print("  -> transform 阶段，特征选择... (已取消)")
+        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
         # Final consistency check enforced strictly
         if self.final_feature_count_after_engineering_ is not None:
@@ -1019,30 +1041,15 @@ def main():
         'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
         'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
 
-        # 统计特征配置 (已取消)
-        'create_statistical_features': False,  # 设置为False以取消
-        'rolling_windows': [3, 5, 10],
-
-        # 聚类特征配置 (已取消)
-        'create_cluster_features': False,  # 设置为False以取消
-        'n_clusters_kmeans': 15,  # 增加聚类数量
-        'dbscan_eps': 0.3,
-        'dbscan_min_samples': 5,
-
-        # 异常检测特征配置 (已取消)
-        'create_anomaly_features': False,  # 设置为False以取消
-        'isolation_contamination': 0.05,  # 假设5%的数据是异常值
-        'lof_n_neighbors': 20,
-
-        # 降维配置 (使用随机森林)
-        'use_rf_decomposition': True,  # 启用随机森林降维
-        'rf_n_components': 50,  # 保留的特征数量
+        # 降维配置 (使用随机森林) - 已关闭
+        'use_rf_decomposition': False,  # 关闭降维
+        'rf_n_components': 50,
         'rf_random_state': SEED,
 
-        # 取消特征选择配置
-        'variance_threshold': 0.01,  # 特征选择已取消
-        'univariate_k_best': None,  # 取消单变量选择
-        'rf_n_features_to_select': None,  # 取消随机森林选择
+        # 特征选择配置 (使用随机森林) - 已启用
+        'use_rf_selection': True,  # 启用特征选择
+        'rf_n_features_to_select': 150,  # 选择150个非向量特征
+        'rf_selection_random_state': SEED,
 
         # 输出格式
         'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
@@ -1053,32 +1060,7 @@ def main():
     try:
         # 实际读取方式如下所示，请替换为你自己的路径
         data = pd.read_parquet('train_bert_enhanced_embedded_hier.parquet')
-        # --- 模拟数据用于测试 ---
-        # np.random.seed(SEED)
-        # n_samples = 1000
-        # n_emb_features_per_group = 10
-        # n_other_features = 5
-        #
-        # # 创建模拟嵌入特征组
-        # emb_data = {}
-        # for i in range(2):  # 2个嵌入组
-        #     for j in range(n_emb_features_per_group):
-        #         # 添加一些NaN来模拟缺失值
-        #         vals = np.random.randn(n_samples)
-        #         if j % 10 == 0:  # 每10个特征让一个有缺失
-        #             vals[np.random.choice(n_samples, size=int(0.05 * n_samples), replace=False)] = np.nan
-        #         emb_data[f"group_{i}_emb_{j}"] = vals
-        #
-        # # 创建其他特征
-        # other_data = {f"other_feature_{i}": np.random.randn(n_samples) for i in range(n_other_features)}
-        #
-        # # 创建目标变量
-        # y_data = np.random.binomial(1, 0.1, n_samples)  # 不平衡数据
-        #
-        # # 合并数据
-        # all_data = {**emb_data, **other_data, "target": y_data}
-        # data = pd.DataFrame(all_data)
-        # --- 模拟数据结束 ---
+
 
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
@@ -1154,6 +1136,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
