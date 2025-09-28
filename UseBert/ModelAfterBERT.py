@@ -744,7 +744,7 @@ class AdvancedFeatureEngineer:
         return self.fit(X, y).transform(X)
 
 
-# --- 新增: 自适应采样策略类 ---
+# --- 修改: 自适应采样策略类 ---
 class AdaptiveSampler:
     """
     实现多种自适应采样策略来处理不平衡数据集。
@@ -775,8 +775,13 @@ class AdaptiveSampler:
         self.original_class_distribution = Counter(y)
         print(f"原始类别分布: {dict(self.original_class_distribution)}")
 
+        # 确保 X 是 DataFrame，y 是 Series，并且它们共享相同的索引
         X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
-        y_series = pd.Series(y)
+        y_series = pd.Series(y) if not isinstance(y, pd.Series) else y.copy()
+
+        # 重置索引以确保对齐
+        X_df.reset_index(drop=True, inplace=True)
+        y_series.reset_index(drop=True, inplace=True)
 
         # 计算目标样本比例
         n_samples_ratio = self.kwargs.get('n_samples_ratio', 1.0)  # 默认平衡到1:1
@@ -794,17 +799,23 @@ class AdaptiveSampler:
         elif self.strategy == 'hybrid':
             # 混合策略：轻微下采样多数类，轻微上采样少数类
             reduction_factor = 0.8  # 将多数类减少到原来的80%
-            increase_factor = 1.2   # 将少数类增加到原来的120%
+            increase_factor = 1.2  # 将少数类增加到原来的120%
             target_majority_count = int(n_majority * reduction_factor)
             target_minority_count = int(n_minority * increase_factor)
         else:
             raise ValueError(f"不支持的采样策略: {self.strategy}")
 
-        print(f"目标采样后类别分布: {minority_class}: {target_minority_count}, {majority_class}: {target_majority_count}")
+        print(
+            f"目标采样后类别分布: {minority_class}: {target_minority_count}, {majority_class}: {target_majority_count}")
 
-        # 分离多数类和少数类
-        df_majority = X_df[y_series == majority_class].copy()
-        df_minority = X_df[y_series == minority_class].copy()
+        # 分离多数类和少数类，使用 loc 进行安全的选择
+        majority_mask = (y_series == majority_class)
+        minority_mask = (y_series == minority_class)
+
+        df_majority = X_df.loc[majority_mask].copy()
+        df_minority = X_df.loc[minority_mask].copy()
+
+        # 添加目标列
         df_majority['target'] = majority_class
         df_minority['target'] = minority_class
 
@@ -829,7 +840,7 @@ class AdaptiveSampler:
 
         # 合并采样后的数据
         df_resampled = pd.concat([df_majority_downsampled, df_minority_upsampled])
-        df_resampled = df_resampled.sample(frac=1, random_state=self.random_state).reset_index(drop=True) # Shuffle
+        df_resampled = df_resampled.sample(frac=1, random_state=self.random_state).reset_index(drop=True)  # Shuffle
 
         X_resampled = df_resampled.drop('target', axis=1)
         y_resampled = df_resampled['target'].values
@@ -1136,7 +1147,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
         },
         'trained_model': trained_pipeline,
         'individual_models': [xgb_classifier, cat_classifier],
-        'sampler': sampler if sampler_params else None # 保存采样器
+        'sampler': sampler if sampler_params else None  # 保存采样器
     }
 
 
@@ -1170,7 +1181,7 @@ def main():
     # --- 新增: 配置自适应采样参数 ---
     sampler_params = {
         'strategy': 'hybrid',  # 'undersample', 'oversample', 'hybrid'
-        'n_samples_ratio': 1.0, # 目标多数类/少数类的比例
+        'n_samples_ratio': 1.0,  # 目标多数类/少数类的比例
         'random_state': SEED
     }
     print(f"使用的自适应采样参数: {sampler_params}")
@@ -1180,7 +1191,6 @@ def main():
     try:
         # 实际读取方式如下所示，请替换为你自己的路径
         data = pd.read_parquet('train_bert_enhanced_embedded_hier.parquet')
-
 
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
@@ -1221,7 +1231,7 @@ def main():
         results = train_and_evaluate_advanced(
             X_train, y_train, X_val, y_val, X_test, y_test,
             feature_engineer_params=feature_engineer_params,
-            sampler_params=sampler_params # 传递采样参数
+            sampler_params=sampler_params  # 传递采样参数
         )
     except Exception as e:
         print(f"训练流程发生错误: {e}")
@@ -1257,3 +1267,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
