@@ -11,11 +11,10 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from catboost import CatBoostClassifier
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
 # --- 导入先进的特征工程库 ---
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier  # 导入 RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor
 # --- 导入预处理 ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
@@ -24,12 +23,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
                                    PowerTransformer, MinMaxScaler)
-# --- 导入 XGBoost 和 CatBoost ---
-from xgboost import XGBClassifier
-
 # --- 新增: 导入用于自适应采样的库 ---
 from sklearn.utils import resample
 from collections import Counter
+
+# --- 新增: 导入深度森林库 ---
+try:
+    from deepforest import CascadeForestClassifier
+except ImportError:
+    print("错误：未安装 'deep-forest' 库。请先运行 'pip install deep-forest'")
+    raise
 
 warnings.filterwarnings('ignore')
 
@@ -479,12 +482,11 @@ class AdvancedFeatureEngineer:
                 X_non_vector = X_dense[:, non_vector_feature_indices]
 
                 # 训练随机森林分类器
-                self.rf_selector = RandomForestClassifier(
+                self.rf_selector = RandomForestRegressor(
                     n_estimators=100,
                     max_features='sqrt',
                     random_state=self.rf_selection_random_state,
-                    n_jobs=-1,
-                    class_weight='balanced'  # 处理不平衡数据
+                    n_jobs=-1
                 )
                 print(f"  -> 训练随机森林分类器以计算特征重要性...")
 
@@ -965,32 +967,41 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
     # 特征工程
     feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
 
-    # XGBoost 模型 - 关注少数类
-    xgb_classifier = XGBClassifier(
-        n_estimators=1000,
-        max_depth=10,
-        learning_rate=0.01,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=SEED,
-        n_jobs=-1,
-        eval_metric='logloss',
-        scale_pos_weight=1.0 / np.mean(y_train_resampled),  # 关注少数类
-        verbosity=1
-    )
+    # --- 替换为深度森林模型 ---
+    print("\n=== 初始化深度森林模型 ===")
+    # CascadeForestClassifier 参数说明:
+    # n_estimators: 每层森林中的树的数量
+    # n_trees: 同 n_estimators
+    # max_depth: 树的最大深度
+    # min_samples_split: 分割内部节点所需的最小样本数
+    # min_samples_leaf: 叶子节点上的最小样本数
+    # use_predictor: 是否使用最终的全局预测器（如 Logistic Regression）
+    # predictor_kwargs: 传递给全局预测器的参数
+    # n_tolerant_rounds: 触发早停的容忍轮数
+    # delta: 性能提升小于delta时触发早停
+    # backend: 使用的后端 ('sklearn', 'torch')
+    # n_jobs: 并行作业数 (-1 表示使用所有处理器)
+    # random_state: 随机种子
 
-    # CatBoost 模型 - 关注少数类
-    cat_classifier = CatBoostClassifier(
-        iterations=1000,
-        depth=10,
-        learning_rate=0.01,
-        subsample=0.8,
-        random_strength=0.8,
-        random_seed=SEED,
-        verbose=False,
-        class_weights=[1.0, 1.0 / np.mean(y_train_resampled)],  # 关注少数类
-        eval_metric='Logloss'
+    # 注意: CascadeForestClassifier 是一个集成学习框架，
+    # 它本身包含了多层随机森林，因此不需要像之前那样单独训练两个模型再融合。
+
+    # 示例配置 (您可以根据需要调整这些超参数)
+    deep_forest_classifier = CascadeForestClassifier(
+        n_estimators=4,  # 每层森林的估计器数量 (默认4)
+        n_layers=5,  # 级联层数量 (默认不限制，直到早停)
+        max_depth=None,  # 树的最大深度 (None表示不限制)
+        min_samples_split=2,  # 分割所需最小样本数
+        min_samples_leaf=1,  # 叶子节点最小样本数
+        use_predictor=True,  # 使用最终的全局预测器 (如LR)
+        predictor_kwargs={'C': 1.0},  # 全局预测器参数
+        n_tolerant_rounds=2,  # 早停容忍轮数
+        delta=1e-5,  # 早停性能提升阈值
+        backend='sklearn',  # 使用 scikit-learn 后端
+        n_jobs=-1,  # 使用全部 CPU 核心
+        random_state=SEED  # 固定随机种子
     )
+    print(f"深度森林模型初始化完毕:\n{deep_forest_classifier}")
 
     # 1. 拟合特征工程器
     print("\n=== 拟合特征工程器 ===")
@@ -999,12 +1010,12 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
     print(f"  -> 训练集特征工程后形状: {X_train_engineered.shape}")
 
     # 2. 模型训练
-    print("\n=== 开始 XGBoost 模型训练 ===")
-    print(f"  -> XGBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
+    print("\n=== 开始深度森林模型训练 ===")
+    print(f"  -> 深度森林输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
 
     # 关键修复：检查特征矩阵行数与标签向量长度是否匹配
     if X_train_engineered.shape[0] == 0:
-        raise ValueError("致命错误：XGBoost训练数据特征矩阵行数为0！")
+        raise ValueError("致命错误：深度森林训练数据特征矩阵行数为0！")
 
     # 新添加：检查特征矩阵行数与标签向量长度是否一致
     if X_train_engineered.shape[0] != len(y_train_resampled):
@@ -1017,61 +1028,43 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
         print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
 
     start_time = time.time()
-    xgb_classifier.fit(X_train_engineered, y_train_resampled)
+    # 深度森林直接调用 fit 方法即可
+    deep_forest_classifier.fit(X_train_engineered, y_train_resampled)
     end_time = time.time()
-    print(f"XGBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
+    print(f"深度森林模型训练耗时: {end_time - start_time:.2f} 秒")
 
-    print("\n=== 开始 CatBoost 模型训练 ===")
-    print(f"  -> CatBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
-    start_time = time.time()
-
-    # 对验证集也进行同样的检查和修复
-    X_val_engineered_temp = feature_engineer.transform(X_val)
-    if X_val_engineered_temp.shape[0] != len(y_val):
-        print(f"警告：验证集特征矩阵行数({X_val_engineered_temp.shape[0]})与标签向量长度({len(y_val)})不匹配")
-        min_len_val = min(X_val_engineered_temp.shape[0], len(y_val))
-        print(f"  -> 截断验证集数据，保持行数一致: {min_len_val}")
-        X_val_engineered_temp = X_val_engineered_temp[:min_len_val]
-        y_val_temp = y_val[:min_len_val]
-        print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered_temp.shape}, 标签形状: {y_val_temp.shape}")
-    else:
-        y_val_temp = y_val
-
-    cat_classifier.fit(X_train_engineered, y_train_resampled, eval_set=(X_val_engineered_temp, y_val_temp),
-                       early_stopping_rounds=50)
-    end_time = time.time()
-    print(f"CatBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
-
-    # 3. 保存模型
+    # 3. 保存模型 (注意: CascadeForestClassifier 可能需要特殊处理才能pickle)
     trained_pipeline = Pipeline([
         ('feature_engineer', feature_engineer),
-        ('xgb_classifier', xgb_classifier),
-        ('cat_classifier', cat_classifier)
+        ('classifier', deep_forest_classifier)
     ])
-    save_model(trained_pipeline, 'advanced_feature_engineering_ensemble_model.pkl')
+    try:
+        save_model(trained_pipeline, 'advanced_feature_engineering_deep_forest_model.pkl')
+    except Exception as e:
+        print(f"警告：模型保存失败: {e}. 尝试只保存特征工程器...")
+        save_model(feature_engineer, 'advanced_feature_engineering_only.pkl')
+        print("如果您需要完整的模型，请手动序列化 CascadeForestClassifier。")
 
     # 4. 验证集阈值选择
     print("\n=== 验证集阈值选择 ===")
-    # 使用之前修复过的验证集特征工程数据，而不是重新生成
-    X_val_engineered = X_val_engineered_temp
-    y_val_used = y_val_temp
+    X_val_engineered = feature_engineer.transform(X_val)
     print(f"  -> 验证集特征工程后形状: {X_val_engineered.shape}")
 
     # 对验证集也进行同样的检查和修复（如果需要）
-    if X_val_engineered.shape[0] != len(y_val_used):
-        print(f"警告：验证集特征矩阵行数({X_val_engineered.shape[0]})与标签向量长度({len(y_val_used)})不匹配")
-        min_len_val = min(X_val_engineered.shape[0], len(y_val_used))
+    if X_val_engineered.shape[0] != len(y_val):
+        print(f"警告：验证集特征矩阵行数({X_val_engineered.shape[0]})与标签向量长度({len(y_val)})不匹配")
+        min_len_val = min(X_val_engineered.shape[0], len(y_val))
         print(f"  -> 截断验证集数据，保持行数一致: {min_len_val}")
         X_val_engineered = X_val_engineered[:min_len_val]
-        y_val_used = y_val_used[:min_len_val]
+        y_val_used = y_val[:min_len_val]
         print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered.shape}, 标签形状: {y_val_used.shape}")
+    else:
+        y_val_used = y_val
 
-    val_proba_xgb = xgb_classifier.predict_proba(X_val_engineered)[:, 1]
-    val_proba_cat = cat_classifier.predict_proba(X_val_engineered)[:, 1]
-    val_proba_ensemble = (val_proba_xgb + val_proba_cat) / 2.0
+    val_proba = deep_forest_classifier.predict_proba(X_val_engineered)[:, 1]
 
-    threshold_f1 = find_best_f1_threshold(y_val_used, val_proba_ensemble)
-    threshold_high_recall = find_threshold_for_max_recall(y_val_used, val_proba_ensemble, min_precision=0.4)
+    threshold_f1 = find_best_f1_threshold(y_val_used, val_proba)
+    threshold_high_recall = find_threshold_for_max_recall(y_val_used, val_proba, min_precision=0.4)
 
     # 5. 测试集评估
     print("\n=== 测试集评估 ===")
@@ -1089,15 +1082,13 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
     else:
         y_test_temp = y_test
 
-    test_proba_xgb = xgb_classifier.predict_proba(X_test_engineered)[:, 1]
-    test_proba_cat = cat_classifier.predict_proba(X_test_engineered)[:, 1]
-    test_proba_ensemble = (test_proba_xgb + test_proba_cat) / 2.0
+    test_proba = deep_forest_classifier.predict_proba(X_test_engineered)[:, 1]
 
     # F1优化阈值评估
     print("\n--- 使用 F1 优化阈值评估 ---")
-    y_pred_f1 = (test_proba_ensemble >= threshold_f1).astype(int)
+    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
     recall_f1 = recall_score(y_test_temp, y_pred_f1)
-    auc_f1 = roc_auc_score(y_test_temp, test_proba_ensemble)
+    auc_f1 = roc_auc_score(y_test_temp, test_proba)
     precision_f1 = precision_score(y_test_temp, y_pred_f1)
     f1_f1 = f1_score(y_test_temp, y_pred_f1)
     accuracy_f1 = accuracy_score(y_test_temp, y_pred_f1)
@@ -1111,9 +1102,9 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
 
     # 高召回率阈值评估
     print("\n--- 使用高召回率阈值评估 ---")
-    y_pred_hr = (test_proba_ensemble >= threshold_high_recall).astype(int)
+    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
     recall_hr = recall_score(y_test_temp, y_pred_hr)
-    auc_hr = roc_auc_score(y_test_temp, test_proba_ensemble)
+    auc_hr = roc_auc_score(y_test_temp, test_proba)
     precision_hr = precision_score(y_test_temp, y_pred_hr)
     f1_hr = f1_score(y_test_temp, y_pred_hr)
     accuracy_hr = accuracy_score(y_test_temp, y_pred_hr)
@@ -1127,8 +1118,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
 
     # 可视化评估结果
     print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test_temp, test_proba_ensemble, threshold_f1, threshold_high_recall,
-                      model_name="Advanced Feature Engineering Ensemble (XGBoost & CatBoost)")
+    evaluate_and_plot(y_test_temp, test_proba, threshold_f1, threshold_high_recall,
+                      model_name="Advanced Feature Engineering Deep Forest")
 
     return {
         'recall': recall_f1,
@@ -1136,7 +1127,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
         'precision': precision_f1,
         'f1': f1_f1,
         'accuracy': accuracy_f1,
-        'y_proba': test_proba_ensemble,
+        'y_proba': test_proba,
         'y_pred': y_pred_f1,
         'threshold': threshold_f1,
         'high_recall_results': {
@@ -1146,7 +1137,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
             'threshold': threshold_high_recall
         },
         'trained_model': trained_pipeline,
-        'individual_models': [xgb_classifier, cat_classifier],
+        'individual_models': [deep_forest_classifier],  # 单一模型
         'sampler': sampler if sampler_params else None  # 保存采样器
     }
 
@@ -1267,6 +1258,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

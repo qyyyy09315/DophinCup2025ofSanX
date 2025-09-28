@@ -170,7 +170,7 @@ if __name__ == "__main__":
 
     # 9. 初始化深度森林（不生成新特征）
     base_enhanced_df = EnhancedDeepForest(
-        n_estimators=1000,
+        n_estimators=800,
         max_layers=5,  # 可适当减少
         min_delta=0.0005,
         random_state=42
@@ -178,7 +178,7 @@ if __name__ == "__main__":
     enhanced_df = CascadeForestWrapper(base_enhanced_df)
 
     # 10. 构建集成模型
-    adaboost = AdaBoostClassifier(n_estimators=100, algorithm='SAMME', random_state=42)
+    adaboost = AdaBoostClassifier(n_estimators=700, algorithm='SAMME', random_state=42)
     stacking_model = StackingClassifier(
         estimators=[
             ('enhanced_df', enhanced_df),
