@@ -1,12 +1,12 @@
+import os
 import pickle
-
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
-from sklearn.feature_selection import SelectKBest, f_classif  # 更宽容的特征选择
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score
 from sklearn.model_selection import train_test_split
@@ -14,6 +14,13 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y
 
+# --- 设置环境变量以控制底层库的线程数 ---
+# 针对 8 核 CPU，设置为 6 是一个相对安全且能利用多核优势的选择
+# 避免设置过高导致系统资源冲突
+os.environ["OMP_NUM_THREADS"] = "6"
+os.environ["MKL_NUM_THREADS"] = "6"
+os.environ["OPENBLAS_NUM_THREADS"] = "6"
+os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
 # --- 修改后的深度森林：不生成新特征 ---
 class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
@@ -35,9 +42,11 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         self.n_features_in_ = None
 
     def _create_base_estimators(self):
+        # 显式设置 n_jobs=2，避免使用全部核心
+        # 在8核CPU上，两个这样的基学习器并行运行比较安全
         return [
-            RandomForestClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=-1),
-            ExtraTreesClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=-1)
+            RandomForestClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=2),
+            ExtraTreesClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=2)
         ]
 
     def fit(self, X, y):
@@ -174,13 +183,14 @@ if __name__ == "__main__":
 
     # 10. 构建集成模型
     adaboost = AdaBoostClassifier(n_estimators=700, algorithm='SAMME', random_state=42)
+    # 显式设置 StackingClassifier 的 n_jobs=2，避免使用全部核心
     stacking_model = StackingClassifier(
         estimators=[
             ('enhanced_df', enhanced_df),
             ('adaboost', adaboost)
         ],
         final_estimator=GaussianNB(),
-        n_jobs=-1,
+        n_jobs=2,  # 修改点：从 -1 改为 2
         cv=3
     )
 
@@ -207,3 +217,6 @@ if __name__ == "__main__":
     print(f"精确率 (Precision): {precision:.6f}")
     print(f"最终评分:          {final_score:.6f}")
     print("=" * 50)
+
+
+
