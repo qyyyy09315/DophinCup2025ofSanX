@@ -11,27 +11,21 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from imblearn.combine import SMOTETomek
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
+from catboost import CatBoostClassifier
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
-from scipy.stats import skew, kurtosis
 # --- 导入聚类和异常检测用于特征工程 ---
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest, RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor
 # --- 导入先进的特征工程库 ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
                              precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
                                    PowerTransformer, MinMaxScaler)
 # --- 导入 XGBoost 和 CatBoost ---
 from xgboost import XGBClassifier
-from catboost import CatBoostClassifier
 
 warnings.filterwarnings('ignore')
 
@@ -380,7 +374,8 @@ class AdvancedFeatureEngineer:
                                 validated_vectors.append(np.zeros(expected_dim_count))
 
                         try:
-                            expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                            expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims,
+                                                       index=X_imputed_df.index)
                             expanded_dfs.append(expanded_df)
                             print(f"      -> 成功展开 '{col}' 为 {len(expected_dims)} 个特征。")
                         except Exception as e:
@@ -483,6 +478,16 @@ class AdvancedFeatureEngineer:
                 n_jobs=-1
             )
             print(f"  -> 训练随机森林回归器以计算特征重要性...")
+
+            # 关键修复：确保X_dense和y的行数一致
+            if X_dense.shape[0] != len(y):
+                print(f"  -> 警告：特征矩阵行数({X_dense.shape[0]})与标签向量长度({len(y)})不匹配")
+                min_len = min(X_dense.shape[0], len(y))
+                print(f"  -> 截断数据，保持行数一致: {min_len}")
+                X_dense = X_dense[:min_len]
+                y = y[:min_len]
+                print(f"  -> 修复后 - 特征矩阵形状: {X_dense.shape}, 标签形状: {y.shape}")
+
             self.rf_regressor.fit(X_dense, y)
 
             # 获取特征重要性并排序
@@ -565,13 +570,14 @@ class AdvancedFeatureEngineer:
                             validated_vectors.append(np.zeros(expected_dim_count))
 
                     try:
-                        expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                        expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims, index=X_imputed_df.index)
                         expanded_dfs.append(expanded_df)
                         print(f"      -> Transform: 成功展开 '{vec_col_name}' 为 {len(expected_dims)} 个特征。")
                     except Exception as e:
                         print(f"      -> Transform: 错误: 无法从列 '{vec_col_name}' 创建DataFrame ({e})，添加零列。")
                         # Add zero columns as fallback
-                        zero_df = pd.DataFrame(np.zeros((len(X), expected_dim_count)), columns=expected_dims)
+                        zero_df = pd.DataFrame(np.zeros((len(X), expected_dim_count)), columns=expected_dims,
+                                               index=X.index)
                         expanded_dfs.append(zero_df)
                 else:
                     print(f"    -> Transform: 警告: 向量列 '{vec_col_name}' 在transform数据中不存在。")
@@ -817,7 +823,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # XGBoost 模型 - 关注少数类
     xgb_classifier = XGBClassifier(
-        n_estimators=500,
+        n_estimators=1000,
         max_depth=10,
         learning_rate=0.01,
         subsample=0.8,
@@ -831,7 +837,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # CatBoost 模型 - 关注少数类
     cat_classifier = CatBoostClassifier(
-        iterations=500,
+        iterations=1000,
         depth=10,
         learning_rate=0.01,
         subsample=0.8,
@@ -1046,7 +1052,7 @@ def main():
     print("\n=== 数据加载 ===")
     try:
         # 实际读取方式如下所示，请替换为你自己的路径
-        data = pd.read_parquet('train_bert_embedded.parquet')
+        data = pd.read_parquet('train_bert_enhanced_embedded_hier.parquet')
         # --- 模拟数据用于测试 ---
         # np.random.seed(SEED)
         # n_samples = 1000
