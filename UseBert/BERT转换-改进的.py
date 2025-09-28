@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F # For softmax
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
 import os
@@ -18,67 +19,177 @@ tokenizer = BertTokenizer.from_pretrained(local_model_path)
 model = BertModel.from_pretrained(local_model_path).to(device)
 model.eval()
 
-
-# === 2. 简化版 BERT 嵌入函数（仅使用 [CLS] 向量）===
-def get_bert_embedding(texts, batch_size=32):
+# === 2. 改进的 BERT 嵌入函数（结合多种池化策略）===
+def get_enhanced_bert_embedding(texts, batch_size=32):
     """
-    使用 BERT 模型为文本列表生成嵌入向量。
-    仅使用 [CLS] token 的最后一层隐藏状态作为句向量。
+    使用 BERT 模型为文本列表生成增强的嵌入向量。
+    结合 [CLS] 向量、加权平均池化和最大池化。
     """
-    embeddings = []
+    embeddings_cls = []
+    embeddings_weighted_avg = []
+    embeddings_max_pool = []
 
-    for i in tqdm(range(0, len(texts), batch_size), desc="Generating BERT embeddings"):
+    for i in tqdm(range(0, len(texts), batch_size), desc="Generating Enhanced BERT embeddings"):
         batch_texts = texts[i:i + batch_size]
-        # padding=True, truncation=True 是关键参数
         inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt").to(device)
 
         with torch.no_grad():
             outputs = model(**inputs)
+            last_hidden_states = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+            attention_mask = inputs['attention_mask']        # [batch_size, seq_len]
 
-        # 使用 [CLS] token 的向量 ([:, 0, :]) 作为整个句子的表示
-        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        embeddings.append(batch_embeddings)
+        # --- 1. [CLS] Token 向量 ---
+        batch_embeddings_cls = last_hidden_states[:, 0, :].cpu().numpy() # [batch_size, hidden_size]
+        embeddings_cls.append(batch_embeddings_cls)
 
-    # 将所有批次的嵌入向量拼接成一个大的 numpy 数组
-    final_embeddings = np.concatenate(embeddings, axis=0)
-    return final_embeddings
+        # --- 2. 加权平均池化 (Attention-based) ---
+        # 使用 [CLS] token 的向量作为查询 (query) 来计算注意力分数
+        # query: [batch_size, 1, hidden_size]
+        query = last_hidden_states[:, :1, :]
+        # key: [batch_size, seq_len, hidden_size]
+        key = last_hidden_states
+
+        # 计算注意力分数 (点积) -> [batch_size, 1, seq_len]
+        attention_scores = torch.matmul(query, key.transpose(-1, -2))
+
+        # 应用 softmax 获取权重 -> [batch_size, 1, seq_len]
+        # 需要将 attention_mask 扩展维度以适应 softmax
+        extended_attention_mask = attention_mask.unsqueeze(1).float() # [batch_size, 1, seq_len]
+        # 将 mask 为 0 的位置设置为一个极大的负数，使 softmax 后接近 0
+        attention_scores = attention_scores.masked_fill(extended_attention_mask == 0, -1e9)
+        attention_weights = F.softmax(attention_scores, dim=-1) # [batch_size, 1, seq_len]
+
+        # 计算加权平均 -> [batch_size, 1, hidden_size] -> squeeze(1) -> [batch_size, hidden_size]
+        batch_weighted_avg = torch.matmul(attention_weights, last_hidden_states).squeeze(1)
+        embeddings_weighted_avg.append(batch_weighted_avg.cpu().numpy())
+
+        # --- 3. 最大池化 ---
+        # 将 padding 位置的值设为极小值，这样在 max 操作中会被忽略
+        # extended_attention_mask: [batch_size, seq_len, 1]
+        extended_attention_mask_for_max = extended_attention_mask.transpose(-1, -2).unsqueeze(-1)
+        # 将 last_hidden_states 中 padding 位置的值设为 -inf
+        last_hidden_states_masked = last_hidden_states.clone()
+        last_hidden_states_masked.masked_fill_(extended_attention_mask_for_max == 0, float('-inf'))
+        # 在序列长度维度 (dim=1) 上取最大值 -> [batch_size, hidden_size]
+        batch_max_pool, _ = torch.max(last_hidden_states_masked, dim=1)
+        embeddings_max_pool.append(batch_max_pool.cpu().numpy())
+
+    # --- 4. 拼接所有策略的向量 ---
+    final_embeddings_cls = np.concatenate(embeddings_cls, axis=0)
+    final_embeddings_weighted_avg = np.concatenate(embeddings_weighted_avg, axis=0)
+    final_embeddings_max_pool = np.concatenate(embeddings_max_pool, axis=0)
+
+    # 将三种向量拼接在一起，形成最终的增强向量
+    enhanced_embeddings = np.concatenate(
+        [final_embeddings_cls, final_embeddings_weighted_avg, final_embeddings_max_pool],
+        axis=1
+    )
+    return enhanced_embeddings
 
 
-# === 3. 数据处理函数 ===
+# === 3. 行业层次结构处理函数 ===
+def process_industry_hierarchy(df):
+    """
+    根据行业层次结构，为每个样本生成一个增强的行业嵌入向量。
+    规则：优先使用最具体的行业级别（L4 -> L3 -> L2 -> L1）。
+    """
+    print("Processing industry hierarchy...")
+    # 定义行业列的优先级
+    industry_cols = ['industry_l4_name', 'industry_l3_name', 'industry_l2_name', 'industry_l1_name']
+    # 筛选出实际存在于 DataFrame 中的行业列
+    existing_industry_cols = [col for col in industry_cols if col in df.columns]
+    if not existing_industry_cols:
+        print("  No industry columns found in DataFrame.")
+        return None
+
+    # 存储每个级别的嵌入结果
+    level_embeddings = {}
+
+    # 为每个存在的行业级别列生成嵌入
+    for col in existing_industry_cols:
+        print(f"  Generating embeddings for {col}...")
+        texts = df[col].fillna("").tolist()
+        # 为该级别的所有文本生成嵌入
+        level_emb = get_enhanced_bert_embedding(texts, batch_size=32)
+        level_embeddings[col] = level_emb
+
+    # 初始化最终的行业嵌入矩阵 (样本数 x 嵌入维度)
+    # 使用第一个处理的级别的嵌入维度来初始化
+    first_level_key = existing_industry_cols[0]
+    embedding_dim = level_embeddings[first_level_key].shape[1]
+    final_industry_embeddings = np.zeros((len(df), embedding_dim))
+
+    # 标记哪些样本已经找到了有效的行业嵌入
+    assigned = np.zeros(len(df), dtype=bool)
+
+    # 按优先级顺序（从最具体到最宽泛）填充嵌入
+    # existing_industry_cols 已经是按 L4->L3->L2->L1 排序
+    for col in existing_industry_cols:
+        print(f"  Assigning embeddings from {col}...")
+        col_data = df[col]
+        # 找到该列中非空且尚未被更具体级别填充的样本索引
+        valid_indices = (~assigned) & (col_data.notna()) & (col_data != "")
+
+        # 将这些样本的嵌入向量赋值给最终结果矩阵
+        final_industry_embeddings[valid_indices] = level_embeddings[col][valid_indices]
+        # 标记这些样本已被处理
+        assigned[valid_indices] = True
+
+    # 对于没有任何行业信息的样本，其嵌入向量将保持为零向量
+
+    print("  Industry hierarchy processing complete.")
+    return final_industry_embeddings
+
+
+# === 4. 主数据处理函数 ===
 def process_data(df, df_name=""):
     """
-    处理单个 DataFrame，为指定列生成 BERT 嵌入。
+    处理单个 DataFrame，为指定列生成 BERT 嵌入，并处理行业层次结构。
     """
     print(f"--- Processing {df_name} ---")
-    # 需要生成嵌入的中文列名
+    # 需要生成嵌入的中文列名（不包括行业列，行业列单独处理）
     chinese_columns = [
-        'province', 'city', 'industry_l1_name', 'industry_l2_name',
-        'industry_l3_name', 'industry_l4_name', 'legal_person',
+         'province', 'city', 'legal_person',
         'business_scope', 'company_type', 'tags', 'company_on_scale', 'honor_titles',
         'sci_tech_ent_tags', 'top100_tags'
     ]
+    # 行业列名
+    industry_columns = [
+        'industry_l1_name', 'industry_l2_name',
+        'industry_l3_name', 'industry_l4_name'
+    ]
 
     # 筛选出实际存在于 DataFrame 中的列
-    valid_cols = [col for col in chinese_columns if col in df.columns]
-    # 选出不需要生成嵌入的其他列
-    non_chinese_cols = [col for col in df.columns if col not in chinese_columns]
+    valid_chinese_cols = [col for col in chinese_columns if col in df.columns]
+    valid_industry_cols = [col for col in industry_columns if col in df.columns]
+    # 选出不需要生成嵌入的其他列 (既不是中文列也不是行业列)
+    other_cols = [col for col in df.columns if col not in chinese_columns and col not in industry_columns]
 
-    # 创建一个只包含非中文列的 DataFrame 作为基础
-    result_df = df[non_chinese_cols].copy()
+    # 创建一个只包含其他列的 DataFrame 作为基础
+    result_df = df[other_cols].copy()
 
-    # 为每个有效的中文列生成嵌入
+    # --- 处理行业层次结构 ---
+    if valid_industry_cols:
+        industry_embeddings = process_industry_hierarchy(df)
+        if industry_embeddings is not None:
+            industry_emb_df = pd.DataFrame(
+                industry_embeddings,
+                columns=[f"industry_hier_emb_{i}" for i in range(industry_embeddings.shape[1])]
+            )
+            result_df = pd.concat([result_df, industry_emb_df], axis=1)
+    else:
+        print("  No industry columns to process for hierarchy.")
+
+    # --- 为其他中文列生成增强嵌入 ---
     embed_dfs = []
-    for col in valid_cols:
+    for col in valid_chinese_cols:
         print(f"  Processing column: {col}")
-        # 处理缺失值，用空字符串填充
         texts = df[col].fillna("").tolist()
-        # 获取嵌入向量
-        embeddings = get_bert_embedding(texts, batch_size=32)
+        embeddings = get_enhanced_bert_embedding(texts, batch_size=32)
 
-        # 将嵌入向量转换为 DataFrame，列名加上前缀以便区分
         embed_df = pd.DataFrame(
             embeddings,
-            columns=[f"{col}_emb_{i}" for i in range(embeddings.shape[1])]
+            columns=[f"{col}_enhanced_emb_{i}" for i in range(embeddings.shape[1])]
         )
         embed_dfs.append(embed_df)
 
@@ -90,12 +201,21 @@ def process_data(df, df_name=""):
     return result_df
 
 
-# === 4. 主执行流程 ===
+# === 5. 主执行流程 ===
 if __name__ == "__main__":
     # --- 读取数据 ---
     print("Loading data...")
-    train_df = pd.read_csv("../data/train.csv")
-    test_df = pd.read_csv("../data/test.csv")
+    # 请根据你的实际文件路径修改
+    train_csv_path = "../data/train.csv"
+    test_csv_path = "../data/test.csv"
+
+    if not os.path.exists(train_csv_path):
+         raise FileNotFoundError(f"训练数据文件 {train_csv_path} 不存在。")
+    if not os.path.exists(test_csv_path):
+         raise FileNotFoundError(f"测试数据文件 {test_csv_path} 不存在。")
+
+    train_df = pd.read_csv(train_csv_path)
+    test_df = pd.read_csv(test_csv_path)
     print(f"Train data shape: {train_df.shape}")
     print(f"Test data shape: {test_df.shape}")
 
@@ -107,15 +227,16 @@ if __name__ == "__main__":
 
     # --- 保存为 Parquet 格式 ---
     print("Saving results to Parquet files...")
-    train_output_path = "train_bert_embedded2.parquet"
-    test_output_path = "test_bert_embedded2.parquet"
+    # 输出文件路径
+    train_output_path = "train_bert_enhanced_embedded.parquet"
+    test_output_path = "test_bert_enhanced_embedded.parquet"
 
     train_processed.to_parquet(train_output_path, index=False)
     test_processed.to_parquet(test_output_path, index=False)
 
     print(f"处理完成！")
-    print(f"训练集嵌入已保存至: {train_output_path} (Shape: {train_processed.shape})")
-    print(f"测试集嵌入已保存至: {test_output_path} (Shape: {test_processed.shape})")
+    print(f"训练集增强嵌入已保存至: {train_output_path} (Shape: {train_processed.shape})")
+    print(f"测试集增强嵌入已保存至: {test_output_path} (Shape: {test_processed.shape})")
 
 
 
