@@ -19,6 +19,10 @@ tokenizer = BertTokenizer.from_pretrained(local_model_path)
 model = BertModel.from_pretrained(local_model_path).to(device)
 model.eval()
 
+HIDDEN_SIZE = model.config.hidden_size
+# 假设增强嵌入是 [CLS], Weighted Avg, Max Pool 的拼接，所以是 3 倍
+ENHANCED_EMBEDDING_SIZE = HIDDEN_SIZE * 3
+
 # === 2. 改进的 BERT 嵌入函数（结合多种池化策略）===
 def get_enhanced_bert_embedding(texts, batch_size=32):
     """
@@ -87,57 +91,60 @@ def get_enhanced_bert_embedding(texts, batch_size=32):
     return enhanced_embeddings
 
 
-# === 3. 行业层次结构处理函数 ===
+# === 3. 行业层次结构处理函数 (针对指定四列) ===
 def process_industry_hierarchy(df):
     """
-    根据行业层次结构，为每个样本生成一个增强的行业嵌入向量。
+    根据指定的行业层次结构四列，为每个样本生成一个增强的行业嵌入向量。
     规则：优先使用最具体的行业级别（L4 -> L3 -> L2 -> L1）。
     """
-    print("Processing industry hierarchy...")
-    # 定义行业列的优先级
-    industry_cols = ['industry_l4_name', 'industry_l3_name', 'industry_l2_name', 'industry_l1_name']
-    # 筛选出实际存在于 DataFrame 中的行业列
-    existing_industry_cols = [col for col in industry_cols if col in df.columns]
-    if not existing_industry_cols:
-        print("  No industry columns found in DataFrame.")
+    print("Processing industry hierarchy for specified columns...")
+    # 定义行业列的优先级和名称 (严格按照 L4 -> L3 -> L2 -> L1)
+    industry_hierarchy_cols = ['industry_l4_name', 'industry_l3_name', 'industry_l2_name', 'industry_l1_name']
+
+    # 检查这些列是否在 DataFrame 中
+    available_industry_cols = [col for col in industry_hierarchy_cols if col in df.columns]
+    if not available_industry_cols:
+        print("  None of the specified industry columns found in DataFrame.")
         return None
 
     # 存储每个级别的嵌入结果
     level_embeddings = {}
 
-    # 为每个存在的行业级别列生成嵌入
-    for col in existing_industry_cols:
+    # 为每个可用的行业级别列生成嵌入
+    for col in available_industry_cols:
         print(f"  Generating embeddings for {col}...")
         texts = df[col].fillna("").tolist()
         # 为该级别的所有文本生成嵌入
         level_emb = get_enhanced_bert_embedding(texts, batch_size=32)
         level_embeddings[col] = level_emb
 
-    # 初始化最终的行业嵌入矩阵 (样本数 x 嵌入维度)
-    # 使用第一个处理的级别的嵌入维度来初始化
-    first_level_key = existing_industry_cols[0]
-    embedding_dim = level_embeddings[first_level_key].shape[1]
-    final_industry_embeddings = np.zeros((len(df), embedding_dim))
+    # 初始化最终的行业嵌入矩阵 (样本数 x 增强嵌入维度)
+    final_industry_embeddings = np.zeros((len(df), ENHANCED_EMBEDDING_SIZE))
 
     # 标记哪些样本已经找到了有效的行业嵌入
     assigned = np.zeros(len(df), dtype=bool)
 
     # 按优先级顺序（从最具体到最宽泛）填充嵌入
-    # existing_industry_cols 已经是按 L4->L3->L2->L1 排序
-    for col in existing_industry_cols:
+    # industry_hierarchy_cols 已经是按 L4->L3->L2->L1 排序
+    for col in industry_hierarchy_cols: # 遍历指定的四列
+        if col not in available_industry_cols:
+             print(f"    Column {col} not found, skipping.")
+             continue
+
         print(f"  Assigning embeddings from {col}...")
         col_data = df[col]
         # 找到该列中非空且尚未被更具体级别填充的样本索引
-        valid_indices = (~assigned) & (col_data.notna()) & (col_data != "")
+        # 注意：使用 ~assigned 来确保优先级高的列先赋值
+        valid_indices = (~assigned) & (col_data.notna()) & (col_data.str.strip() != "")
 
         # 将这些样本的嵌入向量赋值给最终结果矩阵
         final_industry_embeddings[valid_indices] = level_embeddings[col][valid_indices]
         # 标记这些样本已被处理
         assigned[valid_indices] = True
 
-    # 对于没有任何行业信息的样本，其嵌入向量将保持为零向量
+    # 对于没有任何有效行业信息的样本，其嵌入向量将保持为零向量
 
-    print("  Industry hierarchy processing complete.")
+    print("  Industry hierarchy processing for specified columns complete.")
     return final_industry_embeddings
 
 
@@ -153,23 +160,25 @@ def process_data(df, df_name=""):
         'business_scope', 'company_type', 'tags', 'company_on_scale', 'honor_titles',
         'sci_tech_ent_tags', 'top100_tags'
     ]
-    # 行业列名
+    # 行业列名 (用于从chinese_columns中排除)
     industry_columns = [
         'industry_l1_name', 'industry_l2_name',
         'industry_l3_name', 'industry_l4_name'
     ]
 
-    # 筛选出实际存在于 DataFrame 中的列
+    # 筛选出实际存在于 DataFrame 中的非行业中文列
     valid_chinese_cols = [col for col in chinese_columns if col in df.columns]
-    valid_industry_cols = [col for col in industry_columns if col in df.columns]
+    # 检查行业列是否存在于 DataFrame 中
+    available_industry_cols = [col for col in industry_columns if col in df.columns]
     # 选出不需要生成嵌入的其他列 (既不是中文列也不是行业列)
     other_cols = [col for col in df.columns if col not in chinese_columns and col not in industry_columns]
 
     # 创建一个只包含其他列的 DataFrame 作为基础
     result_df = df[other_cols].copy()
 
-    # --- 处理行业层次结构 ---
-    if valid_industry_cols:
+    # --- 处理指定的行业层次结构 ---
+    # 只要DataFrame中包含任何指定的行业列，就进行处理
+    if available_industry_cols:
         industry_embeddings = process_industry_hierarchy(df)
         if industry_embeddings is not None:
             industry_emb_df = pd.DataFrame(
@@ -178,7 +187,7 @@ def process_data(df, df_name=""):
             )
             result_df = pd.concat([result_df, industry_emb_df], axis=1)
     else:
-        print("  No industry columns to process for hierarchy.")
+        print("  None of the specified industry columns are present in the data.")
 
     # --- 为其他中文列生成增强嵌入 ---
     embed_dfs = []
@@ -228,8 +237,8 @@ if __name__ == "__main__":
     # --- 保存为 Parquet 格式 ---
     print("Saving results to Parquet files...")
     # 输出文件路径
-    train_output_path = "train_bert_enhanced_embedded.parquet"
-    test_output_path = "test_bert_enhanced_embedded.parquet"
+    train_output_path = "train_bert_enhanced_embedded_hier.parquet"
+    test_output_path = "test_bert_enhanced_embedded_hier.parquet"
 
     train_processed.to_parquet(train_output_path, index=False)
     test_processed.to_parquet(test_output_path, index=False)
