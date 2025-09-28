@@ -3,6 +3,8 @@ import pickle
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
+# 导入 BalancedRandomForestClassifier
+from imblearn.ensemble import BalancedRandomForestClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
 from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
@@ -16,53 +18,63 @@ from sklearn.utils.validation import check_X_y
 
 # --- 设置环境变量以控制底层库的线程数 ---
 # 针对 8 核 CPU，设置为 6 是一个相对安全且能利用多核优势的选择
-# 避免设置过高导致系统资源冲突
 os.environ["OMP_NUM_THREADS"] = "6"
 os.environ["MKL_NUM_THREADS"] = "6"
 os.environ["OPENBLAS_NUM_THREADS"] = "6"
 os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
-# --- 修改后的深度森林：不生成新特征 ---
-class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
+# --- 新的模型：决策树级联的平衡随机森林网络 ---
+class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
     """
-    增强版深度森林（不生成新特征，每层独立使用原始输入）
+    决策树级联的平衡随机森林网络
+    每一层使用 BalancedRandomForestClassifier，并将预测概率作为下一层的输入特征。
     """
 
     def __init__(self,
                  n_estimators=100,
                  max_layers=5,
-                 min_delta=0.001,
                  random_state=None):
         self.n_estimators = n_estimators
         self.max_layers = max_layers
-        self.min_delta = min_delta
         self.random_state = random_state
-        self.layers_ = []  # 存储每层的分类器列表
+        self.layers_ = []  # 存储每层的分类器
         self.classes_ = None
         self.n_features_in_ = None
-
-    def _create_base_estimators(self):
-        # 显式设置 n_jobs=2，避免使用全部核心
-        # 在8核CPU上，两个这样的基学习器并行运行比较安全
-        return [
-            RandomForestClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=2),
-            ExtraTreesClassifier(n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=2)
-        ]
+        self.initial_n_features_ = None # 记录原始特征数
 
     def fit(self, X, y):
         X, y = check_X_y(X, y, ensure_min_features=1)
         self.classes_ = np.unique(y)
-        self.n_features_in_ = X.shape[1]
+        self.n_features_in_ = X.shape[1] # 初始特征数
+        self.initial_n_features_ = X.shape[1]
 
-        # 所有层都使用原始 X，不生成新特征
-        base_X = X.copy()
+        current_input = X.copy()
+        n_features_current = current_input.shape[1]
 
         for layer_idx in range(self.max_layers):
-            layer_estimators = []
-            for clf in self._create_base_estimators():
-                clf.fit(base_X, y)
-                layer_estimators.append(clf)
-            self.layers_.append(layer_estimators)
+            # 1. 创建并训练当前层的 BalancedRandomForest
+            #    每层使用独立的随机种子
+            layer_clf = BalancedRandomForestClassifier(
+                n_estimators=self.n_estimators,
+                random_state=self.random_state + layer_idx if self.random_state else layer_idx,
+                n_jobs=2 # 控制单个BRF的并行度
+            )
+            layer_clf.fit(current_input, y)
+            self.layers_.append(layer_clf)
+
+            # 2. 生成下一层的输入特征
+            #    使用 predict_proba 作为新特征 (对于二分类是2个特征)
+            if len(self.classes_) == 2:
+                # 对于二分类，只需要正类的概率
+                probas = layer_clf.predict_proba(current_input)[:, 1:]
+            else:
+                # 对于多分类，需要所有类别的概率
+                probas = layer_clf.predict_proba(current_input)
+
+            # 3. 拼接原始特征和新特征
+            current_input = np.hstack((current_input, probas))
+            n_features_current = current_input.shape[1]
+            # print(f"Layer {layer_idx + 1} output features: {n_features_current}") # 可选：打印每层特征数
 
         return self
 
@@ -72,22 +84,28 @@ class EnhancedDeepForest(BaseEstimator, ClassifierMixin):
         X = np.asarray(X)
         if X.ndim != 2:
             raise ValueError(f"期望2D数组，得到{X.ndim}D数组")
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"输入特征数 {X.shape[1]} 与训练时 {self.n_features_in_} 不匹配")
+        # 注意：这里检查的是初始特征数
+        if X.shape[1] != self.initial_n_features_:
+            raise ValueError(f"输入特征数 {X.shape[1]} 与训练时初始特征数 {self.initial_n_features_} 不匹配")
 
-        all_probas = []
-        for layer in self.layers_:
-            for clf in layer:
-                probas = clf.predict_proba(X)
-                all_probas.append(probas)
-        # 对所有分类器的预测取平均
-        return np.mean(all_probas, axis=0)
+        current_input = X.copy()
+
+        # 逐层进行预测并生成新特征
+        for i, layer_clf in enumerate(self.layers_):
+            if len(self.classes_) == 2:
+                probas = layer_clf.predict_proba(current_input)[:, 1:]
+            else:
+                probas = layer_clf.predict_proba(current_input)
+            current_input = np.hstack((current_input, probas))
+
+        # 返回最后一层的预测概率
+        return self.layers_[-1].predict_proba(X) # 或者使用 current_input 的最后一部分
 
     def predict(self, X):
         probas = self.predict_proba(X)
         return self.classes_[np.argmax(probas, axis=1)]
 
-
+# --- 保持原有的包装器不变 ---
 class CascadeForestWrapper(ClassifierMixin):
     def __init__(self, cascade_forest):
         self.cascade_forest = cascade_forest
@@ -148,10 +166,11 @@ if __name__ == "__main__":
     X_imputed = imputer.fit_transform(X)
 
     # 5. 特征缩放
+    # 注意：BalancedRandomForest 对特征缩放不敏感，但为了与其他模型保持一致，我们仍然进行缩放
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
 
-    # 6. 数据平衡
+    # 6. 数据平衡 (注意：级联模型内部也处理平衡，这里的数据平衡是可选的，但保留)
     smote_enn = SMOTEENN(random_state=42)
     X_resampled, y_resampled = smote_enn.fit_resample(X_scaled, y)
     print(f"平衡后数据形状: {X_resampled.shape}")
@@ -172,21 +191,20 @@ if __name__ == "__main__":
     X_train, X_test, y_train, y_test = train_test_split(
         X_selected, y_resampled, test_size=0.1, random_state=42)
 
-    # 9. 初始化深度森林（不生成新特征）
-    base_enhanced_df = EnhancedDeepForest(
-        n_estimators=800,
-        max_layers=5,  # 可适当减少
-        min_delta=0.0005,
+    # 9. 初始化新的级联平衡随机森林模型
+    base_balanced_cascade = BalancedRandomForestCascade(
+        n_estimators=300, # 可以根据需要调整
+        max_layers=3,     # 可以根据需要调整
         random_state=42
     )
-    enhanced_df = CascadeForestWrapper(base_enhanced_df)
+    balanced_cascade = CascadeForestWrapper(base_balanced_cascade)
 
-    # 10. 构建集成模型
+    # 10. 构建集成模型 (保持其他部分不变)
     adaboost = AdaBoostClassifier(n_estimators=700, algorithm='SAMME', random_state=42)
     # 显式设置 StackingClassifier 的 n_jobs=2，避免使用全部核心
     stacking_model = StackingClassifier(
         estimators=[
-            ('enhanced_df', enhanced_df),
+            ('balanced_cascade', balanced_cascade), # 使用新的模型
             ('adaboost', adaboost)
         ],
         final_estimator=GaussianNB(),
