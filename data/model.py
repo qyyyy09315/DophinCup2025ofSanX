@@ -284,8 +284,8 @@ if __name__ == "__main__":
     # 9. 初始化增强深度森林（已移除多粒度扫描）
     print("初始化增强深度森林模型...")
     base_enhanced_df = EnhancedDeepForest(
-        n_estimators=80,
-        max_layers=4,
+        n_estimators=1000,
+        max_layers=10,
         use_scan=False,  # 已显式设置为False
         min_delta=0.0005,
         random_state=42
