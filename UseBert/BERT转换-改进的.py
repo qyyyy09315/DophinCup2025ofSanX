@@ -1,182 +1,88 @@
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from transformers import BertModel, BertTokenizer
 from tqdm import tqdm
+import os
 
-# 1. 加载模型（强制使用 GPU，如果可用）
+# === 1. 加载模型（强制使用 GPU，如果可用） ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# 确保本地模型路径存在
 local_model_path = "./bert-base-chinese"
+if not os.path.exists(local_model_path):
+    raise FileNotFoundError(f"本地模型路径 {local_model_path} 不存在。请确保模型已下载至此目录。")
+
 tokenizer = BertTokenizer.from_pretrained(local_model_path)
 model = BertModel.from_pretrained(local_model_path).to(device)
 model.eval()
 
 
-# 2. 定义注意力加权池化层
-class AttentionPooling(nn.Module):
-    def __init__(self, hidden_size):
-        super(AttentionPooling, self).__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1, bias=False)
-        )
-
-    def forward(self, hidden_states, mask=None):
-        weights = self.attention(hidden_states)  # [batch_size, seq_len, 1]
-        if mask is not None:
-            mask = mask.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
-            weights = weights.masked_fill(mask == 0, -1e9)
-        weights = torch.softmax(weights, dim=1)  # [batch_size, seq_len, 1]
-        pooled = torch.sum(hidden_states * weights, dim=1)  # [batch_size, hidden_size]
-        return pooled, weights.squeeze(-1)
-
-
-# 初始化注意力池化层
-attention_pooler = AttentionPooling(model.config.hidden_size).to(device)
-
-# 3. 读取数据
-train_df = pd.read_csv("../data/train.csv")
-test_df = pd.read_csv("../data/test.csv")
-
-# 4. 需嵌入的中文列名
-chinese_columns = [
-    'province', 'city', 'industry_l1_name', 'industry_l2_name',
-    'industry_l3_name', 'industry_l4_name', 'legal_person',
-    'business_scope', 'company_type', 'tags', 'company_on_scale', 'honor_titles',
-    'sci_tech_ent_tags', 'top100_tags'
-]
-
-# 行业层次结构定义
-industry_hierarchy = {
-    'industry_l1_name': ['industry_l2_name', 'industry_l3_name', 'industry_l4_name'],
-    'industry_l2_name': ['industry_l3_name', 'industry_l4_name'],
-    'industry_l3_name': ['industry_l4_name']
-}
-
-
-# 5. 改进的 BERT 嵌入函数（注意力权重取均值）
-def get_bert_embedding(texts, batch_size=32, use_attention=False):
+# === 2. 简化版 BERT 嵌入函数（仅使用 [CLS] 向量）===
+def get_bert_embedding(texts, batch_size=32):
+    """
+    使用 BERT 模型为文本列表生成嵌入向量。
+    仅使用 [CLS] token 的最后一层隐藏状态作为句向量。
+    """
     embeddings = []
-    attention_weights = []
 
     for i in tqdm(range(0, len(texts), batch_size), desc="Generating BERT embeddings"):
         batch_texts = texts[i:i + batch_size]
+        # padding=True, truncation=True 是关键参数
         inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt").to(device)
 
         with torch.no_grad():
             outputs = model(**inputs)
 
-        # 默认使用 [CLS] 向量
+        # 使用 [CLS] token 的向量 ([:, 0, :]) 作为整个句子的表示
         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
         embeddings.append(batch_embeddings)
 
-        if use_attention:
-            hidden_states = outputs.last_hidden_state
-            mask = inputs['attention_mask']
-            pooled_emb, attn_weights = attention_pooler(hidden_states, mask)
-
-            embeddings[-1] = pooled_emb.cpu().detach().numpy()
-
-            # === 核心修改：取平均权重，保证维度固定 ===
-            attn_weights_mean = attn_weights.mean(dim=1).cpu().detach().numpy()  # [batch_size]
-            attention_weights.append(attn_weights_mean[:, None])  # [batch_size, 1]
-
-    emb = np.concatenate(embeddings, axis=0)
-    if use_attention:
-        weights = np.concatenate(attention_weights, axis=0)  # [num_samples, 1]
-        return emb, weights
-    else:
-        return emb, None
+    # 将所有批次的嵌入向量拼接成一个大的 numpy 数组
+    final_embeddings = np.concatenate(embeddings, axis=0)
+    return final_embeddings
 
 
-# 6. 行业层次化嵌入处理
-def process_industry_hierarchy(df):
-    if 'industry_l1_name' not in df.columns:
-        return None
+# === 3. 数据处理函数 ===
+def process_data(df, df_name=""):
+    """
+    处理单个 DataFrame，为指定列生成 BERT 嵌入。
+    """
+    print(f"--- Processing {df_name} ---")
+    # 需要生成嵌入的中文列名
+    chinese_columns = [
+        'province', 'city', 'industry_l1_name', 'industry_l2_name',
+        'industry_l3_name', 'industry_l4_name', 'legal_person',
+        'business_scope', 'company_type', 'tags', 'company_on_scale', 'honor_titles',
+        'sci_tech_ent_tags', 'top100_tags'
+    ]
 
-    industry_cols = ['industry_l1_name', 'industry_l2_name', 'industry_l3_name', 'industry_l4_name']
-    industry_cols = [col for col in industry_cols if col in df.columns]
-
-    industry_embeddings = {}
-    for col in industry_cols:
-        texts = df[col].fillna("").tolist()
-        non_empty_texts = [t for t in texts if t.strip() != ""]
-        if len(non_empty_texts) == 0:
-            emb = np.zeros((len(texts), model.config.hidden_size))
-            weights = np.zeros((len(texts), 1))
-        else:
-            emb_full = np.zeros((len(texts), model.config.hidden_size))
-            weights_full = np.zeros((len(texts), 1))
-
-            non_empty_indices = [i for i, t in enumerate(texts) if t.strip() != ""]
-            non_empty_results, non_empty_weights = get_bert_embedding(
-                non_empty_texts, batch_size=32, use_attention=True
-            )
-
-            emb_full[non_empty_indices] = non_empty_results
-            if non_empty_weights is not None:
-                weights_full[non_empty_indices, 0] = non_empty_weights[:, 0]
-
-            emb, weights = emb_full, weights_full
-
-        industry_embeddings[col] = (emb, weights)
-
-    hierarchical_embeddings = []
-    for i in range(len(df)):
-        hier_emb = np.zeros(model.config.hidden_size)
-        has_valid_industry = False
-
-        for level in ['industry_l1_name', 'industry_l2_name', 'industry_l3_name', 'industry_l4_name']:
-            if level in industry_embeddings and pd.notna(df.iloc[i][level]) and df.iloc[i][level] != "":
-                emb, weights = industry_embeddings[level]
-                hier_emb = emb[i]
-                has_valid_industry = True
-                break
-
-        if not has_valid_industry:
-            hier_emb = np.zeros(model.config.hidden_size)
-
-        hierarchical_embeddings.append(hier_emb)
-
-    hierarchical_embeddings = np.stack(hierarchical_embeddings)
-    return hierarchical_embeddings
-
-
-# 7. 优化后的数据处理函数
-def process_data(df):
+    # 筛选出实际存在于 DataFrame 中的列
     valid_cols = [col for col in chinese_columns if col in df.columns]
+    # 选出不需要生成嵌入的其他列
     non_chinese_cols = [col for col in df.columns if col not in chinese_columns]
 
+    # 创建一个只包含非中文列的 DataFrame 作为基础
     result_df = df[non_chinese_cols].copy()
 
-    print("Processing industry hierarchy...")
-    industry_hier_emb = process_industry_hierarchy(df)
-    if industry_hier_emb is not None:
-        industry_hier_df = pd.DataFrame(
-            industry_hier_emb,
-            columns=[f"industry_hier_emb_{i}" for i in range(industry_hier_emb.shape[1])]
-        )
-        result_df = pd.concat([result_df, industry_hier_df], axis=1)
-
+    # 为每个有效的中文列生成嵌入
     embed_dfs = []
     for col in valid_cols:
-        if col.startswith('industry_l'):
-            continue
-
-        print(f"Processing column: {col}")
+        print(f"  Processing column: {col}")
+        # 处理缺失值，用空字符串填充
         texts = df[col].fillna("").tolist()
-        embeddings, _ = get_bert_embedding(texts, batch_size=32, use_attention=False)
+        # 获取嵌入向量
+        embeddings = get_bert_embedding(texts, batch_size=32)
 
+        # 将嵌入向量转换为 DataFrame，列名加上前缀以便区分
         embed_df = pd.DataFrame(
             embeddings,
             columns=[f"{col}_emb_{i}" for i in range(embeddings.shape[1])]
         )
         embed_dfs.append(embed_df)
 
+    # 如果生成了嵌入，则将它们与基础 DataFrame 拼接起来
     if embed_dfs:
         all_embeddings = pd.concat(embed_dfs, axis=1)
         result_df = pd.concat([result_df, all_embeddings], axis=1)
@@ -184,12 +90,33 @@ def process_data(df):
     return result_df
 
 
-# 8. 处理数据
-train_processed = process_data(train_df)
-test_processed = process_data(test_df)
+# === 4. 主执行流程 ===
+if __name__ == "__main__":
+    # --- 读取数据 ---
+    print("Loading data...")
+    train_df = pd.read_csv("../data/train.csv")
+    test_df = pd.read_csv("../data/test.csv")
+    print(f"Train data shape: {train_df.shape}")
+    print(f"Test data shape: {test_df.shape}")
 
-# 9. 保存结果
-train_processed.to_csv("train_bert_embedded_hierarchical.csv", index=False)
-test_processed.to_csv("test_bert_embedded_hierarchical.csv", index=False)
+    # --- 处理训练集 ---
+    train_processed = process_data(train_df, "Train Data")
 
-print("处理完成！")
+    # --- 处理测试集 ---
+    test_processed = process_data(test_df, "Test Data")
+
+    # --- 保存为 Parquet 格式 ---
+    print("Saving results to Parquet files...")
+    train_output_path = "train_bert_embedded2.parquet"
+    test_output_path = "test_bert_embedded2.parquet"
+
+    train_processed.to_parquet(train_output_path, index=False)
+    test_processed.to_parquet(test_output_path, index=False)
+
+    print(f"处理完成！")
+    print(f"训练集嵌入已保存至: {train_output_path} (Shape: {train_processed.shape})")
+    print(f"测试集嵌入已保存至: {test_output_path} (Shape: {test_processed.shape})")
+
+
+
+
