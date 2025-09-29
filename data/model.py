@@ -44,7 +44,7 @@ if __name__ == "__main__":
 
     # AdaBoost 超参（可以调整）
     adaboost_n_estimators = 300
-    adaboost_learning_rate = 0.5
+    adaboost_learning_rate = 0.01
 
     # SelectKBest 候选
     candidate_k = [30, 50, 80, 100]
@@ -80,7 +80,7 @@ if __name__ == "__main__":
         X_tmp = selector_tmp.fit_transform(X_scaled, y_all)
         # 用一个简单的 AdaBoost 评估 AUC（快速）
         from sklearn.ensemble import AdaBoostClassifier
-        clf_tmp = AdaBoostClassifier(n_estimators=100, learning_rate=0.5, random_state=random_state)
+        clf_tmp = AdaBoostClassifier(n_estimators=300, learning_rate=0.01, random_state=random_state)
         try:
             from sklearn.model_selection import cross_val_score
             scores = cross_val_score(clf_tmp, X_tmp, y_all, cv=skf, scoring="roc_auc", n_jobs=2)
