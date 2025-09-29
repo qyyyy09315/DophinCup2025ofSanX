@@ -1,11 +1,25 @@
 import os
 import pickle
 import warnings
-
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore")
+import os
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+from imblearn.combine import SMOTEENN
 from imblearn.ensemble import BalancedRandomForestClassifier
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import recall_score, roc_auc_score, precision_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.naive_bayes import GaussianNB
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y
 
 # --- 设置环境变量以控制底层库的线程数 ---
@@ -173,16 +187,18 @@ class CascadeForestWrapper(ClassifierMixin):
             self.cascade_forest = params["cascade_forest"]
         return self
 
-
-def load_model(filename):
-    """从文件加载模型"""
-    with open(filename, 'rb') as f:
-        model = pickle.load(f)
-    print(f"模型已从 '{filename}' 加载")
-    return model
-import pandas as pd
-import pickle
-import numpy as np
+# -----------------------------
+# 工具函数
+# -----------------------------
+def load_object(path):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        print(f"已加载: {path}")
+        return obj
+    else:
+        print(f"警告: {path} 不存在，跳过。")
+        return None
 
 def load_model(filename):
     """从文件加载模型"""
@@ -191,59 +207,89 @@ def load_model(filename):
     print(f"模型已从 '{filename}' 加载, 类型: {type(model)}")
     return model
 
+
+# -----------------------------
 # 1. 加载测试数据
-test_data_path = 'testClean.csv'
+# -----------------------------
+test_data_path = "testClean.csv"
 print(f"正在加载测试数据: {test_data_path}")
 test_data = pd.read_csv(test_data_path)
 print(f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1]}")
 
-# 2. 加载模型管道
-model_path = 'model_pipeline.pkl'
+# -----------------------------
+# 2. 加载预处理器（按训练时保存的）
+# -----------------------------
+imputer = load_object("./imputer.pkl")
+scaler = load_object("./scaler.pkl")
+selector = load_object("./feature_selector.pkl")
+
+# -----------------------------
+# 3. 加载模型管道
+# -----------------------------
+model_path = "model_pipeline.pkl"
 print(f"正在加载模型管道: {model_path}")
 loaded_pipeline = load_model(model_path)
 
 # -----------------------------
-# 尝试读取阈值
+# 4. 读取阈值
 # -----------------------------
 if hasattr(loaded_pipeline, "threshold"):
     threshold = loaded_pipeline.threshold
     print(f"从模型对象读取阈值: {threshold}")
 else:
-    # 如果没有保存阈值，可以回退到默认值
     threshold = 0.5
     print(f"警告: 模型对象中未找到阈值属性，使用默认值 {threshold}")
 
-# 3. 特征选择
-feature_columns = [col for col in test_data.columns if col != 'company_id']
+# -----------------------------
+# 5. 测试数据处理
+# -----------------------------
+# 去掉 ID 列
+feature_columns = [col for col in test_data.columns if col != "company_id"]
 X_test_raw = test_data[feature_columns]
 print(f"用于预测的原始特征数: {X_test_raw.shape[1]}")
 
-# 4. 直接用管道预测
+# 依次应用预处理
+X_test_proc = X_test_raw.copy()
+if imputer is not None:
+    X_test_proc = imputer.transform(X_test_proc)
+    print("已应用缺失值填充。")
+
+if scaler is not None:
+    X_test_proc = scaler.transform(X_test_proc)
+    print("已应用标准化。")
+
+if selector is not None:
+    X_test_proc = selector.transform(X_test_proc)
+    print(f"已应用特征选择，最终特征数: {X_test_proc.shape[1]}")
+
+# -----------------------------
+# 6. 预测
+# -----------------------------
 print("正在进行预测...")
-y_proba = loaded_pipeline.predict_proba(X_test_raw)[:, 1]  # 取正类概率
+y_proba = loaded_pipeline.predict_proba(X_test_proc)[:, 1]
 print(f"预测完成，共 {len(y_proba)} 个概率值。")
 
-# 应用阈值
 print(f"应用分类阈值: {threshold}")
 y_pred = (y_proba >= threshold).astype(int)
 print("分类完成。")
 
-# 5. 结果输出
-if 'company_id' in test_data.columns:
-    uuid_column = test_data['company_id']
+# -----------------------------
+# 7. 结果输出
+# -----------------------------
+if "company_id" in test_data.columns:
+    uuid_column = test_data["company_id"]
 else:
     print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
     uuid_column = test_data.index
 
 results_df = pd.DataFrame({
-    'uuid': uuid_column,
-    'proba': y_proba,
-    'prediction': y_pred
+    "uuid": uuid_column,
+    "proba": y_proba,
+    "prediction": y_pred
 })
 print("结果数据框创建成功。")
 
-# 6. 保存结果
-output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'
+output_path = r"C:\Users\YKSHb\Desktop\submit_template.csv"
 print(f"正在保存结果到: {output_path}")
 results_df.to_csv(output_path, index=False)
 print(f"预测完成，阈值 {threshold}，结果已保存到 {output_path}")
