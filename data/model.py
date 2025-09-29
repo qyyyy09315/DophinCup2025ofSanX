@@ -39,17 +39,14 @@ class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.layers_ = []  # 存储每层的分类器
         self.classes_ = None
-        self.n_features_in_ = None
         self.initial_n_features_ = None # 记录原始特征数
 
     def fit(self, X, y):
         X, y = check_X_y(X, y, ensure_min_features=1)
         self.classes_ = np.unique(y)
-        self.n_features_in_ = X.shape[1] # 初始特征数
-        self.initial_n_features_ = X.shape[1]
+        self.initial_n_features_ = X.shape[1] # 记录初始特征数
 
         current_input = X.copy()
-        n_features_current = current_input.shape[1]
 
         for layer_idx in range(self.max_layers):
             # 1. 创建并训练当前层的 BalancedRandomForest
@@ -73,8 +70,8 @@ class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
 
             # 3. 拼接原始特征和新特征
             current_input = np.hstack((current_input, probas))
-            n_features_current = current_input.shape[1]
-            # print(f"Layer {layer_idx + 1} output features: {n_features_current}") # 可选：打印每层特征数
+            # 注意：我们不再更新 self.n_features_in_ 或任何其他可能在预测时使用的属性
+            #      以确保预测逻辑只依赖于初始特征数和层数。
 
         return self
 
@@ -84,7 +81,7 @@ class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
         X = np.asarray(X)
         if X.ndim != 2:
             raise ValueError(f"期望2D数组，得到{X.ndim}D数组")
-        # 注意：这里检查的是初始特征数
+        # 检查输入特征数是否与训练时的初始特征数匹配
         if X.shape[1] != self.initial_n_features_:
             raise ValueError(f"输入特征数 {X.shape[1]} 与训练时初始特征数 {self.initial_n_features_} 不匹配")
 
@@ -96,10 +93,16 @@ class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
                 probas = layer_clf.predict_proba(current_input)[:, 1:]
             else:
                 probas = layer_clf.predict_proba(current_input)
+            # 拼接原始特征和新特征，为下一层做准备
             current_input = np.hstack((current_input, probas))
 
         # 返回最后一层的预测概率
-        return self.layers_[-1].predict_proba(X) # 或者使用 current_input 的最后一部分
+        # 正确的做法是返回最后一层处理后的 current_input 上的最后一部分概率
+        # 但我们也可以直接使用最后一层分类器对最后一次拼接后的 current_input 进行预测
+        # 这里选择使用最后一层分类器的 predict_proba 方法，它会处理好输入
+        # 但是输入必须是与它训练时最后一轮的输入格式一致
+        # 由于我们在训练和预测时都执行了相同的拼接操作，所以 current_input 是正确的
+        return layer_clf.predict_proba(current_input) # 使用循环结束时的 layer_clf
 
     def predict(self, X):
         probas = self.predict_proba(X)
@@ -175,10 +178,10 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smote_enn.fit_resample(X_scaled, y)
     print(f"平衡后数据形状: {X_resampled.shape}")
 
-    # 7. 宽容度更高的特征选择：保留前 80% 的特征 或 至少 50 个
-    n_features = X_resampled.shape[1]
-    k = max(50, int(0.8 * n_features))  # 更宽容
-    selector = SelectKBest(score_func=f_classif, k=k)
+    # 7. 特征选择：选择固定数量的特征，避免在训练/测试时因数据不同导致特征数变化
+    #    例如，固定选择前 100 个特征
+    fixed_k = min(100, X_resampled.shape[1]) # 选择一个不会超过当前特征数的固定值
+    selector = SelectKBest(score_func=f_classif, k=fixed_k)
     X_selected = selector.fit_transform(X_resampled, y_resampled)
     print(f"特征选择后数量: {X_selected.shape[1]}")
 
@@ -235,6 +238,3 @@ if __name__ == "__main__":
     print(f"精确率 (Precision): {precision:.6f}")
     print(f"最终评分:          {final_score:.6f}")
     print("=" * 50)
-
-
-
