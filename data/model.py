@@ -1,4 +1,4 @@
-# train_ensemble_cascade_smoteen_adaboost_dnn_torch_fixed.py
+# train_ensemble_cascade_smoteen_adaboost_dnn_torch_fixed_with_residual.py
 import os
 import pickle
 import warnings
@@ -54,64 +54,118 @@ def cascade_predict(base_models, meta_model, X, threshold=0.5):
     return preds, avg_proba
 
 
+# 定义一个带残差连接的块
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features, out_features, dropout_rate=0.0):
+        super(ResidualBlock, self).__init__()
+        # 主路径
+        self.linear1 = nn.Linear(in_features, out_features)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        self.linear2 = nn.Linear(out_features, out_features)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+        # 残差连接路径 (如果输入输出维度不同)
+        self.shortcut = nn.Identity()
+        if in_features != out_features:
+            self.shortcut = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+
+        out = self.linear1(x)
+        out = self.relu1(out)
+        if self.dropout1:
+            out = self.dropout1(out)
+
+        out = self.linear2(out)
+        # 残差连接
+        out += identity
+        out = self.relu2(out)
+        if self.dropout2:
+            out = self.dropout2(out)
+
+        return out
+
+
 class DeepFeatureSelector(nn.Module):
-    """更深的全连接网络"""
+    """更深的全连接网络，包含残差连接"""
 
     def __init__(self, input_dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 1024),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
+        # 使用残差块构建网络
+        self.block1 = ResidualBlock(input_dim, 1024, 0.4)
+        self.block2 = ResidualBlock(1024, 512, 0.3)
+        self.block3 = ResidualBlock(512, 256, 0.3)
+        self.block4 = ResidualBlock(256, 128, 0.2)
+
+        # 输出层
+        self.output_layer = nn.Linear(128, 1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return self.net(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.output_layer(x)
+        x = self.sigmoid(x)
+        return x
 
 
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=64, lr=1e-3, device="cpu"):
+def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128, lr=1e-3, device="cpu"):
+    # 确保模型在指定设备上
     model = DeepFeatureSelector(input_dim).to(device)
     criterion = nn.BCELoss()
+    # 可以考虑使用 weight_decay 进行 L2 正则化
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    dataset = TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32))
+    # 将数据也移动到指定设备
+    dataset = TensorDataset(
+        torch.tensor(X, dtype=torch.float32).to(device),
+        torch.tensor(y, dtype=torch.float32).to(device)
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     model.train()
     for epoch in range(epochs):
+        total_loss = 0.0
+        num_batches = 0
         for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device).unsqueeze(1)
+            # 数据已经在设备上了，无需再次移动
+            # xb, yb = xb.to(device), yb.to(device)
+            yb = yb.unsqueeze(1)  # 调整标签形状
             optimizer.zero_grad()
             outputs = model(xb)
             loss = criterion(outputs, yb)
             loss.backward()
             optimizer.step()
-        # 可选：打印损失
+            total_loss += loss.item()
+            num_batches += 1
+        # 可选：打印平均损失
         # if (epoch + 1) % 50 == 0:
-        #     print(f"Epoch {epoch+1}/{epochs}, Loss={loss.item():.4f}")
+        #     avg_loss = total_loss / num_batches
+        #     print(f"Epoch {epoch+1}/{epochs}, Avg Loss={avg_loss:.4f}")
 
     # 提取第一层权重以计算特征重要性
-    first_layer = None
-    for layer in model.net:
-        if isinstance(layer, nn.Linear):
-            first_layer = layer
-            break
-    if first_layer is not None:
-        weights = first_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
+    # 注意：现在第一层是 ResidualBlock，我们需要访问其内部的 linear1 层
+    first_linear_layer = None
+    if hasattr(model, 'block1') and hasattr(model.block1, 'linear1'):
+        first_linear_layer = model.block1.linear1
+    else:
+        # 如果结构改变，尝试查找第一个 nn.Linear 层
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                first_linear_layer = module
+                break
+
+    if first_linear_layer is not None:
+        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
         feature_importance = np.mean(np.abs(weights), axis=0)
     else:
         # 如果找不到线性层，则返回零重要性（理论上不应发生）
+        print("警告：无法找到第一层线性层以计算特征重要性。")
         feature_importance = np.zeros(input_dim)
 
     return feature_importance
@@ -148,6 +202,7 @@ def youden_threshold(y_true, probas):
 if __name__ == "__main__":
     print("=" * 60)
     print("开始训练：SMOTEENN -> AdaBoost(DecisionTree) + 平衡随机森林 -> 级联 GaussianNB (Torch DNN 特征权重)")
+    print("-> DNN 使用残差网络并利用 GPU (如果可用)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -168,14 +223,15 @@ if __name__ == "__main__":
 
     test_size = 0.10
     random_state = 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 关键修改: 确定设备，优先使用 CUDA
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"当前计算设备: {device}")
 
     # AdaBoost 超参 (关键修改点: 将 base_estimator 替换为 estimator)
     ada_params = {
         # 原始参数: "base_estimator": DecisionTreeClassifier(max_depth=3, random_state=random_state),
         # 修改后参数:
-        "estimator": DecisionTreeClassifier(max_depth=3, random_state=random_state),
+        "estimator": DecisionTreeClassifier(max_depth=8, random_state=random_state),
         "n_estimators": 300,
         "learning_rate": 0.05,
         "random_state": random_state,
@@ -210,8 +266,13 @@ if __name__ == "__main__":
     save_object(scaler, "./scaler.pkl")
 
     # ----- 2. DNN 特征权重 -----
-    print("使用 Torch DNN 训练获取特征权重 ...")
-    feature_importance = train_dnn_feature_selector_torch(X_scaled, y_all, input_dim=X_scaled.shape[1], device=device)
+    print("使用 Torch DNN (带残差连接) 训练获取特征权重 ...")
+    # 关键修改: 将设备传递给训练函数
+    feature_importance = train_dnn_feature_selector_torch(
+        X_scaled, y_all,
+        input_dim=X_scaled.shape[1],
+        device=device  # 使用指定的设备
+    )
     ranked_idx = np.argsort(-feature_importance)
     # 根据特征重要性排序选择所有特征
     X_selected = X_scaled[:, ranked_idx]
@@ -305,7 +366,3 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_dnn_torch.pkl")
     print("已保存完整模型 ./model_pipeline_cascade_dnn_torch.pkl")
     print("=" * 60)
-
-
-
-
