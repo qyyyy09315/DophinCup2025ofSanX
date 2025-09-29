@@ -239,9 +239,9 @@ if __name__ == "__main__":
 
     # XGBoost 超参
     xgb_params = {
-        'max_depth': 10,
-        'learning_rate': 0.01,
-        'n_estimators': 700,
+        'max_depth': 6,
+        'learning_rate': 0.1,
+        'n_estimators': 200,
         'objective': 'binary:logistic',
         'eval_metric': 'logloss',  # 用于早停
         'random_state': random_state,
@@ -313,7 +313,7 @@ if __name__ == "__main__":
         dtrain=dtrain_full,
         num_boost_round=xgb_params['n_estimators'],
         evals=[(dval, 'validation')],
-        early_stopping_rounds=50,  # 可选：启用早停
+        early_stopping_rounds=20,  # 可选：启用早停
         verbose_eval=False,  # 设置为True可以看到训练过程
         evals_result=evals_result
     )
