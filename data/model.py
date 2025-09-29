@@ -1,4 +1,4 @@
-# train_ensemble_cascade_smoteen_catboost.py
+# train_ensemble_cascade_smoteen_catboost_dnn.py
 import os
 import pickle
 import warnings
@@ -8,15 +8,18 @@ import pandas as pd
 from catboost import CatBoostClassifier
 from imblearn.combine import SMOTEENN
 from imblearn.ensemble import BalancedRandomForestClassifier
-from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
 
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
 warnings.filterwarnings("ignore")
 np.random.seed(42)
+tf.random.set_seed(42)
 
 
 def save_object(obj, filepath):
@@ -52,9 +55,32 @@ def cascade_predict(base_models, meta_model, X, threshold=0.5):
     return preds, avg_proba
 
 
+def train_dnn_feature_selector(X, y, input_dim, epochs=30, batch_size=64):
+    """
+    训练多层 DNN 来学习特征权重
+    """
+    model = models.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(128, activation="relu"),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation="relu"),
+        layers.Dropout(0.3),
+        layers.Dense(1, activation="sigmoid")
+    ])
+
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["AUC"])
+    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
+
+    # 提取输入层权重
+    weights = model.layers[0].get_weights()[0]  # shape = (input_dim, 128)
+    feature_importance = np.mean(np.abs(weights), axis=1)  # 对每个特征取平均绝对权重
+
+    return feature_importance
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始训练：SMOTEENN 重采样 -> CatBoost + 平衡随机森林 -> 级联修正 GaussianNB")
+    print("开始训练：SMOTEENN 重采样 -> CatBoost + 平衡随机森林 -> 级联修正 GaussianNB (DNN特征权重)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -79,9 +105,6 @@ if __name__ == "__main__":
     brf_max_depth = 8
     brf_max_features = "sqrt"
 
-    # SelectKBest 候选
-    candidate_k = [30, 50, 80, 100]
-
     # ----- 1. 读取并预处理数据 -----
     data = pd.read_csv(data_path).drop(columns=["company_id"])
     data = pd.get_dummies(data, drop_first=True)
@@ -101,30 +124,15 @@ if __name__ == "__main__":
     save_object(imputer, "./imputer.pkl")
     save_object(scaler, "./scaler.pkl")
 
-    # ----- 2. 特征选择 -----
-    print("开始用交叉验证选择特征数 k ...")
-    best_k, best_auc = None, -np.inf
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    # ----- 2. DNN 特征权重 -----
+    print("使用 DNN 训练获取特征权重 ...")
+    feature_importance = train_dnn_feature_selector(X_scaled, y_all, input_dim=X_scaled.shape[1])
+    ranked_idx = np.argsort(-feature_importance)
+    # 可以选择前 N 特征，这里我们保留全部特征，但按重要性排序
+    X_selected = X_scaled[:, ranked_idx]
+    print(f"DNN 特征加权完成，特征总数={X_selected.shape[1]}")
 
-    for k in candidate_k:
-        k_use = min(k, X_scaled.shape[1])
-        selector_tmp = SelectKBest(score_func=f_classif, k=k_use)
-        X_tmp = selector_tmp.fit_transform(X_scaled, y_all)
-        clf_tmp = CatBoostClassifier(**cat_params)
-        try:
-            scores = cross_val_score(clf_tmp, X_tmp, y_all, cv=skf, scoring="roc_auc", n_jobs=2)
-            mean_auc = np.mean(scores)
-        except Exception:
-            mean_auc = -np.inf
-        print(f"  k={k_use}, CV AUC={mean_auc:.5f}")
-        if mean_auc > best_auc:
-            best_auc, best_k = mean_auc, k_use
-
-    print(f"选定特征数 k = {best_k}, CV AUC={best_auc:.5f}")
-    selector = SelectKBest(score_func=f_classif, k=best_k)
-    X_selected = selector.fit_transform(X_scaled, y_all)
-    save_object(selector, "./feature_selector.pkl")
-    print(f"特征选择后维度: {X_selected.shape}")
+    save_object(ranked_idx, "./dnn_feature_ranking.pkl")
 
     # ----- 3. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
@@ -166,7 +174,6 @@ if __name__ == "__main__":
 
     # ----- 6. 训练级联修正器 -----
     print("识别基模型误分类样本，训练级联修正器...")
-    # 在训练集（重采样后）上预测，找到误分类样本
     base_probas = np.zeros((X_resampled.shape[0], len(model_list)))
     for i, m in enumerate(model_list):
         base_probas[:, i] = m.predict_proba(X_resampled)[:, 1]
@@ -209,12 +216,12 @@ if __name__ == "__main__":
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
-        "selector": selector,
+        "dnn_feature_ranking": ranked_idx,
         "base_models": model_list,
         "base_types": model_types,
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
     }
-    save_object(model_dict, "./model_pipeline_cascade.pkl")
-    print("已保存完整模型 ./model_pipeline_cascade.pkl")
+    save_object(model_dict, "./model_pipeline_cascade_dnn.pkl")
+    print("已保存完整模型 ./model_pipeline_cascade_dnn.pkl")
     print("=" * 60)
