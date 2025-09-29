@@ -29,8 +29,7 @@ def cascade_predict(base_models, meta_model, X, threshold=0.5):
     """
     级联预测：
     1. 所有基模型预测概率均值 -> 初步预测
-    2. 如果样本置信度较高（接近0或1），直接输出
-    3. 如果基模型预测分歧较大，则交给元分类器修正
+    2. 如果样本预测分歧较大 -> 交给元分类器修正
     """
     probas = np.zeros((X.shape[0], len(base_models)))
     for i, m in enumerate(base_models):
@@ -42,7 +41,7 @@ def cascade_predict(base_models, meta_model, X, threshold=0.5):
 
     preds = (avg_proba >= threshold).astype(int)
 
-    # 判断不确定样本：各模型预测分歧较大
+    # 判断不确定样本：各模型预测分歧
     disagreement = (probas > 0.5).sum(axis=1)
     uncertain_mask = (disagreement > 0) & (disagreement < len(base_models))
 
@@ -139,7 +138,7 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
     print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled==0).sum()}")
 
-    # ----- 5. 训练基模型 (CatBoost + BalancedRF) -----
+    # ----- 5. 训练基模型 -----
     model_list = []
     model_types = []
 
@@ -167,10 +166,15 @@ if __name__ == "__main__":
 
     # ----- 6. 训练级联修正器 -----
     print("识别基模型误分类样本，训练级联修正器...")
-    # 在验证集上预测
-    val_preds, val_probas = cascade_predict(model_list, GaussianNB(), X_holdout, threshold=0.5)
-    misclassified_mask = (val_preds != y_holdout)
-    X_hard, y_hard = X_holdout[misclassified_mask], y_holdout[misclassified_mask]
+    # 在训练集（重采样后）上预测，找到误分类样本
+    base_probas = np.zeros((X_resampled.shape[0], len(model_list)))
+    for i, m in enumerate(model_list):
+        base_probas[:, i] = m.predict_proba(X_resampled)[:, 1]
+    avg_train_proba = base_probas.mean(axis=1)
+    base_train_preds = (avg_train_proba >= 0.5).astype(int)
+
+    misclassified_mask = (base_train_preds != y_resampled)
+    X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
 
     if len(X_hard) > 0:
         meta_clf = GaussianNB()
@@ -178,8 +182,8 @@ if __name__ == "__main__":
         print(f"级联修正器训练完成，困难样本数={len(X_hard)}")
     else:
         meta_clf = GaussianNB()
-        meta_clf.fit(X_holdout, y_holdout)
-        print("未发现误分类样本，使用全部验证集训练修正器")
+        meta_clf.fit(X_resampled, y_resampled)
+        print("未发现误分类样本，使用全部训练集训练修正器")
 
     # ----- 7. 阈值选择（F1 最大化） -----
     final_preds, final_probas = cascade_predict(model_list, meta_clf, X_holdout, threshold=0.5)
