@@ -2,13 +2,12 @@
 import os
 import pickle
 import warnings
-import math
 
 import numpy as np
 import pandas as pd
-from imblearn.combine import SMOTEENN
 from catboost import CatBoostClassifier
-from sklearn.ensemble import RandomForestClassifier
+from imblearn.combine import SMOTEENN
+from imblearn.ensemble import BalancedRandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score
@@ -28,7 +27,7 @@ def save_object(obj, filepath):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始训练：SMOTEENN 重采样 -> CatBoost + RF -> 级联 GaussianNB")
+    print("开始训练：SMOTEENN 重采样 -> CatBoost + 平衡随机森林 -> 级联 GaussianNB")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -40,7 +39,7 @@ if __name__ == "__main__":
     # CatBoost 超参
     cat_params = {
         "iterations": 500,
-        "learning_rate": 0.05,
+        "learning_rate": 0.001,
         "depth": 8,
         "loss_function": "Logloss",
         "eval_metric": "AUC",
@@ -48,10 +47,10 @@ if __name__ == "__main__":
         "random_seed": random_state
     }
 
-    # RandomForest 超参
-    rf_n_estimators = 300
-    rf_max_depth = 12
-    rf_max_features = "sqrt"
+    # BalancedRandomForest 超参
+    brf_n_estimators = 300
+    brf_max_depth = 8
+    brf_max_features = "sqrt"
 
     # SelectKBest 候选
     candidate_k = [30, 50, 80, 100]
@@ -112,7 +111,7 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
     print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled==0).sum()}")
 
-    # ----- 5. 训练基模型 (CatBoost + RF) -----
+    # ----- 5. 训练基模型 (CatBoost + BalancedRF) -----
     model_list = []
     model_types = []
 
@@ -122,21 +121,21 @@ if __name__ == "__main__":
     model_list.append(cat)
     model_types.append("CatBoost")
 
-    # --- RandomForest ---
-    rf = RandomForestClassifier(
-        n_estimators=rf_n_estimators,
-        max_depth=rf_max_depth,
-        max_features=rf_max_features,
+    # --- BalancedRandomForest ---
+    brf = BalancedRandomForestClassifier(
+        n_estimators=brf_n_estimators,
+        max_depth=brf_max_depth,
+        max_features=brf_max_features,
         random_state=random_state,
         n_jobs=2
     )
-    rf.fit(X_resampled, y_resampled)
-    model_list.append(rf)
-    model_types.append("RandomForest")
+    brf.fit(X_resampled, y_resampled)
+    model_list.append(brf)
+    model_types.append("BalancedRandomForest")
 
     save_object(model_list, "./base_model_list.pkl")
     save_object(model_types, "./base_model_types.pkl")
-    print("已训练基模型：CatBoost + RF")
+    print("已训练基模型：CatBoost + BalancedRandomForest")
 
     # ----- 6. 构建元特征 -----
     def stack_probas(models, X):
