@@ -3,11 +3,9 @@ import pickle
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
-# 导入 BalancedRandomForestClassifier
 from imblearn.ensemble import BalancedRandomForestClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score
@@ -17,13 +15,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y
 
 # --- 设置环境变量以控制底层库的线程数 ---
-# 针对 8 核 CPU，设置为 6 是一个相对安全且能利用多核优势的选择
 os.environ["OMP_NUM_THREADS"] = "6"
 os.environ["MKL_NUM_THREADS"] = "6"
 os.environ["OPENBLAS_NUM_THREADS"] = "6"
 os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
-# --- 新的模型：决策树级联的平衡随机森林网络 ---
+
 class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
     """
     决策树级联的平衡随机森林网络
@@ -37,78 +34,69 @@ class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
         self.n_estimators = n_estimators
         self.max_layers = max_layers
         self.random_state = random_state
-        self.layers_ = []  # 存储每层的分类器
+        self.layers_ = []
         self.classes_ = None
-        self.initial_n_features_ = None # 记录原始特征数
+        self.initial_n_features_ = None
+        self.layer_input_dims_ = []  # 记录每层输入维度
 
     def fit(self, X, y):
         X, y = check_X_y(X, y, ensure_min_features=1)
         self.classes_ = np.unique(y)
-        self.initial_n_features_ = X.shape[1] # 记录初始特征数
+        self.initial_n_features_ = X.shape[1]
 
         current_input = X.copy()
 
         for layer_idx in range(self.max_layers):
-            # 1. 创建并训练当前层的 BalancedRandomForest
-            #    每层使用独立的随机种子
+            self.layer_input_dims_.append(current_input.shape[1])  # 记录输入维度
+
             layer_clf = BalancedRandomForestClassifier(
                 n_estimators=self.n_estimators,
-                random_state=self.random_state + layer_idx if self.random_state else layer_idx,
-                n_jobs=2 # 控制单个BRF的并行度
+                random_state=(self.random_state + layer_idx) if self.random_state else layer_idx,
+                n_jobs=2
             )
             layer_clf.fit(current_input, y)
             self.layers_.append(layer_clf)
 
-            # 2. 生成下一层的输入特征
-            #    使用 predict_proba 作为新特征 (对于二分类是2个特征)
             if len(self.classes_) == 2:
-                # 对于二分类，只需要正类的概率
                 probas = layer_clf.predict_proba(current_input)[:, 1:]
             else:
-                # 对于多分类，需要所有类别的概率
                 probas = layer_clf.predict_proba(current_input)
 
-            # 3. 拼接原始特征和新特征
             current_input = np.hstack((current_input, probas))
-            # 注意：我们不再更新 self.n_features_in_ 或任何其他可能在预测时使用的属性
-            #      以确保预测逻辑只依赖于初始特征数和层数。
 
         return self
 
     def predict_proba(self, X):
-        if not hasattr(self, 'layers_') or len(self.layers_) == 0:
+        if not hasattr(self, "layers_") or len(self.layers_) == 0:
             raise RuntimeError("必须先调用fit训练模型！")
+
         X = np.asarray(X)
-        if X.ndim != 2:
-            raise ValueError(f"期望2D数组，得到{X.ndim}D数组")
-        # 检查输入特征数是否与训练时的初始特征数匹配
         if X.shape[1] != self.initial_n_features_:
             raise ValueError(f"输入特征数 {X.shape[1]} 与训练时初始特征数 {self.initial_n_features_} 不匹配")
 
         current_input = X.copy()
 
-        # 逐层进行预测并生成新特征
-        for i, layer_clf in enumerate(self.layers_):
+        for layer_idx, layer_clf in enumerate(self.layers_):
+            expected_dim = self.layer_input_dims_[layer_idx]
+            if current_input.shape[1] != expected_dim:
+                raise ValueError(f"预测时第 {layer_idx} 层输入维度 {current_input.shape[1]} "
+                                 f"与训练时的 {expected_dim} 不一致")
+
             if len(self.classes_) == 2:
                 probas = layer_clf.predict_proba(current_input)[:, 1:]
             else:
                 probas = layer_clf.predict_proba(current_input)
-            # 拼接原始特征和新特征，为下一层做准备
+
             current_input = np.hstack((current_input, probas))
 
         # 返回最后一层的预测概率
-        # 正确的做法是返回最后一层处理后的 current_input 上的最后一部分概率
-        # 但我们也可以直接使用最后一层分类器对最后一次拼接后的 current_input 进行预测
-        # 这里选择使用最后一层分类器的 predict_proba 方法，它会处理好输入
-        # 但是输入必须是与它训练时最后一轮的输入格式一致
-        # 由于我们在训练和预测时都执行了相同的拼接操作，所以 current_input 是正确的
-        return layer_clf.predict_proba(current_input) # 使用循环结束时的 layer_clf
+        return self.layers_[-1].predict_proba(current_input[:, :self.layer_input_dims_[-1]])
 
     def predict(self, X):
         probas = self.predict_proba(X)
         return self.classes_[np.argmax(probas, axis=1)]
 
-# --- 保持原有的包装器不变 ---
+
 class CascadeForestWrapper(ClassifierMixin):
     def __init__(self, cascade_forest):
         self.cascade_forest = cascade_forest
@@ -129,101 +117,84 @@ class CascadeForestWrapper(ClassifierMixin):
         return {"cascade_forest": self.cascade_forest}
 
     def set_params(self, **params):
-        if 'cascade_forest' in params:
-            self.cascade_forest = params['cascade_forest']
+        if "cascade_forest" in params:
+            self.cascade_forest = params["cascade_forest"]
         return self
 
 
 def save_object(obj, filepath):
-    with open(filepath, 'wb') as f:
+    with open(filepath, "wb") as f:
         pickle.dump(obj, f)
         print(f"模型已保存至: {filepath}")
 
 
 def load_object(filepath):
-    with open(filepath, 'rb') as f:
+    with open(filepath, "rb") as f:
         return pickle.load(f)
 
 
-# --- 主程序 ---
 if __name__ == "__main__":
     print("=" * 50)
     print("开始数据预处理和模型训练...")
     print("=" * 50)
 
-    # 1. 加载数据
-    data = pd.read_csv('./clean.csv').drop(columns=['company_id'])
+    data = pd.read_csv("./clean.csv").drop(columns=["company_id"])
     print(f"原始数据形状: {data.shape}")
 
-    # 2. 编码分类变量
     data = pd.get_dummies(data, drop_first=True)
     print(f"编码后数据形状: {data.shape}")
 
-    # 3. 分离特征和标签
-    X = data.drop(columns=['target'])
-    y = data['target']
+    X = data.drop(columns=["target"])
+    y = data["target"]
     print(f"特征形状: {X.shape}, 标签形状: {y.shape}")
 
-    # 4. 处理缺失值
-    imputer = SimpleImputer(strategy='mean')
+    imputer = SimpleImputer(strategy="mean")
     X_imputed = imputer.fit_transform(X)
 
-    # 5. 特征缩放
-    # 注意：BalancedRandomForest 对特征缩放不敏感，但为了与其他模型保持一致，我们仍然进行缩放
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
 
-    # 6. 数据平衡 (注意：级联模型内部也处理平衡，这里的数据平衡是可选的，但保留)
     smote_enn = SMOTEENN(random_state=42)
     X_resampled, y_resampled = smote_enn.fit_resample(X_scaled, y)
     print(f"平衡后数据形状: {X_resampled.shape}")
 
-    # 7. 特征选择：选择固定数量的特征，避免在训练/测试时因数据不同导致特征数变化
-    #    例如，固定选择前 100 个特征
-    fixed_k = min(100, X_resampled.shape[1]) # 选择一个不会超过当前特征数的固定值
+    fixed_k = min(100, X_resampled.shape[1])
     selector = SelectKBest(score_func=f_classif, k=fixed_k)
     X_selected = selector.fit_transform(X_resampled, y_resampled)
     print(f"特征选择后数量: {X_selected.shape[1]}")
 
-    # 保存预处理组件
-    save_object(selector, './feature_selector_xgboost_cemmdan.pkl')
-    save_object(imputer, './imputer.pkl')
-    save_object(scaler, './scaler.pkl')
+    save_object(selector, "./feature_selector_xgboost_cemmdan.pkl")
+    save_object(imputer, "./imputer.pkl")
+    save_object(scaler, "./scaler.pkl")
 
-    # 8. 划分数据集
     X_train, X_test, y_train, y_test = train_test_split(
-        X_selected, y_resampled, test_size=0.1, random_state=42)
+        X_selected, y_resampled, test_size=0.1, random_state=42
+    )
 
-    # 9. 初始化新的级联平衡随机森林模型
     base_balanced_cascade = BalancedRandomForestCascade(
-        n_estimators=300, # 可以根据需要调整
-        max_layers=3,     # 可以根据需要调整
+        n_estimators=300,
+        max_layers=3,
         random_state=42
     )
     balanced_cascade = CascadeForestWrapper(base_balanced_cascade)
 
-    # 10. 构建集成模型 (保持其他部分不变)
-    adaboost = AdaBoostClassifier(n_estimators=700, algorithm='SAMME', random_state=42)
-    # 显式设置 StackingClassifier 的 n_jobs=2，避免使用全部核心
+    adaboost = AdaBoostClassifier(n_estimators=700, algorithm="SAMME", random_state=42)
     stacking_model = StackingClassifier(
         estimators=[
-            ('balanced_cascade', balanced_cascade), # 使用新的模型
-            ('adaboost', adaboost)
+            ("balanced_cascade", balanced_cascade),
+            ("adaboost", adaboost),
         ],
         final_estimator=GaussianNB(),
-        n_jobs=2,  # 修改点：从 -1 改为 2
+        n_jobs=2,
         cv=3
     )
 
-    # 11. 训练模型
     print("开始训练模型...")
     stacking_model.fit(X_train, y_train)
     print("模型训练完成！")
 
-    # 12. 保存模型
-    save_object(stacking_model, './model_pipeline_xgboost_cemmdan.pkl')
+    save_object(stacking_model, "./model_pipeline_xgboost_cemmdan.pkl")
 
-    # 13. 评估
     y_pred_test = stacking_model.predict(X_test)
     y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
 
