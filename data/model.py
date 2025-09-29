@@ -239,9 +239,9 @@ if __name__ == "__main__":
 
     # XGBoost 超参
     xgb_params = {
-        'max_depth': 10,
-        'learning_rate': 0.01,
-        'n_estimators': 700,
+        'max_depth': 6,
+        'learning_rate': 0.1,
+        'n_estimators': 300,
         'objective': 'binary:logistic',
         'eval_metric': 'logloss',  # 用于早停
         'random_state': random_state,
