@@ -1,13 +1,13 @@
-# train_ensemble_cascade_smoteen_catboost_dnn_torch.py
+# train_ensemble_cascade_smoteen_adaboost_dnn_torch.py
 import os
 import pickle
 import warnings
 
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier
 from imblearn.combine import SMOTEENN
 from imblearn.ensemble import BalancedRandomForestClassifier
+from sklearn.ensemble import AdaBoostClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -124,7 +124,7 @@ def youden_threshold(y_true, probas):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始训练：SMOTEENN -> CatBoost + 平衡随机森林 -> 级联 GaussianNB (Torch DNN 特征权重)")
+    print("开始训练：SMOTEENN -> AdaBoost + 平衡随机森林 -> 级联 GaussianNB (Torch DNN 特征权重)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -135,15 +135,11 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"当前计算设备: {device}")
 
-    # CatBoost 超参
-    cat_params = {
-        "iterations": 500,
-        "learning_rate": 0.001,
-        "depth": 8,
-        "loss_function": "Logloss",
-        "eval_metric": "AUC",
-        "verbose": False,
-        "random_seed": random_state
+    # AdaBoost 超参
+    ada_params = {
+        "n_estimators": 300,
+        "learning_rate": 0.05,
+        "random_state": random_state
     }
 
     # BalancedRandomForest 超参
@@ -194,10 +190,10 @@ if __name__ == "__main__":
     model_list = []
     model_types = []
 
-    cat = CatBoostClassifier(**cat_params)
-    cat.fit(X_resampled, y_resampled)
-    model_list.append(cat)
-    model_types.append("CatBoost")
+    ada = AdaBoostClassifier(**ada_params)
+    ada.fit(X_resampled, y_resampled)
+    model_list.append(ada)
+    model_types.append("AdaBoost")
 
     brf = BalancedRandomForestClassifier(
         n_estimators=brf_n_estimators,
@@ -212,7 +208,7 @@ if __name__ == "__main__":
 
     save_object(model_list, "./base_model_list.pkl")
     save_object(model_types, "./base_model_types.pkl")
-    print("已训练基模型：CatBoost + BalancedRandomForest")
+    print("已训练基模型：AdaBoost + BalancedRandomForest")
 
     # ----- 6. 训练级联修正器 -----
     print("识别基模型误分类样本，训练级联修正器...")
