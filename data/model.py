@@ -25,9 +25,37 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
+def cascade_predict(base_models, meta_model, X, threshold=0.5):
+    """
+    级联预测：
+    1. 所有基模型预测概率均值 -> 初步预测
+    2. 如果样本置信度较高（接近0或1），直接输出
+    3. 如果基模型预测分歧较大，则交给元分类器修正
+    """
+    probas = np.zeros((X.shape[0], len(base_models)))
+    for i, m in enumerate(base_models):
+        try:
+            probas[:, i] = m.predict_proba(X)[:, 1]
+        except Exception:
+            probas[:, i] = m.predict(X).astype(float)
+    avg_proba = probas.mean(axis=1)
+
+    preds = (avg_proba >= threshold).astype(int)
+
+    # 判断不确定样本：各模型预测分歧较大
+    disagreement = (probas > 0.5).sum(axis=1)
+    uncertain_mask = (disagreement > 0) & (disagreement < len(base_models))
+
+    if uncertain_mask.sum() > 0:
+        meta_preds = meta_model.predict(X[uncertain_mask])
+        preds[uncertain_mask] = meta_preds
+
+    return preds, avg_proba
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始训练：SMOTEENN 重采样 -> CatBoost + 平衡随机森林 -> 级联 GaussianNB")
+    print("开始训练：SMOTEENN 重采样 -> CatBoost + 平衡随机森林 -> 级联修正 GaussianNB")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -137,28 +165,25 @@ if __name__ == "__main__":
     save_object(model_types, "./base_model_types.pkl")
     print("已训练基模型：CatBoost + BalancedRandomForest")
 
-    # ----- 6. 构建元特征 -----
-    def stack_probas(models, X):
-        proba_mat = np.zeros((X.shape[0], len(models)))
-        for i, m in enumerate(models):
-            try:
-                proba = m.predict_proba(X)[:, 1]
-            except Exception:
-                proba = m.predict(X).astype(float)
-            proba_mat[:, i] = proba
-        return proba_mat
+    # ----- 6. 训练级联修正器 -----
+    print("识别基模型误分类样本，训练级联修正器...")
+    # 在验证集上预测
+    val_preds, val_probas = cascade_predict(model_list, GaussianNB(), X_holdout, threshold=0.5)
+    misclassified_mask = (val_preds != y_holdout)
+    X_hard, y_hard = X_holdout[misclassified_mask], y_holdout[misclassified_mask]
 
-    X_train_meta = stack_probas(model_list, X_resampled)
-    X_holdout_meta = stack_probas(model_list, X_holdout)
-    print(f"元特征: train {X_train_meta.shape}, holdout {X_holdout_meta.shape}")
+    if len(X_hard) > 0:
+        meta_clf = GaussianNB()
+        meta_clf.fit(X_hard, y_hard)
+        print(f"级联修正器训练完成，困难样本数={len(X_hard)}")
+    else:
+        meta_clf = GaussianNB()
+        meta_clf.fit(X_holdout, y_holdout)
+        print("未发现误分类样本，使用全部验证集训练修正器")
 
-    # ----- 7. 元分类器 GaussianNB -----
-    meta_clf = GaussianNB()
-    meta_clf.fit(X_train_meta, y_resampled)
-    save_object(meta_clf, "./meta_nb.pkl")
-
-    # ----- 8. 阈值选择（F1 最大化） -----
-    holdout_probas = meta_clf.predict_proba(X_holdout_meta)[:, 1]
+    # ----- 7. 阈值选择（F1 最大化） -----
+    final_preds, final_probas = cascade_predict(model_list, meta_clf, X_holdout, threshold=0.5)
+    holdout_probas = final_probas
     thresholds = np.linspace(0.01, 0.99, 99)
     best_thresh, best_f1 = 0.5, -1.0
     for t in thresholds:
@@ -176,7 +201,7 @@ if __name__ == "__main__":
     print(f"最佳阈值={best_thresh:.4f}, F1={best_f1:.4f}")
     print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
 
-    # ----- 9. 保存完整模型 -----
+    # ----- 8. 保存完整模型 -----
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
@@ -186,6 +211,6 @@ if __name__ == "__main__":
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
     }
-    save_object(model_dict, "./model_pipeline_smoteen_catboost.pkl")
-    print("已保存完整模型 ./model_pipeline_smoteen_catboost.pkl")
+    save_object(model_dict, "./model_pipeline_cascade.pkl")
+    print("已保存完整模型 ./model_pipeline_cascade.pkl")
     print("=" * 60)
