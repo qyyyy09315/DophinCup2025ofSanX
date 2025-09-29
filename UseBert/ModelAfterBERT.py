@@ -11,27 +11,28 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from imblearn.combine import SMOTETomek
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
 # --- 导入稀疏矩阵支持 ---
 from scipy import sparse
-from scipy.stats import skew, kurtosis
-# --- 导入聚类和异常检测用于特征工程 ---
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.ensemble import IsolationForest
 # --- 导入先进的特征工程库 ---
+from sklearn.ensemble import RandomForestRegressor
+# --- 导入预处理 ---
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (recall_score, precision_score, roc_auc_score, f1_score, accuracy_score,
                              precision_recall_curve, roc_curve, auc, confusion_matrix, classification_report)
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (StandardScaler, RobustScaler, QuantileTransformer,
                                    PowerTransformer, MinMaxScaler)
-# --- 导入 XGBoost 和 CatBoost ---
-from xgboost import XGBClassifier
-from catboost import CatBoostClassifier
+# --- 新增: 导入用于自适应采样的库 ---
+from sklearn.utils import resample
+from collections import Counter
+
+# --- 新增: 导入深度森林库 ---
+try:
+    from deepforest import CascadeForestClassifier
+except ImportError:
+    print("错误：未安装 'deep-forest' 库。请先运行 'pip install deep-forest'")
+    raise
 
 warnings.filterwarnings('ignore')
 
@@ -48,11 +49,8 @@ class AdvancedFeatureEngineer:
     """
     先进的特征工程管道，包含：
     1. 多种预处理技术
-    2. 统计特征生成
-    3. 聚类特征
-    4. 异常检测特征
-    5. 取消降维技术组合
-    6. 取消智能特征选择
+    2. 使用随机森林进行降维（可选）
+    3. 使用随机森林进行特征选择（可选，仅对非向量特征）
     """
 
     def __init__(self,
@@ -60,31 +58,15 @@ class AdvancedFeatureEngineer:
                  scaler_type='robust',  # 'standard', 'robust', 'quantile', 'power', 'minmax'
                  power_method='yeo-johnson',  # PowerTransformer method
 
-                 # 统计特征参数
-                 create_statistical_features=True,
-                 rolling_windows=[3, 5, 10],  # 滚动统计窗口
+                 # 降维参数 (使用随机森林)
+                 use_rf_decomposition=False,  # 默认关闭降维
+                 rf_n_components=50,  # 保留的特征数量
+                 rf_random_state=SEED,
 
-                 # 聚类特征参数
-                 create_cluster_features=True,
-                 n_clusters_kmeans=10,
-                 dbscan_eps=0.5,
-                 dbscan_min_samples=5,
-
-                 # 异常检测特征参数
-                 create_anomaly_features=True,
-                 isolation_contamination=0.1,
-                 lof_n_neighbors=20,
-
-                 # 取消降维参数
-                 use_multiple_decomposition=False,  # 设置为False以取消降维
-                 svd_components=50,
-                 ica_components=30,
-                 fa_components=20,
-
-                 # 取消特征选择参数
-                 variance_threshold=0.01,
-                 univariate_k_best=None,  # 设置为None以取消单变量选择
-                 rf_n_features_to_select=None,  # 设置为None以取消随机森林选择
+                 # 特征选择参数 (使用随机森林)
+                 use_rf_selection=True,  # 启用随机森林特征选择
+                 rf_n_features_to_select=100,  # 选择的特征数量，默认100
+                 rf_selection_random_state=SEED,
 
                  # 输出格式
                  force_sparse_output=False):  # 改为False，因为高级特征工程通常产生密集特征
@@ -92,40 +74,24 @@ class AdvancedFeatureEngineer:
         # 存储参数
         self.scaler_type = scaler_type
         self.power_method = power_method
-        self.create_statistical_features = create_statistical_features
-        self.rolling_windows = rolling_windows
-        self.create_cluster_features = create_cluster_features
-        self.n_clusters_kmeans = n_clusters_kmeans
-        self.dbscan_eps = dbscan_eps
-        self.dbscan_min_samples = dbscan_min_samples
-        self.create_anomaly_features = create_anomaly_features
-        self.isolation_contamination = isolation_contamination
-        self.lof_n_neighbors = lof_n_neighbors
-        self.use_multiple_decomposition = use_multiple_decomposition  # 降维已取消
-        self.svd_components = svd_components
-        self.ica_components = ica_components
-        self.fa_components = fa_components
-        self.variance_threshold = variance_threshold
-        self.univariate_k_best = univariate_k_best  # 特征选择已取消
-        self.rf_n_features_to_select = rf_n_features_to_select  # 特征选择已取消
+        self.use_rf_decomposition = use_rf_decomposition
+        self.rf_n_components = rf_n_components
+        self.rf_random_state = rf_random_state
+        self.use_rf_selection = use_rf_selection
+        self.rf_n_features_to_select = rf_n_features_to_select
+        self.rf_selection_random_state = rf_selection_random_state
         self.force_sparse_output = force_sparse_output
 
         # 初始化组件
         self.imputer_num = None
         self.scaler = None
         self.power_transformer = None
-        self.kmeans = None
-        self.dbscan = None
-        self.isolation_forest = None
-        self.lof = None
-        # 取消降维组件
-        self.svd = None
-        self.ica = None
-        self.fa = None
-        # 取消特征选择组件
-        self.variance_selector = None
-        self.univariate_selector = None
+        # 降维组件
+        self.rf_regressor = None
+        self.selected_rf_features_ = None
+        # 特征选择组件
         self.rf_selector = None
+        self.selected_features_indices_ = None  # 用于记录最终选择的特征索引
 
         # 记录特征信息
         self.original_feature_names = []  # 原始DataFrame列名
@@ -305,120 +271,6 @@ class AdvancedFeatureEngineer:
                 f"    -> 列 '{vec_col_name}' 已用维度为 {vector_dim} 的零向量填充缺失值/空向量/全NaN向量/维度不匹配向量。")
         return X_imputed_df
 
-    def _create_statistical_features(self, X_dense):
-        """创建统计特征"""
-        if not self.create_statistical_features:
-            return X_dense
-
-        print("  -> 创建统计特征...")
-        stat_features = []
-
-        stat_features.append(np.mean(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.std(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.max(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.min(X_dense, axis=1, keepdims=True))
-        stat_features.append(np.median(X_dense, axis=1, keepdims=True))
-
-        stat_features.append(skew(X_dense, axis=1).reshape(-1, 1))
-        stat_features.append(kurtosis(X_dense, axis=1).reshape(-1, 1))
-
-        stat_features.append(np.percentile(X_dense, 25, axis=1, keepdims=True))
-        stat_features.append(np.percentile(X_dense, 75, axis=1, keepdims=True))
-
-        mean_vals = np.mean(X_dense, axis=1, keepdims=True)
-        std_vals = np.std(X_dense, axis=1, keepdims=True)
-        cv = np.divide(std_vals, mean_vals + 1e-8)
-        stat_features.append(cv)
-
-        stat_features_array = np.concatenate(stat_features, axis=1)
-
-        stat_names = ['row_mean', 'row_std', 'row_max', 'row_min', 'row_median',
-                      'row_skew', 'row_kurtosis', 'row_q25', 'row_q75', 'row_cv']
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(stat_names)
-
-        print(f"    -> 创建了 {stat_features_array.shape[1]} 个统计特征")
-        return np.concatenate([X_dense, stat_features_array], axis=1)
-
-    def _create_cluster_features(self, X_dense):
-        """创建聚类特征"""
-        if not self.create_cluster_features:
-            return X_dense
-
-        print("  -> 创建聚类特征...")
-        cluster_features = []
-
-        if self.kmeans is None:
-            self.kmeans = KMeans(n_clusters=self.n_clusters_kmeans,
-                                 random_state=SEED, n_init=10)
-            kmeans_labels = self.kmeans.fit_predict(X_dense)
-        else:
-            kmeans_labels = self.kmeans.predict(X_dense)
-
-        kmeans_distances = self.kmeans.transform(X_dense)
-        cluster_features.append(kmeans_distances)
-
-        if self.dbscan is None:
-            self.dbscan = DBSCAN(eps=self.dbscan_eps,
-                                 min_samples=self.dbscan_min_samples, n_jobs=-1)
-            dbscan_labels = self.dbscan.fit_predict(X_dense)
-        else:
-            dbscan_labels = np.zeros(X_dense.shape[0])
-
-        cluster_features.append(kmeans_labels.reshape(-1, 1))
-        cluster_features.append(dbscan_labels.reshape(-1, 1))
-
-        cluster_features_array = np.concatenate(cluster_features, axis=1)
-
-        cluster_names = [f'kmeans_dist_{i}' for i in range(self.n_clusters_kmeans)]
-        cluster_names.extend(['kmeans_label', 'dbscan_label'])
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(cluster_names)
-
-        print(f"    -> 创建了 {cluster_features_array.shape[1]} 个聚类特征")
-        return np.concatenate([X_dense, cluster_features_array], axis=1)
-
-    def _create_anomaly_features(self, X_dense):
-        """创建异常检测特征"""
-        if not self.create_anomaly_features:
-            return X_dense
-
-        print("  -> 创建异常检测特征...")
-        anomaly_features = []
-
-        if self.isolation_forest is None:
-            self.isolation_forest = IsolationForest(
-                contamination=self.isolation_contamination,
-                random_state=SEED, n_jobs=-1)
-            iso_scores = self.isolation_forest.fit(X_dense).decision_function(X_dense)
-        else:
-            iso_scores = self.isolation_forest.decision_function(X_dense)
-
-        anomaly_features.append(iso_scores.reshape(-1, 1))
-
-        if self.lof is None:
-            self.lof = LocalOutlierFactor(
-                n_neighbors=self.lof_n_neighbors,
-                novelty=True, n_jobs=-1)
-            self.lof.fit(X_dense)
-            lof_scores = self.lof.decision_function(X_dense)
-        else:
-            lof_scores = self.lof.decision_function(X_dense)
-
-        anomaly_features.append(lof_scores.reshape(-1, 1))
-
-        anomaly_features_array = np.concatenate(anomaly_features, axis=1)
-
-        anomaly_names = ['isolation_score', 'lof_score']
-
-        # 更新建模特征名列表
-        self.feature_names_for_modeling.extend(anomaly_names)
-
-        print(f"    -> 创建了 {anomaly_features_array.shape[1]} 个异常检测特征")
-        return np.concatenate([X_dense, anomaly_features_array], axis=1)
-
     def fit(self, X, y=None):
         """拟合特征工程管道"""
         print("开始高级特征工程拟合...")
@@ -475,7 +327,8 @@ class AdvancedFeatureEngineer:
                                 validated_vectors.append(np.zeros(expected_dim_count))
 
                         try:
-                            expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                            expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims,
+                                                       index=X_imputed_df.index)
                             expanded_dfs.append(expanded_df)
                             print(f"      -> 成功展开 '{col}' 为 {len(expected_dims)} 个特征。")
                         except Exception as e:
@@ -559,21 +412,131 @@ class AdvancedFeatureEngineer:
 
         # 3. 高级特征工程 - Initialize modeling feature names with base ones
         self.feature_names_for_modeling = self.final_feature_names_after_processing.copy()
-        print("步骤 3: 高级特征工程...")
-        X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
+        print("步骤 3: 高级特征工程... (无额外统计、聚类、异常检测步骤)")
 
         print(f"特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # 4. 取消多重降维
-        if self.use_multiple_decomposition:
-            print("步骤 4: 多重降维... (已取消)")
-        else:
-            print("步骤 4: 多重降维已取消")
+        # 4. 使用随机森林进行降维 (可选)
+        if self.use_rf_decomposition and y is not None:
+            print("步骤 4 (可选): 使用随机森林进行降维...")
+            # 训练一个随机森林回归器来评估特征重要性
+            # 使用 y 作为目标，因为它在 fit 阶段是可用的
+            self.rf_regressor = RandomForestRegressor(
+                n_estimators=100,
+                max_features='sqrt',
+                random_state=self.rf_random_state,
+                n_jobs=-1
+            )
+            print(f"  -> 训练随机森林回归器以计算特征重要性...")
 
-        # 5. 取消智能特征选择
-        print("步骤 5: 智能特征选择... (已取消)")
+            # 关键修复：确保X_dense和y的行数一致
+            if X_dense.shape[0] != len(y):
+                print(f"  -> 警告：特征矩阵行数({X_dense.shape[0]})与标签向量长度({len(y)})不匹配")
+                min_len = min(X_dense.shape[0], len(y))
+                print(f"  -> 截断数据，保持行数一致: {min_len}")
+                X_dense = X_dense[:min_len]
+                y = y[:min_len]
+                print(f"  -> 修复后 - 特征矩阵形状: {X_dense.shape}, 标签形状: {y.shape}")
+
+            self.rf_regressor.fit(X_dense, y)
+
+            # 获取特征重要性并排序
+            importances = self.rf_regressor.feature_importances_
+            indices = np.argsort(importances)[::-1]  # 降序排列
+
+            # 选择前 n 个最重要的特征
+            n_select = min(self.rf_n_components, len(importances))
+            self.selected_rf_features_ = indices[:n_select]
+
+            print(f"  -> 基于随机森林重要性选择 {n_select} 个特征...")
+            X_dense = X_dense[:, self.selected_rf_features_]
+
+            # 更新特征名
+            selected_names = [self.feature_names_for_modeling[i] for i in self.selected_rf_features_]
+            self.feature_names_for_modeling = selected_names
+
+        else:
+            print("步骤 4 (可选): 随机森林降维未启用或目标变量不可用")
+
+        # 5. 使用随机森林进行特征选择 (可选)
+        if self.use_rf_selection and y is not None:
+            print("步骤 5 (可选): 使用随机森林进行特征选择...")
+
+            # 识别非向量特征的索引
+            non_vector_feature_indices = []
+            non_vector_feature_names = []
+            for i, name in enumerate(self.feature_names_for_modeling):
+                # 检查是否是向量特征（以 _emb_vector 结尾）
+                is_vector_feature = any(name.startswith(prefix) and name.endswith("_emb_vector")
+                                        for prefix in self.vector_expanded_feature_map.keys())
+                if not is_vector_feature:
+                    non_vector_feature_indices.append(i)
+                    non_vector_feature_names.append(name)
+
+            if not non_vector_feature_indices:
+                print("  -> 没有找到非向量特征，跳过特征选择。")
+            else:
+                print(f"  -> 识别出 {len(non_vector_feature_indices)} 个非向量特征用于选择。")
+
+                # 提取非向量特征
+                X_non_vector = X_dense[:, non_vector_feature_indices]
+
+                # 训练随机森林分类器
+                self.rf_selector = RandomForestRegressor(
+                    n_estimators=100,
+                    max_features='sqrt',
+                    random_state=self.rf_selection_random_state,
+                    n_jobs=-1
+                )
+                print(f"  -> 训练随机森林分类器以计算特征重要性...")
+
+                # 再次检查X_non_vector和y的行数
+                if X_non_vector.shape[0] != len(y):
+                    print(f"  -> 警告：非向量特征矩阵行数({X_non_vector.shape[0]})与标签向量长度({len(y)})不匹配")
+                    min_len = min(X_non_vector.shape[0], len(y))
+                    print(f"  -> 截断数据，保持行数一致: {min_len}")
+                    X_non_vector_selected = X_non_vector[:min_len]
+                    y_selected = y[:min_len]
+                else:
+                    X_non_vector_selected = X_non_vector
+                    y_selected = y
+
+                self.rf_selector.fit(X_non_vector_selected, y_selected)
+
+                # 获取特征重要性并排序
+                importances = self.rf_selector.feature_importances_
+                indices = np.argsort(importances)[::-1]  # 降序排列
+
+                # 选择前 n 个最重要的特征 (非向量)
+                n_select = min(self.rf_n_features_to_select, len(importances))
+                selected_non_vector_indices_local = indices[:n_select]  # 本地索引
+
+                # 转换为全局特征索引
+                selected_non_vector_indices_global = [non_vector_feature_indices[i] for i in
+                                                      selected_non_vector_indices_local]
+
+                # 识别向量特征的全局索引
+                vector_feature_indices_global = [i for i, name in enumerate(self.feature_names_for_modeling)
+                                                 if any(name.startswith(prefix) and name.endswith("_emb_vector")
+                                                        for prefix in self.vector_expanded_feature_map.keys())]
+
+                # 合并最终选择的特征索引 (向量特征 + 选择的非向量特征)，并排序以保持顺序
+                self.selected_features_indices_ = sorted(
+                    vector_feature_indices_global + selected_non_vector_indices_global)
+
+                print(f"  -> 保留所有 {len(vector_feature_indices_global)} 个向量特征。")
+                print(f"  -> 基于随机森林重要性选择了 {len(selected_non_vector_indices_global)} 个非向量特征。")
+                print(f"  -> 最终特征总数: {len(self.selected_features_indices_)}")
+
+                # 应用特征选择
+                X_dense = X_dense[:, self.selected_features_indices_]
+
+                # 更新特征名
+                selected_names = [self.feature_names_for_modeling[i] for i in self.selected_features_indices_]
+                self.feature_names_for_modeling = selected_names
+
+        else:
+            print("步骤 5 (可选): 随机森林特征选择未启用或目标变量不可用")
 
         # 记录最终特征数
         self.final_feature_count_after_engineering_ = X_dense.shape[1]
@@ -634,13 +597,14 @@ class AdvancedFeatureEngineer:
                             validated_vectors.append(np.zeros(expected_dim_count))
 
                     try:
-                        expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims)
+                        expanded_df = pd.DataFrame(validated_vectors, columns=expected_dims, index=X_imputed_df.index)
                         expanded_dfs.append(expanded_df)
                         print(f"      -> Transform: 成功展开 '{vec_col_name}' 为 {len(expected_dims)} 个特征。")
                     except Exception as e:
                         print(f"      -> Transform: 错误: 无法从列 '{vec_col_name}' 创建DataFrame ({e})，添加零列。")
                         # Add zero columns as fallback
-                        zero_df = pd.DataFrame(np.zeros((len(X), expected_dim_count)), columns=expected_dims)
+                        zero_df = pd.DataFrame(np.zeros((len(X), expected_dim_count)), columns=expected_dims,
+                                               index=X.index)
                         expanded_dfs.append(zero_df)
                 else:
                     print(f"    -> Transform: 警告: 向量列 '{vec_col_name}' 在transform数据中不存在。")
@@ -739,20 +703,24 @@ class AdvancedFeatureEngineer:
         X_dense = self.scaler.transform(X_dense)
         print(f"  -> transform 阶段，经过 Scaler transform 后的特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
-        # Recreate engineered features just like in fit
-        X_dense = self._create_statistical_features(X_dense)
-        X_dense = self._create_cluster_features(X_dense)
-        X_dense = self._create_anomaly_features(X_dense)
-        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
+        # Skip statistical, cluster, anomaly features as per config
+        print("  -> transform 阶段，高级特征工程... (无额外统计、聚类、异常检测步骤)")
 
-        # Skip decomposition steps as per config
-        if self.use_multiple_decomposition:
-            print("  -> transform 阶段，多重降维... (已取消)")
+        # Apply random forest dimensionality reduction if fitted
+        if self.use_rf_decomposition and self.selected_rf_features_ is not None:
+            print("  -> transform 阶段，应用随机森林降维...")
+            X_dense = X_dense[:, self.selected_rf_features_]
         else:
-            print("  -> transform 阶段，多重降维已取消")
+            print("  -> transform 阶段，随机森林降维未应用")
 
-        # Skip selection steps as per config
-        print("  -> transform 阶段，特征选择... (已取消)")
+        # Apply random forest feature selection if fitted
+        if self.use_rf_selection and self.selected_features_indices_ is not None:
+            print("  -> transform 阶段，应用随机森林特征选择...")
+            X_dense = X_dense[:, self.selected_features_indices_]
+        else:
+            print("  -> transform 阶段，随机森林特征选择未应用")
+
+        print(f"  -> transform 阶段，特征工程后特征数: {X_dense.shape[1]} (形状: {X_dense.shape})")
 
         # Final consistency check enforced strictly
         if self.final_feature_count_after_engineering_ is not None:
@@ -776,6 +744,114 @@ class AdvancedFeatureEngineer:
     def fit_transform(self, X, y=None):
         """组合fit和transform"""
         return self.fit(X, y).transform(X)
+
+
+# --- 修改: 自适应采样策略类 ---
+class AdaptiveSampler:
+    """
+    实现多种自适应采样策略来处理不平衡数据集。
+    """
+
+    def __init__(self, strategy='smote', random_state=SEED, **kwargs):
+        """
+        初始化采样器。
+
+        :param strategy: 采样策略 ('undersample', 'oversample', 'hybrid')
+        :param random_state: 随机种子
+        :param kwargs: 其他参数，例如 n_samples_ratio (oversample/undersample 比例)
+        """
+        self.strategy = strategy.lower()
+        self.random_state = random_state
+        self.kwargs = kwargs
+        self.original_class_distribution = None
+
+    def fit_resample(self, X, y):
+        """
+        根据指定策略对数据进行采样。
+
+        :param X: 特征数据 (DataFrame 或 array)
+        :param y: 标签数据 (array)
+        :return: 采样后的 X_resampled, y_resampled
+        """
+        print(f"\n=== 使用自适应采样策略: {self.strategy.upper()} ===")
+        self.original_class_distribution = Counter(y)
+        print(f"原始类别分布: {dict(self.original_class_distribution)}")
+
+        # 确保 X 是 DataFrame，y 是 Series，并且它们共享相同的索引
+        X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        y_series = pd.Series(y) if not isinstance(y, pd.Series) else y.copy()
+
+        # 重置索引以确保对齐
+        X_df.reset_index(drop=True, inplace=True)
+        y_series.reset_index(drop=True, inplace=True)
+
+        # 计算目标样本比例
+        n_samples_ratio = self.kwargs.get('n_samples_ratio', 1.0)  # 默认平衡到1:1
+        majority_class = max(self.original_class_distribution, key=self.original_class_distribution.get)
+        minority_class = min(self.original_class_distribution, key=self.original_class_distribution.get)
+        n_minority = self.original_class_distribution[minority_class]
+        n_majority = self.original_class_distribution[majority_class]
+
+        if self.strategy == 'undersample':
+            target_majority_count = int(n_minority * n_samples_ratio)
+            target_minority_count = n_minority
+        elif self.strategy == 'oversample':
+            target_minority_count = int(n_majority * n_samples_ratio)
+            target_majority_count = n_majority
+        elif self.strategy == 'hybrid':
+            # 混合策略：轻微下采样多数类，轻微上采样少数类
+            reduction_factor = 0.6  # 将多数类减少到原来的80%
+            increase_factor = 1.4  # 将少数类增加到原来的120%
+            target_majority_count = int(n_majority * reduction_factor)
+            target_minority_count = int(n_minority * increase_factor)
+        else:
+            raise ValueError(f"不支持的采样策略: {self.strategy}")
+
+        print(
+            f"目标采样后类别分布: {minority_class}: {target_minority_count}, {majority_class}: {target_majority_count}")
+
+        # 分离多数类和少数类，使用 loc 进行安全的选择
+        majority_mask = (y_series == majority_class)
+        minority_mask = (y_series == minority_class)
+
+        df_majority = X_df.loc[majority_mask].copy()
+        df_minority = X_df.loc[minority_mask].copy()
+
+        # 添加目标列
+        df_majority['target'] = majority_class
+        df_minority['target'] = minority_class
+
+        # 执行采样
+        if self.strategy in ['undersample', 'hybrid']:
+            df_majority_downsampled = resample(df_majority,
+                                               replace=False,
+                                               n_samples=target_majority_count,
+                                               random_state=self.random_state)
+            print(f"  -> 下采样多数类: {len(df_majority)} -> {len(df_majority_downsampled)}")
+        else:
+            df_majority_downsampled = df_majority
+
+        if self.strategy in ['oversample', 'hybrid']:
+            df_minority_upsampled = resample(df_minority,
+                                             replace=True,
+                                             n_samples=target_minority_count,
+                                             random_state=self.random_state)
+            print(f"  -> 上采样少数类: {len(df_minority)} -> {len(df_minority_upsampled)}")
+        else:
+            df_minority_upsampled = df_minority
+
+        # 合并采样后的数据
+        df_resampled = pd.concat([df_majority_downsampled, df_minority_upsampled])
+        df_resampled = df_resampled.sample(frac=1, random_state=self.random_state).reset_index(drop=True)  # Shuffle
+
+        X_resampled = df_resampled.drop('target', axis=1)
+        y_resampled = df_resampled['target'].values
+
+        final_distribution = Counter(y_resampled)
+        print(f"采样后最终类别分布: {dict(final_distribution)}")
+        print("=" * 40)
+
+        return X_resampled, y_resampled
 
 
 # --- 其他函数保持不变 ---
@@ -874,126 +950,127 @@ def ensemble_predict_proba(models, X):
     return avg_proba
 
 
-def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, feature_engineer_params=None):
-    """使用先进特征工程的训练评估流程"""
+def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test,
+                                feature_engineer_params=None, sampler_params=None):
+    """使用先进特征工程和自适应采样的训练评估流程"""
     print("\n=== 构建先进特征工程管道 ===")
+
+    # --- 新增: 初始化并应用自适应采样 ---
+    if sampler_params:
+        sampler = AdaptiveSampler(**sampler_params)
+        X_train_resampled, y_train_resampled = sampler.fit_resample(X_train, y_train)
+        print(f"训练集采样后形状: X={X_train_resampled.shape}, y={y_train_resampled.shape}")
+    else:
+        X_train_resampled, y_train_resampled = X_train, y_train
+        print("未使用自适应采样。")
 
     # 特征工程
     feature_engineer = AdvancedFeatureEngineer(**feature_engineer_params)
 
-    # XGBoost 模型 - 关注少数类
-    xgb_classifier = XGBClassifier(
-        n_estimators=500,
-        max_depth=10,
-        learning_rate=0.01,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=SEED,
-        n_jobs=-1,
-        eval_metric='logloss',
-        scale_pos_weight=1.0 / np.mean(y_train),  # 关注少数类
-        verbosity=1
-    )
+    # --- 替换为深度森林模型 ---
+    print("\n=== 初始化深度森林模型 ===")
+    # CascadeForestClassifier 参数说明:
+    # n_estimators: 每层森林中的树的数量
+    # n_trees: 同 n_estimators
+    # max_depth: 树的最大深度
+    # min_samples_split: 分割内部节点所需的最小样本数
+    # min_samples_leaf: 叶子节点上的最小样本数
+    # use_predictor: 是否使用最终的全局预测器（如 Logistic Regression）
+    # predictor_kwargs: 传递给全局预测器的参数
+    # n_tolerant_rounds: 触发早停的容忍轮数
+    # delta: 性能提升小于delta时触发早停
+    # backend: 使用的后端 ('sklearn', 'torch')
+    # n_jobs: 并行作业数 (-1 表示使用所有处理器)
+    # random_state: 随机种子
 
-    # CatBoost 模型 - 关注少数类
-    cat_classifier = CatBoostClassifier(
-        iterations=500,
-        depth=10,
-        learning_rate=0.01,
-        subsample=0.8,
-        random_strength=0.8,
-        random_seed=SEED,
-        verbose=False,
-        class_weights=[1.0, 1.0 / np.mean(y_train)],  # 关注少数类
-        eval_metric='Logloss'
+    # 注意: CascadeForestClassifier 是一个集成学习框架，
+    # 它本身包含了多层随机森林，因此不需要像之前那样单独训练两个模型再融合。
+
+    # 示例配置 (您可以根据需要调整这些超参数)
+    deep_forest_classifier = CascadeForestClassifier(
+        n_estimators=4,  # 每层森林的估计器数量 (默认4)
+        n_layers=5,  # 级联层数量 (默认不限制，直到早停)
+        max_depth=None,  # 树的最大深度 (None表示不限制)
+        min_samples_split=2,  # 分割所需最小样本数
+        min_samples_leaf=1,  # 叶子节点最小样本数
+        use_predictor=True,  # 使用最终的全局预测器 (如LR)
+        predictor_kwargs={'C': 1.0},  # 全局预测器参数
+        n_tolerant_rounds=2,  # 早停容忍轮数
+        delta=1e-5,  # 早停性能提升阈值
+        backend='sklearn',  # 使用 scikit-learn 后端
+        n_jobs=-1,  # 使用全部 CPU 核心
+        random_state=SEED  # 固定随机种子
     )
+    print(f"深度森林模型初始化完毕:\n{deep_forest_classifier}")
 
     # 1. 拟合特征工程器
     print("\n=== 拟合特征工程器 ===")
-    feature_engineer.fit(X_train, y_train)
-    X_train_engineered = feature_engineer.transform(X_train)
+    feature_engineer.fit(X_train_resampled, y_train_resampled)
+    X_train_engineered = feature_engineer.transform(X_train_resampled)
     print(f"  -> 训练集特征工程后形状: {X_train_engineered.shape}")
 
     # 2. 模型训练
-    print("\n=== 开始 XGBoost 模型训练 ===")
-    print(f"  -> XGBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
-    
+    print("\n=== 开始深度森林模型训练 ===")
+    print(f"  -> 深度森林输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
+
     # 关键修复：检查特征矩阵行数与标签向量长度是否匹配
     if X_train_engineered.shape[0] == 0:
-        raise ValueError("致命错误：XGBoost训练数据特征矩阵行数为0！")
-    
+        raise ValueError("致命错误：深度森林训练数据特征矩阵行数为0！")
+
     # 新添加：检查特征矩阵行数与标签向量长度是否一致
-    if X_train_engineered.shape[0] != len(y_train):
-        print(f"警告：特征矩阵行数({X_train_engineered.shape[0]})与标签向量长度({len(y_train)})不匹配")
+    if X_train_engineered.shape[0] != len(y_train_resampled):
+        print(f"警告：特征矩阵行数({X_train_engineered.shape[0]})与标签向量长度({len(y_train_resampled)})不匹配")
         # 尝试修复：截断较长的一方以匹配较短的一方
-        min_len = min(X_train_engineered.shape[0], len(y_train))
+        min_len = min(X_train_engineered.shape[0], len(y_train_resampled))
         print(f"  -> 截断数据，保持行数一致: {min_len}")
         X_train_engineered = X_train_engineered[:min_len]
-        y_train = y_train[:min_len]
-        print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
-    
-    start_time = time.time()
-    xgb_classifier.fit(X_train_engineered, y_train)
-    end_time = time.time()
-    print(f"XGBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
+        y_train_resampled = y_train_resampled[:min_len]
+        print(f"  -> 修复后 - 特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train_resampled.shape}")
 
-    print("\n=== 开始 CatBoost 模型训练 ===")
-    print(f"  -> CatBoost 输入特征矩阵形状: {X_train_engineered.shape}, 标签形状: {y_train.shape}")
     start_time = time.time()
-    
-    # 对验证集也进行同样的检查和修复
-    X_val_engineered_temp = feature_engineer.transform(X_val)
-    if X_val_engineered_temp.shape[0] != len(y_val):
-        print(f"警告：验证集特征矩阵行数({X_val_engineered_temp.shape[0]})与标签向量长度({len(y_val)})不匹配")
-        min_len_val = min(X_val_engineered_temp.shape[0], len(y_val))
-        print(f"  -> 截断验证集数据，保持行数一致: {min_len_val}")
-        X_val_engineered_temp = X_val_engineered_temp[:min_len_val]
-        y_val_temp = y_val[:min_len_val]
-        print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered_temp.shape}, 标签形状: {y_val_temp.shape}")
-    else:
-        y_val_temp = y_val
-    
-    cat_classifier.fit(X_train_engineered, y_train, eval_set=(X_val_engineered_temp, y_val_temp),
-                       early_stopping_rounds=50)
+    # 深度森林直接调用 fit 方法即可
+    deep_forest_classifier.fit(X_train_engineered, y_train_resampled)
     end_time = time.time()
-    print(f"CatBoost 模型训练耗时: {end_time - start_time:.2f} 秒")
+    print(f"深度森林模型训练耗时: {end_time - start_time:.2f} 秒")
 
-    # 3. 保存模型
+    # 3. 保存模型 (注意: CascadeForestClassifier 可能需要特殊处理才能pickle)
     trained_pipeline = Pipeline([
         ('feature_engineer', feature_engineer),
-        ('xgb_classifier', xgb_classifier),
-        ('cat_classifier', cat_classifier)
+        ('classifier', deep_forest_classifier)
     ])
-    save_model(trained_pipeline, 'advanced_feature_engineering_ensemble_model.pkl')
+    try:
+        save_model(trained_pipeline, 'advanced_feature_engineering_deep_forest_model.pkl')
+    except Exception as e:
+        print(f"警告：模型保存失败: {e}. 尝试只保存特征工程器...")
+        save_model(feature_engineer, 'advanced_feature_engineering_only.pkl')
+        print("如果您需要完整的模型，请手动序列化 CascadeForestClassifier。")
 
     # 4. 验证集阈值选择
     print("\n=== 验证集阈值选择 ===")
-    # 使用之前修复过的验证集特征工程数据，而不是重新生成
-    X_val_engineered = X_val_engineered_temp
-    y_val_used = y_val_temp
+    X_val_engineered = feature_engineer.transform(X_val)
     print(f"  -> 验证集特征工程后形状: {X_val_engineered.shape}")
-    
+
     # 对验证集也进行同样的检查和修复（如果需要）
-    if X_val_engineered.shape[0] != len(y_val_used):
-        print(f"警告：验证集特征矩阵行数({X_val_engineered.shape[0]})与标签向量长度({len(y_val_used)})不匹配")
-        min_len_val = min(X_val_engineered.shape[0], len(y_val_used))
+    if X_val_engineered.shape[0] != len(y_val):
+        print(f"警告：验证集特征矩阵行数({X_val_engineered.shape[0]})与标签向量长度({len(y_val)})不匹配")
+        min_len_val = min(X_val_engineered.shape[0], len(y_val))
         print(f"  -> 截断验证集数据，保持行数一致: {min_len_val}")
         X_val_engineered = X_val_engineered[:min_len_val]
-        y_val_used = y_val_used[:min_len_val]
+        y_val_used = y_val[:min_len_val]
         print(f"  -> 修复后 - 验证集特征矩阵形状: {X_val_engineered.shape}, 标签形状: {y_val_used.shape}")
-    
-    val_proba_xgb = xgb_classifier.predict_proba(X_val_engineered)[:, 1]
-    val_proba_cat = cat_classifier.predict_proba(X_val_engineered)[:, 1]
-    val_proba_ensemble = (val_proba_xgb + val_proba_cat) / 2.0
+    else:
+        y_val_used = y_val
 
-    threshold_f1 = find_best_f1_threshold(y_val_used, val_proba_ensemble)
-    threshold_high_recall = find_threshold_for_max_recall(y_val_used, val_proba_ensemble, min_precision=0.4)
+    val_proba = deep_forest_classifier.predict_proba(X_val_engineered)[:, 1]
+
+    threshold_f1 = find_best_f1_threshold(y_val_used, val_proba)
+    threshold_high_recall = find_threshold_for_max_recall(y_val_used, val_proba, min_precision=0.4)
 
     # 5. 测试集评估
     print("\n=== 测试集评估 ===")
     X_test_engineered = feature_engineer.transform(X_test)
     print(f"  -> 测试集特征工程后形状: {X_test_engineered.shape}")
-    
+
     # 对测试集也进行同样的检查和修复
     if X_test_engineered.shape[0] != len(y_test):
         print(f"警告：测试集特征矩阵行数({X_test_engineered.shape[0]})与标签向量长度({len(y_test)})不匹配")
@@ -1004,16 +1081,14 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         print(f"  -> 修复后 - 测试集特征矩阵形状: {X_test_engineered.shape}, 标签形状: {y_test_temp.shape}")
     else:
         y_test_temp = y_test
-    
-    test_proba_xgb = xgb_classifier.predict_proba(X_test_engineered)[:, 1]
-    test_proba_cat = cat_classifier.predict_proba(X_test_engineered)[:, 1]
-    test_proba_ensemble = (test_proba_xgb + test_proba_cat) / 2.0
+
+    test_proba = deep_forest_classifier.predict_proba(X_test_engineered)[:, 1]
 
     # F1优化阈值评估
     print("\n--- 使用 F1 优化阈值评估 ---")
-    y_pred_f1 = (test_proba_ensemble >= threshold_f1).astype(int)
+    y_pred_f1 = (test_proba >= threshold_f1).astype(int)
     recall_f1 = recall_score(y_test_temp, y_pred_f1)
-    auc_f1 = roc_auc_score(y_test_temp, test_proba_ensemble)
+    auc_f1 = roc_auc_score(y_test_temp, test_proba)
     precision_f1 = precision_score(y_test_temp, y_pred_f1)
     f1_f1 = f1_score(y_test_temp, y_pred_f1)
     accuracy_f1 = accuracy_score(y_test_temp, y_pred_f1)
@@ -1027,9 +1102,9 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # 高召回率阈值评估
     print("\n--- 使用高召回率阈值评估 ---")
-    y_pred_hr = (test_proba_ensemble >= threshold_high_recall).astype(int)
+    y_pred_hr = (test_proba >= threshold_high_recall).astype(int)
     recall_hr = recall_score(y_test_temp, y_pred_hr)
-    auc_hr = roc_auc_score(y_test_temp, test_proba_ensemble)
+    auc_hr = roc_auc_score(y_test_temp, test_proba)
     precision_hr = precision_score(y_test_temp, y_pred_hr)
     f1_hr = f1_score(y_test_temp, y_pred_hr)
     accuracy_hr = accuracy_score(y_test_temp, y_pred_hr)
@@ -1043,8 +1118,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
 
     # 可视化评估结果
     print("\n=== 绘制评估图表 ===")
-    evaluate_and_plot(y_test_temp, test_proba_ensemble, threshold_f1, threshold_high_recall,
-                      model_name="Advanced Feature Engineering Ensemble (XGBoost & CatBoost)")
+    evaluate_and_plot(y_test_temp, test_proba, threshold_f1, threshold_high_recall,
+                      model_name="Advanced Feature Engineering Deep Forest")
 
     return {
         'recall': recall_f1,
@@ -1052,7 +1127,7 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
         'precision': precision_f1,
         'f1': f1_f1,
         'accuracy': accuracy_f1,
-        'y_proba': test_proba_ensemble,
+        'y_proba': test_proba,
         'y_pred': y_pred_f1,
         'threshold': threshold_f1,
         'high_recall_results': {
@@ -1062,7 +1137,8 @@ def train_and_evaluate_advanced(X_train, y_train, X_val, y_val, X_test, y_test, 
             'threshold': threshold_high_recall
         },
         'trained_model': trained_pipeline,
-        'individual_models': [xgb_classifier, cat_classifier]
+        'individual_models': [deep_forest_classifier],  # 单一模型
+        'sampler': sampler if sampler_params else None  # 保存采样器
     }
 
 
@@ -1079,67 +1155,33 @@ def main():
         'scaler_type': 'robust',  # 使用鲁棒缩放，对异常值更稳健
         'power_method': 'yeo-johnson',  # Yeo-Johnson变换处理偏态分布
 
-        # 统计特征配置
-        'create_statistical_features': True,
-        'rolling_windows': [3, 5, 10],
+        # 降维配置 (使用随机森林) - 已关闭
+        'use_rf_decomposition': False,  # 关闭降维
+        'rf_n_components': 50,
+        'rf_random_state': SEED,
 
-        # 聚类特征配置
-        'create_cluster_features': True,
-        'n_clusters_kmeans': 15,  # 增加聚类数量
-        'dbscan_eps': 0.3,
-        'dbscan_min_samples': 5,
-
-        # 异常检测特征配置
-        'create_anomaly_features': True,
-        'isolation_contamination': 0.05,  # 假设5%的数据是异常值
-        'lof_n_neighbors': 20,
-
-        # 取消多重降维配置
-        'use_multiple_decomposition': False,  # 关闭降维
-        'svd_components': 80,  # 降维已取消
-        'ica_components': 50,  # 降维已取消
-        'fa_components': 30,  # 降维已取消
-
-        # 取消特征选择配置
-        'variance_threshold': 0.01,  # 特征选择已取消
-        'univariate_k_best': None,  # 取消单变量选择
-        'rf_n_features_to_select': None,  # 取消随机森林选择
+        # 特征选择配置 (使用随机森林) - 已启用
+        'use_rf_selection': True,  # 启用特征选择
+        'rf_n_features_to_select': 80,  # 选择非向量特征
+        'rf_selection_random_state': SEED,
 
         # 输出格式
         'force_sparse_output': False  # 使用密集矩阵，便于高级特征工程
     }
 
+    # --- 新增: 配置自适应采样参数 ---
+    sampler_params = {
+        'strategy': 'hybrid',  # 'undersample', 'oversample', 'hybrid'
+        'n_samples_ratio': 1.0,  # 目标多数类/少数类的比例
+        'random_state': SEED
+    }
+    print(f"使用的自适应采样参数: {sampler_params}")
+
     # 数据加载
     print("\n=== 数据加载 ===")
     try:
         # 实际读取方式如下所示，请替换为你自己的路径
-        data = pd.read_parquet('train_bert_embedded.parquet')
-        # --- 模拟数据用于测试 ---
-        # np.random.seed(SEED)
-        # n_samples = 1000
-        # n_emb_features_per_group = 10
-        # n_other_features = 5
-        #
-        # # 创建模拟嵌入特征组
-        # emb_data = {}
-        # for i in range(2):  # 2个嵌入组
-        #     for j in range(n_emb_features_per_group):
-        #         # 添加一些NaN来模拟缺失值
-        #         vals = np.random.randn(n_samples)
-        #         if j % 10 == 0:  # 每10个特征让一个有缺失
-        #             vals[np.random.choice(n_samples, size=int(0.05 * n_samples), replace=False)] = np.nan
-        #         emb_data[f"group_{i}_emb_{j}"] = vals
-        #
-        # # 创建其他特征
-        # other_data = {f"other_feature_{i}": np.random.randn(n_samples) for i in range(n_other_features)}
-        #
-        # # 创建目标变量
-        # y_data = np.random.binomial(1, 0.1, n_samples)  # 不平衡数据
-        #
-        # # 合并数据
-        # all_data = {**emb_data, **other_data, "target": y_data}
-        # data = pd.DataFrame(all_data)
-        # --- 模拟数据结束 ---
+        data = pd.read_parquet('train_bert_enhanced_embedded_hier.parquet')
 
         if "company_id" in data.columns:
             data = data.drop(columns=["company_id"])
@@ -1179,7 +1221,8 @@ def main():
     try:
         results = train_and_evaluate_advanced(
             X_train, y_train, X_val, y_val, X_test, y_test,
-            feature_engineer_params=feature_engineer_params
+            feature_engineer_params=feature_engineer_params,
+            sampler_params=sampler_params  # 传递采样参数
         )
     except Exception as e:
         print(f"训练流程发生错误: {e}")
@@ -1215,7 +1258,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
