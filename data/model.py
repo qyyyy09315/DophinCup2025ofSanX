@@ -1,4 +1,3 @@
-# train_ensemble_cascade_smoteen_adaboost_dnn_torch_fixed_with_residual.py
 import os
 import pickle
 import warnings
@@ -7,15 +6,20 @@ import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
 # 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
-from imblearn.ensemble import BalancedRandomForestClassifier
-# 注意：AdaBoostClassifier 的 base_estimator 参数在 sklearn 新版本中已被弃用，应使用 estimator 参数替代
-from sklearn.ensemble import AdaBoostClassifier
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
+
+# 导入 XGBoost
+try:
+    import xgboost as xgb
+
+    XGB_AVAILABLE = True
+except ImportError:
+    print("警告: 未找到 xgboost 库。请运行 'pip install xgboost' 进行安装。")
+    XGB_AVAILABLE = False
 
 import torch
 import torch.nn as nn
@@ -33,25 +37,27 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
-def cascade_predict(base_models, meta_model, X, threshold=0.5):
-    probas = np.zeros((X.shape[0], len(base_models)))
-    for i, m in enumerate(base_models):
-        try:
-            probas[:, i] = m.predict_proba(X)[:, 1]
-        except Exception:
-            probas[:, i] = m.predict(X).astype(float)
-    avg_proba = probas.mean(axis=1)
+def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
+    """
+    修改版cascade_predict，适用于单个基模型。
+    修复了当meta_model为None时的错误处理
+    """
+    try:
+        probas_base = base_model.predict_proba(X)[:, 1]
+    except Exception:
+        probas_base = base_model.predict(X).astype(float)
 
-    preds = (avg_proba >= threshold).astype(int)
+    preds = (probas_base >= threshold).astype(int)
 
-    disagreement = (probas > 0.5).sum(axis=1)
-    uncertain_mask = (disagreement > 0) & (disagreement < len(base_models))
+    # 简化的不确定性判断：这里我们假设当概率接近0.5时不确定
+    uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)  # 可调整阈值
 
-    if uncertain_mask.sum() > 0:
+    # 只有当meta_model不为None且存在不确定样本时才使用meta_model
+    if meta_model is not None and uncertain_mask.sum() > 0:
         meta_preds = meta_model.predict(X[uncertain_mask])
         preds[uncertain_mask] = meta_preds
 
-    return preds, avg_proba
+    return preds, probas_base
 
 
 # 定义一个带残差连接的块
@@ -200,8 +206,12 @@ def youden_threshold(y_true, probas):
 
 
 if __name__ == "__main__":
+    if not XGB_AVAILABLE:
+        print("错误: 缺少必要依赖库 xgboost。程序退出。")
+        exit(1)
+
     print("=" * 60)
-    print("开始训练：SMOTEENN -> AdaBoost(DecisionTree) + 平衡随机森林 -> 级联 GaussianNB (Torch DNN 特征权重)")
+    print("开始训练：SMOTEENN -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
     print("-> DNN 使用残差网络并利用 GPU (如果可用)")
     print("=" * 60)
 
@@ -227,21 +237,19 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"当前计算设备: {device}")
 
-    # AdaBoost 超参 (关键修改点: 将 base_estimator 替换为 estimator)
-    ada_params = {
-        # 原始参数: "base_estimator": DecisionTreeClassifier(max_depth=3, random_state=random_state),
-        # 修改后参数:
-        "estimator": DecisionTreeClassifier(max_depth=8, random_state=random_state),
-        "n_estimators": 300,
-        "learning_rate": 0.05,
-        "random_state": random_state,
-        "algorithm": "SAMME"  # 显式指定算法以兼容新版本sklearn和DecisionTreeClassifier
+    # XGBoost 超参
+    xgb_params = {
+        'max_depth': 6,
+        'learning_rate': 0.1,
+        'n_estimators': 200,
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',  # 用于早停
+        'random_state': random_state,
+        'n_jobs': -1,
+        # 启用 GPU (如果可用且配置了 GPU 支持的 XGBoost)
+        'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist',
+        'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
     }
-
-    # BalancedRandomForest 超参
-    brf_n_estimators = 300
-    brf_max_depth = 8
-    brf_max_features = "sqrt"
 
     # ----- 1. 读取并预处理数据 -----
     data = pd.read_csv(data_path)
@@ -292,38 +300,52 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
     print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
 
-    # ----- 5. 训练基模型 -----
-    model_list = []
-    model_types = []
+    # ----- 5. 训练基模型 (改为 XGBoost) -----
+    print("训练 XGBoost 基模型 ...")
+    # 准备 XGBoost 数据集以便使用早停功能（可选）
+    dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
+    dval = xgb.DMatrix(X_holdout, label=y_holdout)
 
-    # 关键修改: 使用更新后的参数初始化 AdaBoostClassifier
-    ada = AdaBoostClassifier(**ada_params)
-    ada.fit(X_resampled, y_resampled)
-    model_list.append(ada)
-    model_types.append("AdaBoost(DecisionTree)")
-
-    brf = BalancedRandomForestClassifier(
-        n_estimators=brf_n_estimators,
-        max_depth=brf_max_depth,
-        max_features=brf_max_features,
-        random_state=random_state,
-        n_jobs=-1  # 使用所有可用CPU核心
+    evals_result = {}
+    # 训练 XGBoost 模型
+    xgb_model = xgb.train(
+        xgb_params,
+        dtrain=dtrain_full,
+        num_boost_round=xgb_params['n_estimators'],
+        evals=[(dval, 'validation')],
+        early_stopping_rounds=20,  # 可选：启用早停
+        verbose_eval=False,  # 设置为True可以看到训练过程
+        evals_result=evals_result
     )
-    brf.fit(X_resampled, y_resampled)
-    model_list.append(brf)
-    model_types.append("BalancedRandomForest")
 
-    save_object(model_list, "./base_model_list.pkl")
-    save_object(model_types, "./base_model_types.pkl")
-    print("已训练基模型：AdaBoost(DecisionTree) + BalancedRandomForest")
+
+    # 为了兼容后续的 predict_proba 接口，我们可以包装一下
+    class WrappedXGBModel:
+        def __init__(self, booster):
+            self.booster = booster
+
+        def predict_proba(self, X):
+            dmatrix = xgb.DMatrix(X)
+            probs = self.booster.predict(dmatrix)
+            # 返回二维数组 [[prob_0, prob_1], ...]
+            return np.vstack([1 - probs, probs]).T
+
+        def predict(self, X):
+            dmatrix = xgb.DMatrix(X)
+            probs = self.booster.predict(dmatrix)
+            return (probs > 0.5).astype(int)
+
+
+    wrapped_xgb_model = WrappedXGBModel(xgb_model)
+
+    save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
+    print("已训练基模型：XGBoost")
 
     # ----- 6. 训练级联修正器 -----
     print("识别基模型误分类样本，训练级联修正器...")
-    base_probas = np.zeros((X_resampled.shape[0], len(model_list)))
-    for i, m in enumerate(model_list):
-        base_probas[:, i] = m.predict_proba(X_resampled)[:, 1]
-    avg_train_proba = base_probas.mean(axis=1)
-    base_train_preds = (avg_train_proba >= 0.5).astype(int)
+    # 使用新的预测方法，传入None作为meta_model
+    _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
+    base_train_preds = (train_probas >= 0.5).astype(int)
 
     misclassified_mask = (base_train_preds != y_resampled)
     X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
@@ -339,7 +361,8 @@ if __name__ == "__main__":
         print("未发现足够的误分类样本，使用全部重采样数据训练修正器")
 
     # ----- 7. 阈值选择（Youden's J） -----
-    _, holdout_probas = cascade_predict(model_list, meta_clf, X_holdout, threshold=0.5)
+    # 使用新的预测函数
+    _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
     best_thresh = youden_threshold(y_holdout, holdout_probas)
 
     y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
@@ -358,11 +381,14 @@ if __name__ == "__main__":
         "imputer": imputer,
         "scaler": scaler,
         "dnn_feature_ranking": ranked_idx,
-        "base_models": model_list,
-        "base_types": model_types,
+        "base_models": wrapped_xgb_model,  # 单一模型
+        "base_types": ["XGBoost"],  # 类型列表
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
     }
     save_object(model_dict, "./model_pipeline_cascade_dnn_torch.pkl")
     print("已保存完整模型 ./model_pipeline_cascade_dnn_torch.pkl")
     print("=" * 60)
+
+
+
