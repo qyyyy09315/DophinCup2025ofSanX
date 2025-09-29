@@ -1,184 +1,23 @@
+# train_ensemble_cascade.py
 import os
 import pickle
 import warnings
+import math
+
 import numpy as np
 import pandas as pd
-from imblearn.combine import SMOTEENN
-from imblearn.ensemble import BalancedRandomForestClassifier
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.ensemble import AdaBoostClassifier, StackingClassifier
+from imblearn.combine import SMOTEENN  # 仅保留 import，如果不需要可删除
+from imblearn.ensemble import BalancedRandomForestClassifier  # 保留以防后续替换
+from sklearn.ensemble import AdaBoostClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import recall_score, roc_auc_score, precision_score
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_X_y
-
-# --- 设置环境变量以控制底层库的线程数 ---
-os.environ["OMP_NUM_THREADS"] = "6"
-os.environ["MKL_NUM_THREADS"] = "6"
-os.environ["OPENBLAS_NUM_THREADS"] = "6"
-os.environ["NUMEXPR_NUM_THREADS"] = "6"
 
 warnings.filterwarnings("ignore")
-
-
-class BalancedRandomForestCascade(BaseEstimator, ClassifierMixin):
-    """
-    决策树级联的平衡随机森林网络（改进版）
-    每一层使用 BalancedRandomForestClassifier，并将预测概率作为下一层的输入特征。
-    参数：
-        n_estimators: 每层的树数量（可调整以防过拟合）
-        max_layers: 最大层数
-        random_state: 随机种子
-        max_depth: 单棵树最大深度（控制复杂度）
-        max_features: 每棵树随机特征数（例如 "sqrt"）
-        n_jobs: BalancedRandomForestClassifier 的并行度
-        debug: 是否打印每层输入维度（用于调试）
-    """
-    def __init__(self,
-                 n_estimators=100,
-                 max_layers=3,
-                 random_state=None,
-                 max_depth=None,
-                 max_features="sqrt",
-                 n_jobs=1,
-                 debug=False):
-        self.n_estimators = n_estimators
-        self.max_layers = max_layers
-        self.random_state = random_state
-        self.max_depth = max_depth
-        self.max_features = max_features
-        self.n_jobs = n_jobs
-        self.debug = debug
-
-        self.layers_ = []
-        self.classes_ = None
-        self.initial_n_features_ = None
-        self.layer_input_dims_ = []  # 记录每层训练时的输入维度
-
-    def _make_layer_clf(self, layer_idx):
-        rs = (self.random_state + layer_idx) if (self.random_state is not None) else layer_idx
-        return BalancedRandomForestClassifier(
-            n_estimators=self.n_estimators,
-            random_state=rs,
-            max_depth=self.max_depth,
-            max_features=self.max_features,
-            n_jobs=self.n_jobs
-        )
-
-    def fit(self, X, y):
-        X, y = check_X_y(X, y, ensure_min_features=1)
-        self.classes_ = np.unique(y)
-        self.initial_n_features_ = X.shape[1]
-
-        current_input = X.copy()
-
-        for layer_idx in range(self.max_layers):
-            # 记录训练时该层的输入维度（用于后续predict时一致性检查）
-            self.layer_input_dims_.append(current_input.shape[1])
-
-            layer_clf = self._make_layer_clf(layer_idx)
-            layer_clf.fit(current_input, y)
-            self.layers_.append(layer_clf)
-
-            # 取得概率特征并拼接（用于下一层训练）
-            if len(self.classes_) == 2:
-                probas = layer_clf.predict_proba(current_input)[:, 1:].reshape(-1, 1)
-            else:
-                probas = layer_clf.predict_proba(current_input)
-
-            current_input = np.hstack((current_input, probas))
-
-            if self.debug:
-                print(f"[fit] 层 {layer_idx} 训练时输入维度: {self.layer_input_dims_[-1]}, "
-                      f"拼接后维度: {current_input.shape[1]}")
-
-        return self
-
-    def predict_proba(self, X):
-        if not hasattr(self, "layers_") or len(self.layers_) == 0:
-            raise RuntimeError("必须先调用 fit() 训练模型！")
-
-        X = np.asarray(X)
-        if X.ndim != 2:
-            raise ValueError(f"期望2D数组，得到{X.ndim}D数组")
-
-        if X.shape[1] != self.initial_n_features_:
-            raise ValueError(f"输入特征数 {X.shape[1]} 与训练时初始特征数 {self.initial_n_features_} 不匹配")
-
-        current_input = X.copy()
-
-        for layer_idx, layer_clf in enumerate(self.layers_):
-            expected_dim = self.layer_input_dims_[layer_idx]
-            if current_input.shape[1] != expected_dim:
-                raise ValueError(
-                    f"预测时第 {layer_idx} 层输入维度 {current_input.shape[1]} 与训练时的 {expected_dim} 不一致"
-                )
-
-            if len(self.classes_) == 2:
-                probas = layer_clf.predict_proba(current_input)[:, 1:].reshape(-1, 1)
-            else:
-                probas = layer_clf.predict_proba(current_input)
-
-            current_input = np.hstack((current_input, probas))
-
-            if self.debug:
-                print(f"[predict] 层 {layer_idx} 预测时输入维度: {expected_dim}, 拼接后维度: {current_input.shape[1]}")
-
-        # 注意：最后一层的训练输入维度记录在 layer_input_dims_[-1]
-        # layers_[-1] 是在其对应输入（即 current_input 切片到前 layer_input_dims_[-1]）上训练的
-        last_input_dim = self.layer_input_dims_[-1]
-        last_layer_input = current_input[:, :last_input_dim]
-        return self.layers_[-1].predict_proba(last_layer_input)
-
-    def predict(self, X):
-        probas = self.predict_proba(X)
-        return self.classes_[np.argmax(probas, axis=1)]
-
-    def get_params(self, deep=True):
-        # 使其在 sklearn 管道中可调
-        return {
-            "n_estimators": self.n_estimators,
-            "max_layers": self.max_layers,
-            "random_state": self.random_state,
-            "max_depth": self.max_depth,
-            "max_features": self.max_features,
-            "n_jobs": self.n_jobs,
-            "debug": self.debug
-        }
-
-    def set_params(self, **params):
-        for k, v in params.items():
-            setattr(self, k, v)
-        return self
-
-
-class CascadeForestWrapper(ClassifierMixin):
-    """包装器用于让 StackingClassifier 能够识别该自定义分类器"""
-    def __init__(self, cascade_forest):
-        self.cascade_forest = cascade_forest
-        self.classes_ = None
-
-    def fit(self, X, y):
-        self.cascade_forest.fit(X, y)
-        self.classes_ = self.cascade_forest.classes_
-        return self
-
-    def predict(self, X):
-        return self.cascade_forest.predict(X)
-
-    def predict_proba(self, X):
-        return self.cascade_forest.predict_proba(X)
-
-    def get_params(self, deep=True):
-        return {"cascade_forest": self.cascade_forest}
-
-    def set_params(self, **params):
-        if "cascade_forest" in params:
-            self.cascade_forest = params["cascade_forest"]
-        return self
+np.random.seed(42)
 
 
 def save_object(obj, filepath):
@@ -194,153 +33,184 @@ def load_object(filepath):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始数据预处理与训练流程（含过拟合控制）")
+    print("开始训练：负类分组 -> 多个 AdaBoost -> 级联 GaussianNB（元分类器）")
     print("=" * 60)
 
-    # 1) 读取数据
+    # ----- 配置 -----
     data_path = "./clean.csv"
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"未找到 {data_path}，请确认路径正确。")
+    assert os.path.exists(data_path), f"未找到数据文件: {data_path}"
+    test_size = 0.10
+    random_state = 42
 
+    # AdaBoost 超参（可以调整）
+    adaboost_n_estimators = 300
+    adaboost_learning_rate = 0.5
+
+    # SelectKBest 候选
+    candidate_k = [30, 50, 80, 100]
+
+    # ----- 1. 读取并预处理数据 -----
     data = pd.read_csv(data_path).drop(columns=["company_id"])
-    print(f"原始数据形状: {data.shape}")
-
-    # 2) 类别编码（one-hot）
     data = pd.get_dummies(data, drop_first=True)
-    print(f"编码后数据形状: {data.shape}")
-
-    # 3) 分离特征与标签
     if "target" not in data.columns:
-        raise KeyError("数据中未找到 'target' 列。")
-    X = data.drop(columns=["target"])
-    y = data["target"].values
-    print(f"特征形状: {X.shape}, 标签分布: {np.bincount(y)}")
+        raise KeyError("数据中未找到 'target' 列")
 
-    # 4) 缺失值处理与缩放
+    X_all = data.drop(columns=["target"]).values
+    y_all = data["target"].values
+    print(f"加载数据: X={X_all.shape}, y={y_all.shape}, positive={y_all.sum()}, negative={(y_all==0).sum()}")
+
+    # 处理缺失与缩放（并保存）
     imputer = SimpleImputer(strategy="mean")
-    X_imputed = imputer.fit_transform(X)
-
+    X_imputed = imputer.fit_transform(X_all)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
 
-    # 保存预处理器
     save_object(imputer, "./imputer.pkl")
     save_object(scaler, "./scaler.pkl")
 
-    # 5) 处理类别不平衡（注意：过采样会引入噪声，需谨慎）
-    smote_enn = SMOTEENN(random_state=42)
-    X_resampled, y_resampled = smote_enn.fit_resample(X_scaled, y)
-    print(f"SMOTEENN 后数据形状: {X_resampled.shape}, 标签分布: {np.bincount(y_resampled)}")
+    # ----- 2. 特征选择（交叉验证选择 k） -----
+    print("开始用交叉验证选择特征数 k ...")
+    best_k = None
+    best_auc = -np.inf
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
 
-    # 6) 自动选择最优 k（候选 k 列表），用一个较稳健的弱分类器评估 AUC
-    candidate_k = [30, 50, 80, 100]
-    best_k = min(candidate_k)
-    best_score = -np.inf
-
-    # 在小数据集上可增大 cv，否则保持 cv=5
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    print("开始选择最佳特征数 k（使用简单 BRF 做 cross-val 评估）...")
     for k in candidate_k:
-        k_tmp = min(k, X_resampled.shape[1])
-        selector_tmp = SelectKBest(score_func=f_classif, k=k_tmp)
-        X_tmp = selector_tmp.fit_transform(X_resampled, y_resampled)
-        # 用一个受限参数的 BRF 做评估，避免过拟合评估器本身
-        eval_clf = BalancedRandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            max_features="sqrt",
-            random_state=42,
-            n_jobs=2
-        )
+        k_use = min(k, X_scaled.shape[1])
+        selector_tmp = SelectKBest(score_func=f_classif, k=k_use)
+        X_tmp = selector_tmp.fit_transform(X_scaled, y_all)
+        # 用一个简单的 AdaBoost 评估 AUC（快速）
+        from sklearn.ensemble import AdaBoostClassifier
+        clf_tmp = AdaBoostClassifier(n_estimators=100, learning_rate=0.5, random_state=random_state)
         try:
-            scores = cross_val_score(eval_clf, X_tmp, y_resampled, cv=cv, scoring="roc_auc", n_jobs=2)
-            mean_score = np.mean(scores)
-        except Exception as e:
-            mean_score = -np.inf
-        print(f"  k={k_tmp} -> CV AUC = {mean_score:.5f}")
-        if mean_score > best_score:
-            best_score = mean_score
-            best_k = k_tmp
+            from sklearn.model_selection import cross_val_score
+            scores = cross_val_score(clf_tmp, X_tmp, y_all, cv=skf, scoring="roc_auc", n_jobs=2)
+            mean_auc = np.mean(scores)
+        except Exception:
+            mean_auc = -np.inf
+        print(f"  k={k_use}, CV AUC={mean_auc:.5f}")
+        if mean_auc > best_auc:
+            best_auc = mean_auc
+            best_k = k_use
 
-    print(f"选择到的最佳 k = {best_k}（CV AUC={best_score:.5f}）")
-
-    # 7) 用最佳 k 做最终特征选择
+    print(f"选定特征数 k = {best_k}, CV AUC={best_auc:.5f}")
     selector = SelectKBest(score_func=f_classif, k=best_k)
-    X_selected = selector.fit_transform(X_resampled, y_resampled)
+    X_selected = selector.fit_transform(X_scaled, y_all)
+    save_object(selector, "./feature_selector.pkl")
     print(f"特征选择后维度: {X_selected.shape}")
 
-    save_object(selector, "./feature_selector.pkl")
-
-    # 8) 划分训练/测试集（最终评估使用 held-out test）
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_selected, y_resampled, test_size=0.1, stratify=y_resampled, random_state=42
+    # ----- 3. 划分训练/测试集（用于最终评估与阈值选择） -----
+    X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
+        X_selected, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
-    print(f"训练集: {X_train.shape}, 测试集: {X_test.shape}")
+    print(f"训练集: {X_train_full.shape}, 验证集(holdout): {X_holdout.shape}")
 
-    # 9) 初始化 Cascade（限制复杂度）
-    base_balanced_cascade = BalancedRandomForestCascade(
-        n_estimators=150,   # 减少树数
-        max_layers=3,
-        random_state=42,
-        max_depth=12,       # 限制树深
-        max_features="sqrt",
-        n_jobs=2,
-        debug=False         # 设置 True 可打印每层维度以便调试
-    )
-    balanced_cascade = CascadeForestWrapper(base_balanced_cascade)
+    # ----- 4. 负类分组并训练多个 AdaBoost（每组与所有正类组合） -----
+    pos_idx = np.where(y_train_full == 1)[0]
+    neg_idx = np.where(y_train_full == 0)[0]
+    n_pos = len(pos_idx)
+    n_neg = len(neg_idx)
+    print(f"训练集中正类数={n_pos}, 负类数={n_neg}")
 
-    # 10) AdaBoost（降低学习率与迭代数）
-    adaboost = AdaBoostClassifier(
-        n_estimators=300,
-        learning_rate=0.5,
-        algorithm="SAMME",
-        random_state=42
-    )
+    # 按与正类相同数量分组负类
+    group_size = max(1, n_pos)  # 防止 n_pos = 0 的极端情况（若无正类需特殊处理）
+    n_groups = math.ceil(n_neg / group_size)
+    print(f"将负类分为 {n_groups} 组，每组最多 {group_size} 个样本")
 
-    # 11) Stacking（增加 cv 稳定性）
-    stacking_model = StackingClassifier(
-        estimators=[
-            ("balanced_cascade", balanced_cascade),
-            ("adaboost", adaboost),
-        ],
-        final_estimator=GaussianNB(),
-        n_jobs=2,
-        cv=5
-    )
+    adaboost_list = []
+    group_indices_list = []
 
-    # 12) 在训练集上先做一次交叉验证评估（观察是否还存在过拟合）
-    print("在训练集上进行交叉验证评估（观察过拟合迹象）...")
-    try:
-        cv_scores = cross_val_score(clone(stacking_model), X_train, y_train, cv=cv, scoring="roc_auc", n_jobs=2)
-        print(f"训练集 CV AUC (5-fold): mean={np.mean(cv_scores):.5f}, std={np.std(cv_scores):.5f}")
-    except Exception as e:
-        print("交叉验证评估出错：", e)
+    for g in range(n_groups):
+        start = g * group_size
+        end = min((g + 1) * group_size, n_neg)
+        neg_group_idx = neg_idx[start:end]
+        # 合并正类与该负组，构建训练子集
+        subset_idx = np.concatenate([pos_idx, neg_group_idx])
+        np.random.shuffle(subset_idx)
 
-    # 13) 训练最终模型
-    print("开始拟合最终模型（可能耗时）...")
-    stacking_model.fit(X_train, y_train)
-    print("训练完成。")
+        X_sub = X_train_full[subset_idx]
+        y_sub = y_train_full[subset_idx]
 
-    # 保存模型
-    save_object(stacking_model, "./model_pipeline.pkl")
+        clf = AdaBoostClassifier(
+            n_estimators=adaboost_n_estimators,
+            learning_rate=adaboost_learning_rate,
+            random_state=random_state
+        )
+        clf.fit(X_sub, y_sub)
+        adaboost_list.append(clf)
+        group_indices_list.append(subset_idx)
+        print(f" 已训练 AdaBoost #{g+1}，子集大小={len(subset_idx)}，正例={sum(y_sub==1)}, 负例={sum(y_sub==0)}")
 
-    # 14) 在 held-out 测试集上评估
-    y_pred_test = stacking_model.predict(X_test)
-    # 如果 predict_proba 不可用（极端情况），处理异常
-    try:
-        y_proba_test = stacking_model.predict_proba(X_test)[:, 1]
-    except Exception:
-        # 退回使用预测标签的 0/1 （这会使 AUC 无法正确计算）
-        y_proba_test = (y_pred_test == 1).astype(float)
+    # 保存 adaboost 列表（可能比较大）
+    save_object(adaboost_list, "./adaboost_list.pkl")
+    save_object(group_indices_list, "./adaboost_group_indices.pkl")
 
-    recall = recall_score(y_test, y_pred_test)
-    auc = roc_auc_score(y_test, y_proba_test)
-    precision = precision_score(y_test, y_pred_test)
+    # ----- 5. 构建元特征（用每个 AdaBoost 对全训练集和 holdout 产生概率） -----
+    def stack_probas(adaboost_models, X):
+        """返回 shape=(n_samples, n_models) 的正类概率矩阵"""
+        proba_mat = np.zeros((X.shape[0], len(adaboost_models)))
+        for i, m in enumerate(adaboost_models):
+            try:
+                proba = m.predict_proba(X)[:, 1]
+            except Exception:
+                # 万一 predict_proba 不可用（极端），退回 predict
+                proba = m.predict(X).astype(float)
+            proba_mat[:, i] = proba
+        return proba_mat
+
+    print("为训练集与 holdout 构建元概率特征...")
+    X_train_meta = stack_probas(adaboost_list, X_train_full)  # (n_train, n_models)
+    X_holdout_meta = stack_probas(adaboost_list, X_holdout)  # (n_holdout, n_models)
+    print(f"元特征矩阵形状: train {X_train_meta.shape}, holdout {X_holdout_meta.shape}")
+
+    # ----- 6. 在元特征上训练级联 GaussianNB（元分类器） -----
+    meta_clf = GaussianNB()
+    meta_clf.fit(X_train_meta, y_train_full)
+    save_object(meta_clf, "./meta_nb.pkl")
+    print("训练并保存元分类器 GaussianNB。")
+
+    # ----- 7. 在 holdout 上评估并选择最佳阈值（以 F1 最大化为例） -----
+    print("在 holdout 上评估以选择最佳阈值（使用 F1 最大化）...")
+    holdout_probas = meta_clf.predict_proba(X_holdout_meta)[:, 1]
+    # 搜索阈值
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_f1 = -1.0
+    best_thresh = 0.5
+    for t in thresholds:
+        preds = (holdout_probas >= t).astype(int)
+        f1 = f1_score(y_holdout, preds)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = t
+    print(f"在 holdout 上选定阈值 (F1 最大): {best_thresh:.4f}, 对应 F1 = {best_f1:.4f}")
+
+    # 也计算 recall/auc/precision 等供参考
+    y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
+    recall = recall_score(y_holdout, y_pred_holdout)
+    auc = roc_auc_score(y_holdout, holdout_probas)
+    precision = precision_score(y_holdout, y_pred_holdout)
     final_score = 30 * recall + 50 * auc + 20 * precision
+    print("holdout 评估：")
+    print(f"  Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, final_score={final_score:.5f}")
 
-    print("\n最终模型在测试集上的评估结果：")
-    print(f"召回率 (Recall):    {recall:.6f}")
-    print(f"AUC:               {auc:.6f}")
-    print(f"精确率 (Precision): {precision:.6f}")
-    print(f"最终评分:          {final_score:.6f}")
+    # ----- 8. 保存整体模型（包含所有必要组件与阈值） -----
+    model_dict = {
+        "imputer": imputer,
+        "scaler": scaler,
+        "selector": selector,
+        "adaboost_list": adaboost_list,
+        "group_indices_list": group_indices_list,
+        "meta_nb": meta_clf,
+        "threshold": float(best_thresh),
+        "feature_names": None  # 如果需要可以保存训练时的列名
+    }
+    save_object(model_dict, "./model_pipeline_ensemble.pkl")
+    print("全部模型组件已保存为 ./model_pipeline_ensemble.pkl")
+
+    # ----- 9. 在 holdout 上报告最终指标（再次打印） -----
+    print("\n最终 holdout 指标（使用选定阈值）:")
+    print(f"  Threshold = {best_thresh:.4f}")
+    print(f"  Recall = {recall:.6f}")
+    print(f"  AUC = {auc:.6f}")
+    print(f"  Precision = {precision:.6f}")
+    print(f"  F1 = {best_f1:.6f}")
     print("=" * 60)
