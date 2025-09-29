@@ -1,4 +1,4 @@
-# train_ensemble_cascade_sysdn.py
+# train_ensemble_cascade_smoteen_catboost.py
 import os
 import pickle
 import warnings
@@ -6,7 +6,9 @@ import math
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
+from imblearn.combine import SMOTEENN
+from catboost import CatBoostClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score
@@ -26,7 +28,7 @@ def save_object(obj, filepath):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("开始训练：SysDN负类分组 -> AdaBoost + RF -> 级联 GaussianNB")
+    print("开始训练：SMOTEENN 重采样 -> CatBoost + RF -> 级联 GaussianNB")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -35,12 +37,19 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # AdaBoost 超参
-    adaboost_n_estimators = 300
-    adaboost_learning_rate = 0.01
+    # CatBoost 超参
+    cat_params = {
+        "iterations": 500,
+        "learning_rate": 0.05,
+        "depth": 8,
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "verbose": False,
+        "random_seed": random_state
+    }
 
     # RandomForest 超参
-    rf_n_estimators = 200
+    rf_n_estimators = 300
     rf_max_depth = 12
     rf_max_features = "sqrt"
 
@@ -75,9 +84,7 @@ if __name__ == "__main__":
         k_use = min(k, X_scaled.shape[1])
         selector_tmp = SelectKBest(score_func=f_classif, k=k_use)
         X_tmp = selector_tmp.fit_transform(X_scaled, y_all)
-        clf_tmp = AdaBoostClassifier(
-            n_estimators=300, learning_rate=0.01, random_state=random_state
-        )
+        clf_tmp = CatBoostClassifier(**cat_params)
         try:
             scores = cross_val_score(clf_tmp, X_tmp, y_all, cv=skf, scoring="roc_auc", n_jobs=2)
             mean_auc = np.mean(scores)
@@ -99,55 +106,39 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 4. SysDN 分组：负类分组采样 -----
-    pos_idx = np.where(y_train_full == 1)[0]
-    neg_idx = np.where(y_train_full == 0)[0]
-    n_pos, n_neg = len(pos_idx), len(neg_idx)
-    print(f"训练集中正类={n_pos}, 负类={n_neg}")
+    # ----- 4. SMOTEENN 重采样 -----
+    print("正在进行 SMOTEENN 重采样 ...")
+    smoteenn = SMOTEENN(random_state=random_state)
+    X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
+    print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled==0).sum()}")
 
-    group_size = max(1, n_pos)
-    n_groups = math.ceil(n_neg / group_size)
-    print(f"SysDN: 将负类划分为 {n_groups} 组，每组最多 {group_size} 个负例")
-
+    # ----- 5. 训练基模型 (CatBoost + RF) -----
     model_list = []
     model_types = []
 
-    for g in range(n_groups):
-        start, end = g * group_size, min((g + 1) * group_size, n_neg)
-        neg_group_idx = neg_idx[start:end]
-        subset_idx = np.concatenate([pos_idx, neg_group_idx])
-        np.random.shuffle(subset_idx)
+    # --- CatBoost ---
+    cat = CatBoostClassifier(**cat_params)
+    cat.fit(X_resampled, y_resampled)
+    model_list.append(cat)
+    model_types.append("CatBoost")
 
-        X_sub, y_sub = X_train_full[subset_idx], y_train_full[subset_idx]
-
-        # --- AdaBoost ---
-        ada = AdaBoostClassifier(
-            n_estimators=adaboost_n_estimators,
-            learning_rate=adaboost_learning_rate,
-            random_state=random_state
-        )
-        ada.fit(X_sub, y_sub)
-        model_list.append(ada)
-        model_types.append("AdaBoost")
-
-        # --- RandomForest ---
-        rf = RandomForestClassifier(
-            n_estimators=rf_n_estimators,
-            max_depth=rf_max_depth,
-            max_features=rf_max_features,
-            random_state=random_state,
-            n_jobs=2
-        )
-        rf.fit(X_sub, y_sub)
-        model_list.append(rf)
-        model_types.append("RandomForest")
-
-        print(f"已训练组 #{g+1}: AdaBoost & RF, 子集大小={len(subset_idx)}")
+    # --- RandomForest ---
+    rf = RandomForestClassifier(
+        n_estimators=rf_n_estimators,
+        max_depth=rf_max_depth,
+        max_features=rf_max_features,
+        random_state=random_state,
+        n_jobs=2
+    )
+    rf.fit(X_resampled, y_resampled)
+    model_list.append(rf)
+    model_types.append("RandomForest")
 
     save_object(model_list, "./base_model_list.pkl")
     save_object(model_types, "./base_model_types.pkl")
+    print("已训练基模型：CatBoost + RF")
 
-    # ----- 5. 构建元特征 -----
+    # ----- 6. 构建元特征 -----
     def stack_probas(models, X):
         proba_mat = np.zeros((X.shape[0], len(models)))
         for i, m in enumerate(models):
@@ -158,16 +149,16 @@ if __name__ == "__main__":
             proba_mat[:, i] = proba
         return proba_mat
 
-    X_train_meta = stack_probas(model_list, X_train_full)
+    X_train_meta = stack_probas(model_list, X_resampled)
     X_holdout_meta = stack_probas(model_list, X_holdout)
     print(f"元特征: train {X_train_meta.shape}, holdout {X_holdout_meta.shape}")
 
-    # ----- 6. 元分类器 GaussianNB -----
+    # ----- 7. 元分类器 GaussianNB -----
     meta_clf = GaussianNB()
-    meta_clf.fit(X_train_meta, y_train_full)
+    meta_clf.fit(X_train_meta, y_resampled)
     save_object(meta_clf, "./meta_nb.pkl")
 
-    # ----- 7. 阈值选择（F1 最大化） -----
+    # ----- 8. 阈值选择（F1 最大化） -----
     holdout_probas = meta_clf.predict_proba(X_holdout_meta)[:, 1]
     thresholds = np.linspace(0.01, 0.99, 99)
     best_thresh, best_f1 = 0.5, -1.0
@@ -186,7 +177,7 @@ if __name__ == "__main__":
     print(f"最佳阈值={best_thresh:.4f}, F1={best_f1:.4f}")
     print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
 
-    # ----- 8. 保存完整模型 -----
+    # ----- 9. 保存完整模型 -----
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
@@ -196,6 +187,6 @@ if __name__ == "__main__":
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
     }
-    save_object(model_dict, "./model_pipeline_sysdn.pkl")
-    print("已保存完整模型 ./model_pipeline_sysdn.pkl")
+    save_object(model_dict, "./model_pipeline_smoteen_catboost.pkl")
+    print("已保存完整模型 ./model_pipeline_smoteen_catboost.pkl")
     print("=" * 60)
