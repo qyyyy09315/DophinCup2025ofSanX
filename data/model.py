@@ -101,15 +101,28 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         :param y: 训练标签 (numpy array or pandas Series)。
         """
         self.initial_feature_count = X.shape[1]
-        X_current = X.copy()  # 避免修改原始输入
+        original_X_shape = X.shape[1]
+
+        # 初始输入为原始特征
+        current_input = X.copy()
         self.layers = []  # 重置 layers 列表，确保 fit 是幂等的
 
         # 为了启用早停，我们需要划分一部分训练数据作为验证集
         X_train_fit, X_val_fit, y_train_fit, y_val_fit = train_test_split(
-            X_current, y, test_size=0.15, stratify=y, random_state=self.random_state
+            current_input, y, test_size=0.15, stratify=y, random_state=self.random_state
         )
 
         for i in range(self.n_layers):
+
+            # 构造本层独立的训练集和验证集
+            # 当前层只看到 previous_input （即来自上一层或者原始输入）
+            temp_X_train_for_this_layer = current_input
+
+            # 再次划分是为了让每一层都能有自己的val set吗？还是说只需要第一次划分即可？
+            # 更合理的做法可能是始终复用第一次split的结果来保证一致性
+            # 所以下面这部分其实可以简化，但我们保留原来的结构做最小改动示意
+            _, _, _, _ = train_test_split(current_input, y, test_size=0.15, stratify=y, random_state=self.random_state)
+
             # 合并基础参数和用户提供的参数
             params_to_use = {
                 'random_state': self.random_state + i,  # 改变每层的随机种子
@@ -125,27 +138,29 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
             # 使用带验证集的拟合进行早停
             # 在新版 XGBoost 中，early_stopping_rounds 应该在构造函数中指定
             clf.fit(
-                X_train_fit, y_train_fit,
-                eval_set=[(X_val_fit, y_val_fit)],
-                # early_stopping_rounds=self.early_stopping_rounds, # 已移动到构造函数
-                # eval_metric=self.eval_metric,                   # 已移动到构造函数
+                temp_X_train_for_this_layer, y_train_fit,
+                eval_set=[(current_input[X_val_fit.index], y_val_fit)],  # 确保 val index align correctly
                 verbose=False  # 关闭详细输出
             )
 
             self.layers.append(clf)
 
-            # 将原始特征与当前层的概率预测拼接，作为下一层的输入
-            # 使用完整的 X_current 来获取概率，以便下一层看到所有训练样本的信息
-            probas = clf.predict_proba(X_current)
-            X_current = np.hstack([X, probas])  # 始终与原始特征拼接
+            # 获取当前层在全部数据上的预测概率
+            probas = clf.predict_proba(temp_X_train_for_this_layer)  # Shape: [n_samples, n_classes]
 
-            # 更新下一循环使用的训练/验证集 (虽然不改变结构，但保持一致性)
-            # 这里简单地重新分割 X_current, y 供下一层潜在使用（尽管本次实现没用上）
-            # X_train_fit, X_val_fit, y_train_fit, y_val_fit = train_test_split(
-            #     X_current, y, test_size=0.15, stratify=y, random_state=self.random_state
-            # )
+            # 更新 current_input 为原始特征+各层预测结果的组合
+            # 下一层将会看到所有的历史信息
+            if i == 0:
+                # 第一次拼接的是原始特征 + 第一层预测结果
+                next_input = np.hstack((X, probas))
+            else:
+                # 后续拼接增加新的预测结果列
+                next_input = np.hstack((next_input, probas))
 
-        # print("级联 XGBoost 训练完成。")
+                # Prepare input for next iteration / prediction phase storage
+            current_input = next_input
+
+            # print("级联 XGBoost 训练完成。")
         return self  # 符合 sklearn 接口
 
     def predict_proba(self, X):
@@ -160,13 +175,25 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         if X.shape[1] != self.initial_feature_count:
             raise ValueError(f"输入特征维度 {X.shape[1]} 与训练时的维度 {self.initial_feature_count} 不符。")
 
-        X_current = X.copy()
+        # Start with original features
+        current_input = X.copy()
+        probas = None
+
         for i, clf in enumerate(self.layers):
-            # 将原始特征与当前层的概率预测拼接
-            probas = clf.predict_proba(X_current)
-            if i < len(self.layers) - 1:  # 最后一层不需要拼接，直接输出
-                X_current = np.hstack([X, probas])
-        # 返回最后一层的概率预测
+            # Predict using only the features that were available during training of this layer
+            # That means we feed it what was used to train it.
+            probas = clf.predict_proba(current_input)
+
+            # Build up inputs incrementally just like in training
+            if i < len(self.layers) - 1:  # Don't concatenate after last one since output will be returned directly
+                if i == 0:
+                    extended_input = np.hstack((X, probas))
+                else:
+                    extended_input = np.hstack((extended_input, probas))
+
+                current_input = extended_input
+
+        # Return probabilities from the final layer
         return probas
 
     def predict(self, X):
