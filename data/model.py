@@ -7,11 +7,12 @@ import pandas as pd
 from imblearn.combine import SMOTEENN
 # 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, make_scorer, \
+from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, \
     precision_recall_curve
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA # 新增 PCA
 from sklearn.base import BaseEstimator, ClassifierMixin
 
 warnings.filterwarnings("ignore")
@@ -188,75 +189,43 @@ def pr_threshold(y_true, probas):
 
 # --- 新增：封装完整模型管道以支持 GridSearchCV ---
 # --- 修改：移除内部 SMOTEENN 步骤，因为数据将在外部预处理 ---
+# --- 修改：加入 PCA 步骤 ---
 class ModelPipeline(BaseEstimator, ClassifierMixin):
-    """整合预处理和 CascadeRandomForest 的管道 (移除了内部 SMOTEENN)"""
+    """整合预处理 (插补, 缩放, PCA) 和 CascadeRandomForest 的管道 (移除了内部 SMOTEENN)"""
 
-    def __init__(self, imputer=None, scaler=None, model=None):
+    def __init__(self, imputer=None, scaler=None, pca=None, model=None): # 新增 pca 参数
         self.imputer = imputer or SimpleImputer(strategy="mean")
         self.scaler = scaler or StandardScaler()
+        self.pca = pca or PCA(n_components=0.95) # 默认保留 95% 方差 # 新增 PCA
         # 默认模型使用 class_weight=None，网格搜索会覆盖
         self.model = model or CascadeRandomForest(class_weight_option=None)
 
     def fit(self, X, y):
-        """拟合整个管道：插补 -> 缩放 -> 模型训练"""
+        """拟合整个管道：插补 -> 缩放 -> PCA -> 模型训练"""
         X_imputed = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_imputed)
-        self.model.fit(X_scaled, y)
+        X_pca = self.pca.fit_transform(X_scaled) # 新增 PCA 拟合和变换
+        print(f"PCA 后数据维度: {X_pca.shape}")
+        self.model.fit(X_pca, y) # 在 PCA 变换后的数据上训练模型
         return self
 
     def predict_proba(self, X):
-        """预测概率：插补 -> 缩放 -> 模型预测"""
+        """预测概率：插补 -> 缩放 -> PCA -> 模型预测"""
         X_imputed = self.imputer.transform(X)
         X_scaled = self.scaler.transform(X_imputed)
-        return self.model.predict_proba(X_scaled)
+        X_pca = self.pca.transform(X_scaled) # 新增 PCA 变换
+        return self.model.predict_proba(X_pca) # 在 PCA 变换后的数据上预测
 
     def predict(self, X):
-        """预测标签：插补 -> 缩放 -> 模型预测"""
+        """预测标签：插补 -> 缩放 -> PCA -> 模型预测"""
         probas = self.predict_proba(X)
         return np.argmax(probas, axis=1)
 
 
-# --- 修复：修改自定义评分函数以接受任意额外关键字参数 ---
-def custom_score_function(y_true, y_proba, **kwargs):
-    """
-    计算自定义评分：30 * Recall + 50 * AUC + 20 * Precision
-    注意：GridSearchCV 传入的是概率，需要处理阈值或直接使用概率计算 AUC。
-    这里我们直接使用 y_proba 计算 AUC，并使用默认 0.5 阈值计算其他指标。
-    修复：添加 **kwargs 以捕获可能由 make_scorer 传递的意外参数 (如 needs_proba)。
-    """
-    # GridSearchCV 传给 make_scorer 的是 predict_proba 的结果，对于二分类是 (n_samples, 2)
-    # 我们通常取正类的概率
-    if y_proba.ndim > 1:
-        y_proba_pos = y_proba[:, 1]
-    else:
-        y_proba_pos = y_proba  # 如果已经是正类概率
-
-    y_pred = (y_proba_pos >= 0.5).astype(int)
-
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    # AUC 需要概率
-    try:
-        auc = roc_auc_score(y_true, y_proba_pos)
-    except ValueError:
-        # 如果 y_true 只有一个类，AUC 无法计算，返回 0 或一个默认值
-        auc = 0.0
-    precision = precision_score(y_true, y_pred, zero_division=0)
-
-    # 避免 auc 为 nan 的情况影响整体评分
-    if np.isnan(auc):
-        auc = 0.0
-
-    final_score = 30 * recall + 50 * auc + 20 * precision
-    return final_score
-
-
-# 包装成 sklearn 可用的 scorer
-custom_scorer = make_scorer(custom_score_function, needs_proba=True)
-
 if __name__ == "__main__":
     print("=" * 70)
-    print("开始训练：SMOTEENN -> 级联随机森林 (Cascade RF) 带网格搜索调优 & 优化")
-    print("优化方向: 1. 先采样再网格搜索; 2. 扩大参数搜索空间; 3. PR曲线拐点阈值")
+    print("开始训练：SMOTEENN -> PCA -> 级联随机森林 (Cascade RF) (无网格搜索)")
+    print("优化方向: 1. 先采样再训练; 2. 加入 PCA 降维; 3. PR曲线拐点阈值")
     print("=" * 70)
 
     # ----- 配置 -----
@@ -265,16 +234,14 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # 网格搜索配置 - 扩大参数范围和种类
-    param_grid = {
-        # 注意：参数名需要与 ModelPipeline.model 的属性对应
-        'model__n_layers': [2, 3, 5], # 增加选项
-        'model__n_estimators': [50, 100, 200], # 增加选项
-        'model__max_depth': [3, 5, None], # 增加选项，None 表示不限制深度
-        'model__class_weight_option': ['balanced', None] # 新增：将 class_weight 也加入搜索
+    # 固定模型超参数 (取消网格搜索)
+    fixed_params = {
+        'n_layers': 3,
+        'n_estimators': 100,
+        'max_depth': None,
+        'class_weight_option': 'balanced'
     }
-    cv_folds = 3  # 交叉验证折数
-    n_jobs = -1  # 并行运行作业数
+    pca_n_components = 0.95 # PCA 保留的方差比例
 
     # ----- 1. 读取并预处理数据 -----
     # 注意：此部分需要一个名为 'clean.csv' 的有效文件
@@ -283,25 +250,6 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print(f"错误: 找不到文件 '{data_path}'。请确保文件路径正确。")
         # 如果没有文件，可以创建一个示例数据集用于演示
-        print("创建示例数据集用于演示...")
-        n_samples = 1000
-        n_features = 20
-        np.random.seed(42)
-        X_demo = np.random.randn(n_samples, n_features)
-        # 创建一个稍微不平衡的目标变量
-        y_demo = np.random.binomial(1, 0.1, n_samples) # 10% 正类
-        # 添加一些与目标相关的特征
-        X_demo[y_demo==1, 0] += 1
-        X_demo[y_demo==1, 1] += 1
-        data = pd.DataFrame(X_demo, columns=[f"feature_{i}" for i in range(n_features)])
-        data['target'] = y_demo
-        # 添加一个分类特征并进行独热编码
-        data['category'] = np.random.choice(['A', 'B', 'C'], size=n_samples)
-        # 确保至少有一个 'company_id' 列用于演示删除
-        data['company_id'] = range(n_samples)
-        # 重新生成 target 列以确保它在最后
-        target_col = data.pop('target')
-        data['target'] = target_col
 
     # 删除 company_id 列（如果存在）
     if 'company_id' in data.columns:
@@ -320,7 +268,7 @@ if __name__ == "__main__":
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
         X_all, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
-    print(f"用于网格搜索的数据集: {X_temp.shape}, Holdout 集: {X_holdout.shape}")
+    print(f"用于训练的数据集: {X_temp.shape}, Holdout 集: {X_holdout.shape}")
 
     # ----- 3. 数据预处理与重采样 (先采样) -----
     print("正在进行数据预处理 (插补 & 缩放) ...")
@@ -338,86 +286,36 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn_sampler.fit_resample(X_temp_scaled, y_temp)
     print(f"重采样后数据形状: {X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
 
-    # ----- 4. 网格搜索超参数调优 (在重采样后的数据上) -----
-    print("开始网格搜索超参数调优 (在重采样后的数据上)...")
-    print(f"搜索空间: {param_grid}")
+    # ----- 4. PCA 降维 (在重采样后的数据上) -----
+    print(f"正在进行 PCA 降维 (保留 {pca_n_components*100:.1f}% 方差) ...")
+    pca_transformer = PCA(n_components=pca_n_components)
+    X_resampled_pca = pca_transformer.fit_transform(X_resampled)
+    print(f"PCA 后数据形状: {X_resampled_pca.shape}")
+    n_components_retained = pca_transformer.n_components_
+    print(f"保留的主成分数量: {n_components_retained}")
 
-    # 创建管道实例 (内部模型使用默认参数，会被 GridSearchCV 覆盖)
-    # 注意：这个管道现在只负责模型部分，数据预处理已在外部完成
-    pipeline_for_gridsearch = ModelPipeline(imputer=None, scaler=None) # 插补和缩放已在外部完成
+    # ----- 5. 使用固定参数训练模型 -----
+    print("--- 使用固定参数训练最终模型 (已重采样和PCA数据) ---")
+    print(f"使用的固定参数: {fixed_params}")
 
-    # 创建 GridSearchCV 对象
-    grid_search = GridSearchCV(
-        estimator=pipeline_for_gridsearch,
-        param_grid=param_grid,
-        scoring=custom_scorer,  # 使用修复后的自定义评分函数
-        cv=cv_folds,
-        n_jobs=n_jobs,
-        verbose=2  # 显示进度
-    )
-
-    # 执行网格搜索
-    # 注意：由于数据已经预处理和重采样，我们需要一个特殊的管道来绕过内部的预处理步骤
-    # 解决方案：创建一个临时的、只包含模型的管道实例，直接在重采样数据上训练
-    # 但这会丢失 imputer/scaler 的信息。更好的方法是修改 ModelPipeline 的 fit/predict_proba
-    # 使其能接受已预处理的数据。
-    # 这里采用一个更直接的方法：创建一个只包含 CascadeRF 的 GridSearchCV，
-    # 因为我们已经完成了预处理和重采样。
-
-    # --- 修改：直接对 CascadeRandomForest 进行网格搜索 ---
-    print("--- 修改策略：直接对 CascadeRandomForest 进行网格搜索 ---")
-    # 调整参数名以匹配 CascadeRandomForest 的构造函数
-    adjusted_param_grid = {
-        'n_layers': param_grid['model__n_layers'],
-        'n_estimators': param_grid['model__n_estimators'],
-        'max_depth': param_grid['model__max_depth'],
-        'class_weight_option': param_grid['model__class_weight_option']
-    }
-
-    base_model_for_gridsearch = CascadeRandomForest() # 基础模型
-
-    grid_search = GridSearchCV(
-        estimator=base_model_for_gridsearch,
-        param_grid=adjusted_param_grid,
-        scoring=custom_scorer,
-        cv=cv_folds,
-        n_jobs=n_jobs,
-        verbose=2
-    )
-
-    # 在重采样后的数据上进行网格搜索
-    grid_search.fit(X_resampled, y_resampled)
-
-    print("网格搜索完成。")
-    print(f"最佳参数: {grid_search.best_params_}")
-    print(f"最佳交叉验证得分: {grid_search.best_score_:.5f}")
-
-    # ----- 5. 使用最佳参数重新训练完整模型 -----
-    print("--- 使用最佳参数重新训练最终模型 (已重采样数据) ---")
-    # 1. 提取最佳参数
-    best_params = grid_search.best_params_
-    print(f"使用的最佳参数: {best_params}")
-
-    # 2. 使用最佳参数创建最终模型 (强制加入 class_weight='balanced' 如需求)
-    # 注意：如果网格搜索中 class_weight_option 是 'balanced'，则它已经是最佳的
-    # 这里我们保留最佳参数，但可以在最终模型中强制设置以确保
-    # 为了演示，我们保留搜索到的最佳 class_weight_option
+    # 1. 使用固定参数创建最终模型
     final_cascade_rf_clean = CascadeRandomForest(
-        n_layers=best_params.get('n_layers', 3),
-        n_estimators=best_params.get('n_estimators', 100),
-        max_depth=best_params.get('max_depth', None),
+        n_layers=fixed_params.get('n_layers', 5),
+        n_estimators=fixed_params.get('n_estimators', 200),
+        max_depth=fixed_params.get('max_depth', None),
         random_state=random_state,
-        class_weight_option=best_params.get('class_weight_option', 'balanced') # 使用搜索到的最佳选项
+        class_weight_option=fixed_params.get('class_weight_option', 'balanced')
     )
 
-    # 3. 用重采样后的数据训练 CascadeRF (插补和缩放已在外部完成)
-    print("训练最终级联随机森林模型 (使用最佳参数和重采样数据) ...")
-    final_cascade_rf_clean.fit(X_resampled, y_resampled)
+    # 2. 训练 CascadeRF (在重采样和PCA后的数据上)
+    print("训练最终级联随机森林模型 (使用固定参数、重采样和PCA数据) ...")
+    final_cascade_rf_clean.fit(X_resampled_pca, y_resampled)
 
-    # 4. 组装最终管道 (包含原始的 imputer 和 scaler)
+    # 3. 组装最终管道 (包含原始的 imputer, scaler, pca)
     final_model_clean = ModelPipeline(
         imputer=initial_imputer,   # 使用之前训练好的 imputer
         scaler=initial_scaler,     # 使用之前训练好的 scaler
+        pca=pca_transformer,       # 使用训练好的 PCA 变换器
         model=final_cascade_rf_clean # 使用训练好的模型
     )
 
@@ -443,15 +341,12 @@ if __name__ == "__main__":
     model_dict = {
         "imputer": final_model_clean.imputer,
         "scaler": final_model_clean.scaler,
+        "pca": final_model_clean.pca, # 保存 PCA 变换器
         "model": final_model_clean.model,  # 包含了级联结构和所有层
         "threshold_youden": float(best_thresh_youden),
         "threshold_pr_elbow": float(best_thresh_pr),
-        "best_params": best_params  # 保存最佳参数
+        "fixed_params": fixed_params  # 保存固定参数
     }
-    save_object(model_dict, "./model_pipeline_cascade_rf_optimized.pkl")
-    print("\n已保存优化后的完整模型管道 ./model_pipeline_cascade_rf_optimized.pkl")
+    save_object(model_dict, "./model_pipeline_cascade_rf_pca.pkl")
+    print("\n已保存包含PCA的完整模型管道 ./model_pipeline_cascade_rf_pca.pkl")
     print("=" * 70)
-
-
-
-
