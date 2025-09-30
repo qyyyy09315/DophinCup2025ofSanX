@@ -5,17 +5,16 @@ import warnings
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
-# 注意：如果环境中没有安装 imblearn 和 xgboost，需要先通过 pip 安装
-# pip install imbalanced-learn xgboost
+# 注意：如果环境中没有安装 imblearn 和 scikit-learn，需要先通过 pip 安装
+# pip install imbalanced-learn scikit-learn
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, \
     precision_recall_curve
 from sklearn.model_selection import train_test_split
-# from sklearn.ensemble import RandomForestClassifier # 已移除
-# from sklearn.decomposition import PCA # 已移除
 from sklearn.preprocessing import StandardScaler
 from sklearn.base import BaseEstimator, ClassifierMixin
-import xgboost as xgb  # 新增 XGBoost
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -54,144 +53,273 @@ def evaluate_and_print_metrics(y_true, y_pred, y_proba, threshold_name):
     print("-" * 30)
 
 
-# class CascadeRandomForest(BaseEstimator, ClassifierMixin): # 已重命名并修改
-class CascadeXGBoost(BaseEstimator, ClassifierMixin):
+class CascadeNaiveBayesWithDTFeatures(BaseEstimator, ClassifierMixin):
     """
-    级联 XGBoost 模型。
-    通过逐层训练 XGBoost 分类器，并将预测概率作为新特征传递给下一层，
-    实现层次化的特征学习。
+    基于决策树思想的级联朴素贝叶斯模型。
+    该模型模仿决策树的分裂过程：
+    1. 使用决策树找到最佳分割特征和阈值。
+    2. 根据此分割条件将数据划分为两部分。
+    3. 在每个子集上训练一个朴素贝叶斯分类器。
+    4. 将这两个 NB 分类器视为第一层。
+    5. 后续层级重复此过程，在由前一层分类器预测结果划分的新子集上训练新的 NB 对。
+    最终预测通过对所有 NB 分类器的概率进行平均得到。
     """
 
-    # def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42): # 已修改
-    def __init__(self, n_layers=3, early_stopping_rounds=10, eval_metric='logloss', random_state=42, xgb_params=None):
+    def __init__(self, n_layers=3, dt_max_depth_per_layer=1, nb_type='gaussian', random_state=42,
+                 nb_params=None):
         """
-        初始化级联 XGBoost。
+        初始化级联决策树思想朴素贝叶斯。
 
         :param n_layers: 级联的层数。
-        :param early_stopping_rounds: XGBoost 早停轮数 (现在用于 xgb_params)。
-        :param eval_metric: XGBoost 评估指标 (现在用于 xgb_params)。
+        :param dt_max_depth_per_layer: 每层用于分割的决策树的最大深度 (建议保持为1以模拟单次分割)。
+        :param nb_type: 使用的朴素贝叶斯类型 ('gaussian' for GaussianNB)。
         :param random_state: 随机种子。
-        :param xgb_params: 传递给 xgb.XGBClassifier 的参数字典。
-                           示例: {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1}
-                           early_stopping_rounds 和 eval_metric 也会被加入其中。
+        :param nb_params: 传递给朴素贝叶斯分类器的参数字典。
+                           示例 for GaussianNB: {'var_smoothing': 1e-9}
         """
         self.n_layers = n_layers
-        self.early_stopping_rounds = early_stopping_rounds
-        self.eval_metric = eval_metric
+        self.dt_max_depth_per_layer = dt_max_depth_per_layer
+        self.nb_type = nb_type.lower()
         self.random_state = random_state
-        # 将早停参数合并进 xgb_params 字典
-        base_xgb_params = {
-            'early_stopping_rounds': self.early_stopping_rounds,
-            'eval_metric': self.eval_metric
-        }
-        self.xgb_params = xgb_params or {}
-        # 更新用户提供的参数覆盖默认或基参数
-        base_xgb_params.update(self.xgb_params)
-        self.xgb_params = base_xgb_params
+        self.nb_params = nb_params or {}
+
+        if self.nb_type != 'gaussian':
+            raise NotImplementedError("目前仅支持 'gaussian' 类型的朴素贝叶叶斯。")
 
         self.layers = []
         # 用于存储训练时的原始特征维度，预测时需要
         self.initial_feature_count = None
-        # 存储用于早停的验证集
-        self.X_val_fit = None
-        self.y_val_fit = None
+
+    def _get_nb_instance(self):
+        """根据配置创建一个新的朴素贝叶斯实例"""
+        if self.nb_type == 'gaussian':
+            return GaussianNB(**self.nb_params)
+        else:
+            # This case should ideally not be reached due to check in __init__
+            raise ValueError(f"不支持的朴素贝叶斯类型: {self.nb_type}")
 
     def fit(self, X, y):
         """
-        训练级联 XGBoost 模型。
+        训练级联决策树思想朴素贝叶斯模型。
 
         :param X: 训练特征 (numpy array or pandas DataFrame)。
         :param y: 训练标签 (numpy array or pandas Series)。
         """
         self.initial_feature_count = X.shape[1]
 
-        # 为了启用早停，我们需要划分一部分训练数据作为验证集
-        # 这个划分在整个级联过程中保持不变
-        X_train_fit, self.X_val_fit, y_train_fit, self.y_val_fit = train_test_split(
-            X, y, test_size=0.15, stratify=y, random_state=self.random_state
-        )
-
-        # 初始输入为原始特征 (仅使用训练部分)
-        current_input = X_train_fit.copy()
+        # 初始输入为原始特征和标签
+        datasets_to_process = [(X.copy(), y.copy())]  # [(features, labels), ...]
         self.layers = []  # 重置 layers 列表，确保 fit 是幂等的
 
-        for i in range(self.n_layers):
+        for layer_idx in range(self.n_layers):
+            # print(f"训练第 {layer_idx + 1} 层...")
 
-            # 合并基础参数和用户提供的参数
-            params_to_use = {
-                'random_state': self.random_state + i,  # 改变每层的随机种子
-                'n_jobs': -1
-            }
-            params_to_use.update(self.xgb_params)
+            current_layer_classifiers = []
+            next_datasets = []
 
-            # 创建 XGBoost 分类器实例
-            clf = xgb.XGBClassifier(**params_to_use)
+            # 遍历当前层需要处理的所有数据集
+            for dataset_idx, (current_X, current_y) in enumerate(datasets_to_process):
 
-            # print(f"训练第 {i + 1} 层 XGBoost...") # 为简洁可关闭此打印
+                # 如果当前子集只有一个类别，则直接训练一个对应类别的 NB 并跳过分割
+                unique_labels = np.unique(current_y)
+                if len(unique_labels) <= 1:
+                    # print(f"  数据集 {dataset_idx} 只有一个类别 ({unique_labels}), 直接训练 NB.")
+                    clf = self._get_nb_instance()
+                    clf.fit(current_X, current_y)
+                    # 添加一个占位符 split_info，表示无需进一步分割
+                    current_layer_classifiers.append((clf, None))
+                    continue
 
-            # 使用带验证集的拟合进行早停
-            # eval_set 使用的是在 fit 开始时划分的固定验证集
-            clf.fit(
-                current_input, y_train_fit,
-                eval_set=[(self.X_val_fit, self.y_val_fit)],
-                verbose=False  # 关闭详细输出
-            )
+                # 1. 使用浅层决策树寻找最佳分割
+                splitter_dt = DecisionTreeClassifier(
+                    max_depth=self.dt_max_depth_per_layer,
+                    random_state=self.random_state + layer_idx * 100 + dataset_idx
+                )
+                splitter_dt.fit(current_X, current_y)
 
-            self.layers.append(clf)
+                # 获取分割特征和阈值 (对于 max_depth=1，这很简单)
+                # tree_.feature[0] 是根节点使用的特征索引 (-2 表示叶节点)
+                if splitter_dt.tree_.children_left[0] == splitter_dt.tree_.children_right[0]:  # No split happened
+                    # print(f"  数据集 {dataset_idx} 上决策树未能产生有效分割, 直接训练 NB.")
+                    clf = self._get_nb_instance()
+                    clf.fit(current_X, current_y)
+                    current_layer_classifiers.append((clf, None))
+                    continue
 
-            # 获取当前层在训练集上的预测概率 (用于构建下一层的输入)
-            probas_train = clf.predict_proba(X_train_fit)  # Shape: [n_samples_train, n_classes]
+                split_feature = splitter_dt.tree_.feature[0]
+                split_threshold = splitter_dt.tree_.threshold[0]
 
-            # 获取当前层在验证集上的预测概率 (用于早停, 不用于下一层输入构建)
-            # 注意：实际训练中，clf.predict_proba 已经在早停时使用了
+                # 2. 根据分割点划分数据
+                left_mask = current_X[:, split_feature] <= split_threshold
+                right_mask = ~left_mask
 
-            # 更新 current_input 为原始训练特征 + 各层预测结果的组合
-            # 下一层将会看到所有的历史信息 (仅在训练集上)
-            if i == 0:
-                # 第一次拼接的是原始训练特征 + 第一层预测结果
-                next_input_train = np.hstack((X_train_fit, probas_train))
-            else:
-                # 后续拼接增加新的预测结果列
-                next_input_train = np.hstack((next_input_train, probas_train))
+                X_left, y_left = current_X[left_mask], current_y[left_mask]
+                X_right, y_right = current_X[right_mask], current_y[right_mask]
 
-                # Prepare input for next iteration
-            current_input = next_input_train
+                # 3. 在左右子集上分别训练朴素贝叶斯分类器
+                clf_left = self._get_nb_instance()
+                clf_right = self._get_nb_instance()
 
-            # print("级联 XGBoost 训练完成。")
-        return self  # 符合 sklearn 接口
+                # 处理空子集的情况
+                if X_left.size > 0:
+                    clf_left.fit(X_left, y_left)
+                else:
+                    # 如果左子集为空，创建一个总是预测多数类的虚拟分类器
+                    majority_class = np.bincount(y_right).argmax()  # Use right's majority if left is empty
+                    dummy_preds_left = np.full_like(y_left, fill_value=majority_class,
+                                                    dtype=int) if y_left.size > 0 else np.array([majority_class])
+                    clf_left.fit(current_X[:1], dummy_preds_left[:1])  # Fit on a dummy sample
+
+                if X_right.size > 0:
+                    clf_right.fit(X_right, y_right)
+                else:
+                    # 如果右子集为空，创建一个总是预测多数类的虚拟分类器
+                    majority_class = np.bincount(y_left).argmax()  # Use left's majority if right is empty
+                    dummy_preds_right = np.full_like(y_right, fill_value=majority_class,
+                                                     dtype=int) if y_right.size > 0 else np.array([majority_class])
+                    clf_right.fit(current_X[:1], dummy_preds_right[:1])  # Fit on a dummy sample
+
+                # 4. 保存分类器和分割信息
+                split_info = {'feature': split_feature, 'threshold': split_threshold}
+                current_layer_classifiers.append(([clf_left, clf_right], split_info))
+
+                # 5. 将子集添加到下一轮待处理列表
+                if X_left.size > 0:
+                    next_datasets.append((X_left, y_left))
+                if X_right.size > 0:
+                    next_datasets.append((X_right, y_right))
+
+            # 6. 保存当前层
+            self.layers.append(current_layer_classifiers)
+            # 7. 更新下一轮要处理的数据集
+            datasets_to_process = next_datasets
+
+            # print(f"第 {layer_idx + 1} 层训练完成，产生了 {len(datasets_to_process)} 个新子集。")
+
+        # print("级联决策树思想朴素贝叶斯训练完成。")
+        return self
 
     def predict_proba(self, X):
         """
         预测样本属于各个类别的概率。
 
         :param X: 待预测特征。
-        :return: 概率矩阵 (numpy array)。
+        :return: 概率矩阵 (numpy array)，每一行是样本对各类别的平均概率。
         """
         if not self.layers:
             raise ValueError("模型尚未训练，请先调用 fit 方法。")
         if X.shape[1] != self.initial_feature_count:
             raise ValueError(f"输入特征维度 {X.shape[1]} 与训练时的维度 {self.initial_feature_count} 不符。")
 
-        # Start with original features
-        current_input = X.copy()
-        probas = None
+        all_proba_predictions = []
 
-        for i, clf in enumerate(self.layers):
-            # Predict using the current input features
-            probas = clf.predict_proba(current_input)
+        # 初始化队列，包含整个数据集和其在各层的位置追踪
+        # 结构: [(data_indices, layer_level, classifier_path_in_layer)]
+        processing_queue = [(np.arange(X.shape[0]), 0, [])]  # Start with all samples at layer 0
 
-            # Build up inputs incrementally for the next layer's prediction
-            # We use the original X and predictions from all previous layers
-            if i < len(self.layers) - 1:  # Don't concatenate after last one
-                if i == 0:
-                    extended_input = np.hstack((X, probas))
-                else:
-                    extended_input = np.hstack((extended_input, probas))
+        while processing_queue:
+            data_indices, layer_level, path = processing_queue.pop(0)
+            if layer_level >= len(self.layers):
+                # Should not happen, but safety check
+                continue
 
-                current_input = extended_input
+            current_layer = self.layers[layer_level]
 
-        # Return probabilities from the final layer
-        return probas
+            # Retrieve the specific set of classifiers based on the path taken so far
+            # For simplicity in this cascading structure, we assume path directly indexes into nested lists
+            # This logic needs careful handling depending on exact storage structure.
+            # Here, let's iterate through the layer's classifiers and match by path implicitly via order/tree traversal simulation
+
+            # In our stored structure, each item in a layer corresponds to an original split node
+            # We need to re-traverse the splits up to the current level for these indices.
+            # Simpler approach: process all classifiers in the layer that apply to the current subset.
+            # But our storage isn't strictly hierarchical paths. Let's rethink...
+
+            # Revised simpler idea matching original training flow:
+            # During prediction, we recreate the splitting process used during training.
+
+            # Let's restart queue logic properly:
+
+        # Re-initialize for correct traversal
+        # Structure in queue: (indices, layer_index, list_of_conditions_to_reach_here)
+        # Conditions could be list of (split_feature, split_threshold, is_left_child_bool)
+        processing_stack = [(np.arange(X.shape[0]), 0, [])]
+
+        while processing_stack:
+            current_indices, l_idx, conditions = processing_stack.pop()
+
+            if l_idx >= len(self.layers) or current_indices.size == 0:
+                continue
+
+            layer_models = self.layers[l_idx]
+
+            child_datasets_info = []  # Will hold (indices, new_conditions) for children
+
+            for model_group, split_details in layer_models:
+                if split_details is None:  # Model trained without split (pure node)
+                    # Apply this single model to current_indices
+                    sub_X = X[current_indices]
+                    try:
+                        p = model_group.predict_proba(sub_X)
+                    except:
+                        # Handle edge cases where model might fail on unseen feature values
+                        # E.g., GaussianNB can sometimes produce issues
+                        p = np.zeros((sub_X.shape[0], 2))  # Assuming binary classification
+                        p[:, 1] = 0.5  # Assign neutral probability
+
+                    all_proba_predictions.append((current_indices, p))
+
+                else:  # Normal split-based pair of models
+                    feat_idx = split_details['feature']
+                    thresh = split_details['threshold']
+
+                    sub_X = X[current_indices]
+
+                    # Check which points satisfy ancestral conditions first
+                    # This requires checking `conditions` history against X.
+                    # Simplification: Assume stack manages routing correctly based on applying splits sequentially.
+                    # So `current_indices` already represent points that reached this stage.
+
+                    left_child_mask_local = sub_X[:, feat_idx] <= thresh
+                    right_child_mask_local = ~left_child_mask_local
+
+                    left_indices = current_indices[left_child_mask_local]
+                    right_indices = current_indices[right_child_mask_local]
+
+                    # Predict with respective models
+                    if left_indices.size > 0:
+                        try:
+                            p_left = model_group[0].predict_proba(X[left_indices])
+                        except:
+                            p_left = np.zeros((left_indices.shape[0], 2))
+                            p_left[:, 1] = 0.5
+                        all_proba_predictions.append((left_indices, p_left))
+
+                    if right_indices.size > 0:
+                        try:
+                            p_right = model_group[1].predict_proba(X[right_indices])
+                        except:
+                            p_right = np.zeros((right_indices.shape[0], 2))
+                            p_right[:, 1] = 0.5
+                        all_proba_predictions.append((right_indices, p_right))
+
+        # Aggregate probabilities: Average over all predictions for each sample
+        if not all_proba_predictions:
+            # Fallback if no valid predictions were made (should be rare)
+            return np.ones((X.shape[0], 2)) * 0.5
+
+        final_probas = np.zeros((X.shape[0], all_proba_predictions[0][1].shape[1]))
+        counts = np.zeros(X.shape[0])
+
+        for indices, probas in all_proba_predictions:
+            final_probas[indices] += probas
+            counts[indices] += 1
+
+        # Avoid division by zero
+        counts[counts == 0] = 1
+        final_probas /= counts.reshape(-1, 1)
+
+        return final_probas
 
     def predict(self, X):
         """
@@ -251,35 +379,28 @@ def pr_threshold(y_true, probas):
 
 # --- 新增：封装完整模型管道以支持 GridSearchCV ---
 # --- 修改：移除内部 SMOTEENN 步骤，因为数据将在外部预处理 ---
-# --- 修改：移除 PCA 步骤 ---
-# class ModelPipeline(BaseEstimator, ClassifierMixin): # 已修改 docstring
 class ModelPipeline(BaseEstimator, ClassifierMixin):
-    """整合预处理 (插补, 缩放) 和 CascadeXGBoost 的管道 (移除了内部 SMOTEENN 和 PCA)"""
+    """整合预处理 (插补, 缩放) 和 CascadeNaiveBayesWithDTFeatures 的管道"""
 
-    def __init__(self, imputer=None, scaler=None, model=None):  # 移除 pca 参数
+    def __init__(self, imputer=None, scaler=None, model=None):
         self.imputer = imputer or SimpleImputer(strategy="mean")
         self.scaler = scaler or StandardScaler()
-        # self.pca = pca or PCA(n_components=0.95) # 默认保留 95% 方差 # 已移除 PCA
-        # 默认模型使用 CascadeXGBoost
-        self.model = model or CascadeXGBoost()
+        # 默认模型使用 CascadeNaiveBayesWithDTFeatures
+        self.model = model or CascadeNaiveBayesWithDTFeatures()
 
     def fit(self, X, y):
         """拟合整个管道：插补 -> 缩放 -> 模型训练"""
         X_imputed = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_imputed)
-        # X_pca = self.pca.fit_transform(X_scaled) # 已移除 PCA 拟合和变换
-        print(f"预处理后数据维度: {X_scaled.shape}")  # 更新打印信息
-        # self.model.fit(X_pca, y) # 在 PCA 变换后的数据上训练模型 # 已修改
-        self.model.fit(X_scaled, y)  # 在缩放后的数据上训练模型
+        print(f"预处理后数据维度: {X_scaled.shape}")
+        self.model.fit(X_scaled, y)
         return self
 
     def predict_proba(self, X):
         """预测概率：插补 -> 缩放 -> 模型预测"""
         X_imputed = self.imputer.transform(X)
         X_scaled = self.scaler.transform(X_imputed)
-        # X_pca = self.pca.transform(X_scaled) # 已移除 PCA 变换
-        # return self.model.predict_proba(X_pca) # 在 PCA 变换后的数据上预测 # 已修改
-        return self.model.predict_proba(X_scaled)  # 在缩放后的数据上预测
+        return self.model.predict_proba(X_scaled)
 
     def predict(self, X):
         """预测标签：插补 -> 缩放 -> 模型预测"""
@@ -289,8 +410,8 @@ class ModelPipeline(BaseEstimator, ClassifierMixin):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("开始训练：SMOTEENN -> 标准化 -> 级联 XGBoost (无网格搜索, 无PCA)")  # 更新标题
-    print("优化方向: 1. 先采样再训练; 2. 使用 XGBoost; 3. PR曲线拐点阈值")
+    print("开始训练：SMOTEENN -> 标准化 -> 级联 决策树思想朴素贝叶斯")
+    print("优化方向: 1. 先采样再训练; 2. 使用改进的级联 NB; 3. PR曲线拐点阈值")
     print("=" * 70)
 
     # ----- 配置 -----
@@ -299,28 +420,20 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # 固定模型超参数 (取消网格搜索和代价敏感, 移除 PCA 设置)
+    # 固定模型超参数
     fixed_params = {
         'n_layers': 3,
-        'n_estimators': 100,  # XGBoost 参数
-        'max_depth': 6,  # XGBoost 参数
-        'learning_rate': 0.1,  # XGBoost 参数
-        'subsample': 0.8,  # XGBoost 参数
-        'colsample_bytree': 0.8,  # XGBoost 参数
-        # 'class_weight_option': 'balanced' # 已移除
-        # 'pca_n_components': 0.95 # 已移除 PCA 设置
+        'dt_max_depth_per_layer': 1,
+        'nb_type': 'gaussian',
+        'nb_params': {'var_smoothing': 1e-9}  # GaussianNB 参数
     }
-    # pca_n_components = 0.95 # PCA 保留的方差比例 # 已移除
 
     # ----- 1. 读取并预处理数据 -----
-    # 注意：此部分需要一个名为 'clean.csv' 的有效文件
     try:
         data = pd.read_csv(data_path)
     except FileNotFoundError:
         print(f"错误: 找不到文件 '{data_path}'。请确保文件路径正确。")
-        exit(1)  # 如果找不到文件，则退出脚本
-        # 如果没有文件，可以创建一个示例数据集用于演示
-        # 例如: data = pd.DataFrame({'feature1': np.random.rand(100), 'feature2': np.random.rand(100), 'target': np.random.randint(0, 2, 100)})
+        exit(1)
 
     # 删除 company_id 列（如果存在）
     if 'company_id' in data.columns:
@@ -342,14 +455,14 @@ if __name__ == "__main__":
     print(f"用于训练的数据集: {X_temp.shape}, Holdout 集: {X_holdout.shape}")
 
     # ----- 3. 数据预处理与重采样 (先采样) -----
-    print("正在进行数据预处理 (插补 & 缩放) ...")  # 更新打印信息
+    print("正在进行数据预处理 (插补 & 缩放) ...")
     # 1. 插补
     initial_imputer = SimpleImputer(strategy="mean")
     X_temp_imputed = initial_imputer.fit_transform(X_temp)
     # 2. 缩放
     initial_scaler = StandardScaler()
     X_temp_scaled = initial_scaler.fit_transform(X_temp_imputed)
-    print(f"预处理后数据形状: {X_temp_scaled.shape}")  # 更新打印信息
+    print(f"预处理后数据形状: {X_temp_scaled.shape}")
 
     print("正在进行 SMOTEENN 重采样 ...")
     # 3. SMOTEENN 重采样
@@ -357,53 +470,31 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn_sampler.fit_resample(X_temp_scaled, y_temp)
     print(f"重采样后数据形状: {X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
 
-    # # ----- 4. PCA 降维 (在重采样后的数据上) ----- # 已移除整个步骤
-    # print(f"正在进行 PCA 降维 (保留 {pca_n_components*100:.1f}% 方差) ...")
-    # pca_transformer = PCA(n_components=pca_n_components)
-    # X_resampled_pca = pca_transformer.fit_transform(X_resampled)
-    # print(f"PCA 后数据形状: {X_resampled_pca.shape}")
-    # n_components_retained = pca_transformer.n_components_
-    # print(f"保留的主成分数量: {n_components_retained}")
-
-    # ----- 5. 使用固定参数训练模型 -----
-    print("--- 使用固定参数训练最终模型 (已重采样和标准化数据) ---")  # 更新打印信息
+    # ----- 4. 使用固定参数训练模型 -----
+    print("--- 使用固定参数训练最终模型 (已重采样和标准化数据) ---")
     print(f"使用的固定参数: {fixed_params}")
 
-    # 1. 使用固定参数创建最终模型 (使用 CascadeXGBoost, 不包含 class_weight_option)
-    # 提取 XGBoost 特定参数
-    xgb_specific_params = {k: v for k, v in fixed_params.items()
-                           if k in ['n_estimators', 'max_depth', 'learning_rate',
-                                    'subsample', 'colsample_bytree']}
-
-    # **关键修改**: 将早期停止参数也放在 xgb_params 中
-    xgb_early_stop_params = {
-        'early_stopping_rounds': 10,  # 或者使用 fixed_params.get('early_stopping_rounds', 10) 如果它也在里面
-        'eval_metric': 'logloss'  # 或者使用 fixed_params.get('eval_metric', 'logloss') 如果它也在里面
-    }
-    # 合并两个字典
-    all_xgb_params = {**xgb_specific_params, **xgb_early_stop_params}
-
-    final_cascade_xgb_clean = CascadeXGBoost(
-        n_layers=fixed_params.get('n_layers', 3),
-        random_state=random_state,
-        xgb_params=all_xgb_params  # 传递所有 XGBoost 参数包括早停
-        # 移除了 class_weight_option
+    # 1. 使用固定参数创建最终模型
+    final_cascade_nb_clean = CascadeNaiveBayesWithDTFeatures(
+        n_layers=fixed_params.get('n_layers',10),
+        dt_max_depth_per_layer=fixed_params.get('dt_max_depth_per_layer', 1),
+        nb_type=fixed_params.get('nb_type', 'gaussian'),
+        nb_params=fixed_params.get('nb_params', {}),
+        random_state=random_state
     )
 
-    # 2. 训练 CascadeXGBoost (在重采样和标准化后的数据上) # 更新打印信息
-    print("训练最终级联 XGBoost 模型 (使用固定参数、重采样和标准化数据) ...")
-    # final_cascade_rf_clean.fit(X_resampled_pca, y_resampled) # 已修改
-    final_cascade_xgb_clean.fit(X_resampled, y_resampled)
+    # 2. 训练 Cascade Naive Bayes
+    print("训练最终级联决策树思想朴素贝叶斯模型 (使用固定参数、重采样和标准化数据) ...")
+    final_cascade_nb_clean.fit(X_resampled, y_resampled)
 
-    # 3. 组装最终管道 (包含原始的 imputer, scaler) # 更新注释
+    # 3. 组装最终管道
     final_model_clean = ModelPipeline(
-        imputer=initial_imputer,  # 使用之前训练好的 imputer
-        scaler=initial_scaler,  # 使用之前训练好的 scaler
-        # pca=pca_transformer,       # 使用训练好的 PCA 变换器 # 已移除
-        model=final_cascade_xgb_clean  # 使用训练好的模型
+        imputer=initial_imputer,
+        scaler=initial_scaler,
+        model=final_cascade_nb_clean
     )
 
-    # ----- 6. 在 Holdout 集上评估最终模型 (多种阈值策略) -----
+    # ----- 5. 在 Holdout 集上评估最终模型 (多种阈值策略) -----
     print("\n在 Holdout 集上评估最终模型...")
     # 获取最后一层的概率预测 (对于二分类，我们通常取正类概率)
     holdout_probas = final_model_clean.predict_proba(X_holdout)[:, 1]
@@ -412,27 +503,25 @@ if __name__ == "__main__":
     best_thresh_youden = youden_threshold(y_holdout, holdout_probas)
     print(f"\n使用 Youden's J 统计量计算最佳阈值: {best_thresh_youden:.4f}")
     y_pred_holdout_youden = (holdout_probas >= best_thresh_youden).astype(int)
-    evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J")  # 调用已修复的函数
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J")
 
     # --- 阈值 2: PR 曲线拐点 (最小化 |P-R|) ---
     best_thresh_pr = pr_threshold(y_holdout, holdout_probas)
     print(f"\n使用 PR 曲线拐点 (最小化 |P-R|) 计算最佳阈值: {best_thresh_pr:.4f}")
     y_pred_holdout_pr = (holdout_probas >= best_thresh_pr).astype(int)
-    evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow")  # 调用已修复的函数
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow")
 
-    # ----- 7. 保存完整模型管道 (使用 Youden's J 阈值) -----
-    # (可根据业务需求选择保存哪个阈值的结果)
+    # ----- 6. 保存完整模型管道 (使用 Youden's J 阈值) -----
     model_dict = {
         "imputer": final_model_clean.imputer,
         "scaler": final_model_clean.scaler,
-        # "pca": final_model_clean.pca, # 保存 PCA 变换器 # 已移除
-        "model": final_model_clean.model,  # 包含了级联结构和所有层
+        "model": final_model_clean.model,
         "threshold_youden": float(best_thresh_youden),
         "threshold_pr_elbow": float(best_thresh_pr),
-        "fixed_params": fixed_params  # 保存固定参数
+        "fixed_params": fixed_params
     }
-    save_object(model_dict, "./model_pipeline_cascade_xgb.pkl")  # 更新保存文件名
-    print("\n已保存包含级联XGBoost的完整模型管道 ./model_pipeline_cascade_xgb.pkl")  # 更新打印信息
+    save_object(model_dict, "./model_pipeline_cascade_nb_dt.pkl")
+    print("\n已保存完整模型管道 ./model_pipeline_cascade_nb_dt.pkl")
     print("=" * 70)
 
 
