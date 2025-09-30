@@ -139,7 +139,7 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
             # 在新版 XGBoost 中，early_stopping_rounds 应该在构造函数中指定
             clf.fit(
                 temp_X_train_for_this_layer, y_train_fit,
-                eval_set=[(current_input[X_val_fit.index], y_val_fit)],  # 确保 val index align correctly
+                eval_set=[(X_val_fit, y_val_fit)],  # 修复：直接使用 NumPy 数组
                 verbose=False  # 关闭详细输出
             )
 
@@ -437,3 +437,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_xgb.pkl")  # 更新保存文件名
     print("\n已保存包含级联XGBoost的完整模型管道 ./model_pipeline_cascade_xgb.pkl")  # 更新打印信息
     print("=" * 70)
+
+
+
