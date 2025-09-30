@@ -68,17 +68,27 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         初始化级联 XGBoost。
 
         :param n_layers: 级联的层数。
-        :param early_stopping_rounds: XGBoost 早停轮数。
-        :param eval_metric: XGBoost 评估指标。
+        :param early_stopping_rounds: XGBoost 早停轮数 (现在用于 xgb_params)。
+        :param eval_metric: XGBoost 评估指标 (现在用于 xgb_params)。
         :param random_state: 随机种子。
         :param xgb_params: 传递给 xgb.XGBClassifier 的参数字典。
                            示例: {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1}
+                           early_stopping_rounds 和 eval_metric 也会被加入其中。
         """
         self.n_layers = n_layers
         self.early_stopping_rounds = early_stopping_rounds
         self.eval_metric = eval_metric
         self.random_state = random_state
+        # 将早停参数合并进 xgb_params 字典
+        base_xgb_params = {
+            'early_stopping_rounds': self.early_stopping_rounds,
+            'eval_metric': self.eval_metric
+        }
         self.xgb_params = xgb_params or {}
+        # 更新用户提供的参数覆盖默认或基参数
+        base_xgb_params.update(self.xgb_params)
+        self.xgb_params = base_xgb_params
+
         self.layers = []
         # 用于存储训练时的原始特征维度，预测时需要
         self.initial_feature_count = None
@@ -113,11 +123,12 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
             # print(f"训练第 {i + 1} 层 XGBoost...") # 为简洁可关闭此打印
 
             # 使用带验证集的拟合进行早停
+            # 在新版 XGBoost 中，early_stopping_rounds 应该在构造函数中指定
             clf.fit(
                 X_train_fit, y_train_fit,
                 eval_set=[(X_val_fit, y_val_fit)],
-                early_stopping_rounds=self.early_stopping_rounds,
-                eval_metric=self.eval_metric,
+                # early_stopping_rounds=self.early_stopping_rounds, # 已移动到构造函数
+                # eval_metric=self.eval_metric,                   # 已移动到构造函数
                 verbose=False  # 关闭详细输出
             )
 
@@ -283,6 +294,7 @@ if __name__ == "__main__":
         data = pd.read_csv(data_path)
     except FileNotFoundError:
         print(f"错误: 找不到文件 '{data_path}'。请确保文件路径正确。")
+        exit(1)  # 如果找不到文件，则退出脚本
         # 如果没有文件，可以创建一个示例数据集用于演示
         # 例如: data = pd.DataFrame({'feature1': np.random.rand(100), 'feature2': np.random.rand(100), 'target': np.random.randint(0, 2, 100)})
 
@@ -339,10 +351,18 @@ if __name__ == "__main__":
                            if k in ['n_estimators', 'max_depth', 'learning_rate',
                                     'subsample', 'colsample_bytree']}
 
+    # **关键修改**: 将早期停止参数也放在 xgb_params 中
+    xgb_early_stop_params = {
+        'early_stopping_rounds': 10,  # 或者使用 fixed_params.get('early_stopping_rounds', 10) 如果它也在里面
+        'eval_metric': 'logloss'  # 或者使用 fixed_params.get('eval_metric', 'logloss') 如果它也在里面
+    }
+    # 合并两个字典
+    all_xgb_params = {**xgb_specific_params, **xgb_early_stop_params}
+
     final_cascade_xgb_clean = CascadeXGBoost(
         n_layers=fixed_params.get('n_layers', 3),
         random_state=random_state,
-        xgb_params=xgb_specific_params  # 传递 XGBoost 参数
+        xgb_params=all_xgb_params  # 传递所有 XGBoost 参数包括早停
         # 移除了 class_weight_option
     )
 
