@@ -59,7 +59,7 @@ class CascadeRandomForest(BaseEstimator, ClassifierMixin):
     实现层次化的特征学习。
     """
 
-    def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42, class_weight_option='balanced'):
+    def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42):
         """
         初始化级联随机森林。
 
@@ -67,14 +67,11 @@ class CascadeRandomForest(BaseEstimator, ClassifierMixin):
         :param n_estimators: 每层中随机森林的树的数量。
         :param max_depth: 每棵树的最大深度。
         :param random_state: 随机种子。
-        :param class_weight_option: 'balanced', None, 或字典形式的类别权重 (e.g., {0:1, 1:5})
-                                    用于传递给底层 RandomForestClassifier 以实现代价敏感学习。
         """
         self.n_layers = n_layers
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.random_state = random_state
-        self.class_weight_option = class_weight_option  # 新增参数
         self.layers = []
         # 用于存储训练时的原始特征维度，预测时需要
         self.initial_feature_count = None
@@ -96,8 +93,8 @@ class CascadeRandomForest(BaseEstimator, ClassifierMixin):
                 n_estimators=self.n_estimators,
                 max_depth=self.max_depth,
                 random_state=self.random_state + i,  # 改变随机种子
-                n_jobs=-1,
-                class_weight=self.class_weight_option  # 应用代价敏感学习
+                n_jobs=-1
+                # 移除了 class_weight 参数
             )
             # print(f"训练第 {i + 1} 层随机森林...") # 为简洁可关闭此打印
             rf.fit(X_current, y)
@@ -197,8 +194,8 @@ class ModelPipeline(BaseEstimator, ClassifierMixin):
         self.imputer = imputer or SimpleImputer(strategy="mean")
         self.scaler = scaler or StandardScaler()
         self.pca = pca or PCA(n_components=0.95) # 默认保留 95% 方差 # 新增 PCA
-        # 默认模型使用 class_weight=None，网格搜索会覆盖
-        self.model = model or CascadeRandomForest(class_weight_option=None)
+        # 默认模型，不再设置 class_weight
+        self.model = model or CascadeRandomForest()
 
     def fit(self, X, y):
         """拟合整个管道：插补 -> 缩放 -> PCA -> 模型训练"""
@@ -224,7 +221,7 @@ class ModelPipeline(BaseEstimator, ClassifierMixin):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("开始训练：SMOTEENN -> PCA -> 级联随机森林 (Cascade RF) (无网格搜索)")
+    print("开始训练：SMOTEENN -> PCA -> 级联随机森林 (Cascade RF) (无网格搜索，无代价敏感)")
     print("优化方向: 1. 先采样再训练; 2. 加入 PCA 降维; 3. PR曲线拐点阈值")
     print("=" * 70)
 
@@ -234,12 +231,12 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # 固定模型超参数 (取消网格搜索)
+    # 固定模型超参数 (取消网格搜索和代价敏感)
     fixed_params = {
         'n_layers': 3,
         'n_estimators': 100,
-        'max_depth': None,
-        'class_weight_option': 'balanced'
+        'max_depth': None
+        # 移除了 'class_weight_option'
     }
     pca_n_components = 0.95 # PCA 保留的方差比例
 
@@ -250,6 +247,7 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print(f"错误: 找不到文件 '{data_path}'。请确保文件路径正确。")
         # 如果没有文件，可以创建一个示例数据集用于演示
+        # 例如: data = pd.DataFrame({'feature1': np.random.rand(100), 'feature2': np.random.rand(100), 'target': np.random.randint(0, 2, 100)})
 
     # 删除 company_id 列（如果存在）
     if 'company_id' in data.columns:
@@ -298,13 +296,13 @@ if __name__ == "__main__":
     print("--- 使用固定参数训练最终模型 (已重采样和PCA数据) ---")
     print(f"使用的固定参数: {fixed_params}")
 
-    # 1. 使用固定参数创建最终模型
+    # 1. 使用固定参数创建最终模型 (不包含 class_weight_option)
     final_cascade_rf_clean = CascadeRandomForest(
         n_layers=fixed_params.get('n_layers', 5),
         n_estimators=fixed_params.get('n_estimators', 200),
         max_depth=fixed_params.get('max_depth', None),
-        random_state=random_state,
-        class_weight_option=fixed_params.get('class_weight_option', 'balanced')
+        random_state=random_state
+        # 移除了 class_weight_option
     )
 
     # 2. 训练 CascadeRF (在重采样和PCA后的数据上)
