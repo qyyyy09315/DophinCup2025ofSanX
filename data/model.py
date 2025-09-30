@@ -187,13 +187,15 @@ def pr_threshold(y_true, probas):
 
 
 # --- 新增：封装完整模型管道以支持 GridSearchCV ---
+# --- 修改：移除内部 SMOTEENN 步骤，因为数据将在外部预处理 ---
 class ModelPipeline(BaseEstimator, ClassifierMixin):
-    """整合预处理和 CascadeRandomForest 的管道"""
+    """整合预处理和 CascadeRandomForest 的管道 (移除了内部 SMOTEENN)"""
 
     def __init__(self, imputer=None, scaler=None, model=None):
         self.imputer = imputer or SimpleImputer(strategy="mean")
         self.scaler = scaler or StandardScaler()
-        self.model = model or CascadeRandomForest()
+        # 默认模型使用 class_weight=None，网格搜索会覆盖
+        self.model = model or CascadeRandomForest(class_weight_option=None)
 
     def fit(self, X, y):
         """拟合整个管道：插补 -> 缩放 -> 模型训练"""
@@ -254,7 +256,7 @@ custom_scorer = make_scorer(custom_score_function, needs_proba=True)
 if __name__ == "__main__":
     print("=" * 70)
     print("开始训练：SMOTEENN -> 级联随机森林 (Cascade RF) 带网格搜索调优 & 优化")
-    print("优化方向: 1. 代价敏感学习(class_weight); 2. PR曲线拐点阈值")
+    print("优化方向: 1. 先采样再网格搜索; 2. 扩大参数搜索空间; 3. PR曲线拐点阈值")
     print("=" * 70)
 
     # ----- 配置 -----
@@ -263,13 +265,13 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # 网格搜索配置
+    # 网格搜索配置 - 扩大参数范围和种类
     param_grid = {
         # 注意：参数名需要与 ModelPipeline.model 的属性对应
-        'model__n_layers': [3, 5], # 示例：减少搜索空间以加快速度
-        'model__n_estimators': [100, 200], # 示例：减少搜索空间以加快速度
-        'model__max_depth': [4, None]  # None 表示不限制深度 # 示例：减少搜索空间以加快速度
-        # 'model__class_weight_option': ['balanced'] # 可以也将其加入网格搜索
+        'model__n_layers': [2, 3, 5], # 增加选项
+        'model__n_estimators': [50, 100, 200], # 增加选项
+        'model__max_depth': [3, 5, None], # 增加选项，None 表示不限制深度
+        'model__class_weight_option': ['balanced', None] # 新增：将 class_weight 也加入搜索
     }
     cv_folds = 3  # 交叉验证折数
     n_jobs = -1  # 并行运行作业数
@@ -318,20 +320,35 @@ if __name__ == "__main__":
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
         X_all, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
-    # 再将剩余部分划分为用于网格搜索的训练集和验证集 (这里简化处理，实际可以再细分)
-    # 或者直接使用 GridSearchCV 的 cv 功能，它会在 X_temp 上进行 cv 划分
     print(f"用于网格搜索的数据集: {X_temp.shape}, Holdout 集: {X_holdout.shape}")
 
-    # ----- 3. 网格搜索超参数调优 -----
-    print("开始网格搜索超参数调优 ...")
+    # ----- 3. 数据预处理与重采样 (先采样) -----
+    print("正在进行数据预处理 (插补 & 缩放) ...")
+    # 1. 插补
+    initial_imputer = SimpleImputer(strategy="mean")
+    X_temp_imputed = initial_imputer.fit_transform(X_temp)
+    # 2. 缩放
+    initial_scaler = StandardScaler()
+    X_temp_scaled = initial_scaler.fit_transform(X_temp_imputed)
+    print(f"预处理后数据形状: {X_temp_scaled.shape}")
+
+    print("正在进行 SMOTEENN 重采样 ...")
+    # 3. SMOTEENN 重采样
+    smoteenn_sampler = SMOTEENN(random_state=random_state)
+    X_resampled, y_resampled = smoteenn_sampler.fit_resample(X_temp_scaled, y_temp)
+    print(f"重采样后数据形状: {X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
+
+    # ----- 4. 网格搜索超参数调优 (在重采样后的数据上) -----
+    print("开始网格搜索超参数调优 (在重采样后的数据上)...")
     print(f"搜索空间: {param_grid}")
 
     # 创建管道实例 (内部模型使用默认参数，会被 GridSearchCV 覆盖)
-    pipeline = ModelPipeline()
+    # 注意：这个管道现在只负责模型部分，数据预处理已在外部完成
+    pipeline_for_gridsearch = ModelPipeline(imputer=None, scaler=None) # 插补和缩放已在外部完成
 
     # 创建 GridSearchCV 对象
     grid_search = GridSearchCV(
-        estimator=pipeline,
+        estimator=pipeline_for_gridsearch,
         param_grid=param_grid,
         scoring=custom_scorer,  # 使用修复后的自定义评分函数
         cv=cv_folds,
@@ -339,53 +356,72 @@ if __name__ == "__main__":
         verbose=2  # 显示进度
     )
 
-    # 执行网格搜索 (注意：GridSearchCV 内部会处理 fit/predict_proba)
-    grid_search.fit(X_temp, y_temp)
+    # 执行网格搜索
+    # 注意：由于数据已经预处理和重采样，我们需要一个特殊的管道来绕过内部的预处理步骤
+    # 解决方案：创建一个临时的、只包含模型的管道实例，直接在重采样数据上训练
+    # 但这会丢失 imputer/scaler 的信息。更好的方法是修改 ModelPipeline 的 fit/predict_proba
+    # 使其能接受已预处理的数据。
+    # 这里采用一个更直接的方法：创建一个只包含 CascadeRF 的 GridSearchCV，
+    # 因为我们已经完成了预处理和重采样。
+
+    # --- 修改：直接对 CascadeRandomForest 进行网格搜索 ---
+    print("--- 修改策略：直接对 CascadeRandomForest 进行网格搜索 ---")
+    # 调整参数名以匹配 CascadeRandomForest 的构造函数
+    adjusted_param_grid = {
+        'n_layers': param_grid['model__n_layers'],
+        'n_estimators': param_grid['model__n_estimators'],
+        'max_depth': param_grid['model__max_depth'],
+        'class_weight_option': param_grid['model__class_weight_option']
+    }
+
+    base_model_for_gridsearch = CascadeRandomForest() # 基础模型
+
+    grid_search = GridSearchCV(
+        estimator=base_model_for_gridsearch,
+        param_grid=adjusted_param_grid,
+        scoring=custom_scorer,
+        cv=cv_folds,
+        n_jobs=n_jobs,
+        verbose=2
+    )
+
+    # 在重采样后的数据上进行网格搜索
+    grid_search.fit(X_resampled, y_resampled)
 
     print("网格搜索完成。")
     print(f"最佳参数: {grid_search.best_params_}")
     print(f"最佳交叉验证得分: {grid_search.best_score_:.5f}")
 
-    # ----- 4. 使用最佳参数重新训练完整模型 -----
-
-    # --- 采用严谨方法重新训练 ---
-    print("--- 严谨地重新训练最佳模型 ---")
+    # ----- 5. 使用最佳参数重新训练完整模型 -----
+    print("--- 使用最佳参数重新训练最终模型 (已重采样数据) ---")
     # 1. 提取最佳参数
     best_params = grid_search.best_params_
     print(f"使用的最佳参数: {best_params}")
-    # 重建模型 (强制加入 class_weight='balanced')
+
+    # 2. 使用最佳参数创建最终模型 (强制加入 class_weight='balanced' 如需求)
+    # 注意：如果网格搜索中 class_weight_option 是 'balanced'，则它已经是最佳的
+    # 这里我们保留最佳参数，但可以在最终模型中强制设置以确保
+    # 为了演示，我们保留搜索到的最佳 class_weight_option
     final_cascade_rf_clean = CascadeRandomForest(
-        n_layers=best_params.get('model__n_layers', 3),  # 默认值以防万一
-        n_estimators=best_params.get('model__n_estimators', 100),
-        max_depth=best_params.get('model__max_depth', None),
+        n_layers=best_params.get('n_layers', 3),
+        n_estimators=best_params.get('n_estimators', 100),
+        max_depth=best_params.get('max_depth', None),
         random_state=random_state,
-        class_weight_option='balanced'  # 强制应用代价敏感学习
+        class_weight_option=best_params.get('class_weight_option', 'balanced') # 使用搜索到的最佳选项
     )
-    # 2. 用 X_temp 重新训练预处理步骤
-    final_imputer = SimpleImputer(strategy="mean")
-    final_scaler = StandardScaler()
-    X_temp_imputed_clean = final_imputer.fit_transform(X_temp)
-    X_temp_scaled_clean = final_scaler.fit_transform(X_temp_imputed_clean)
 
-    # 3. 对预处理后的数据进行 SMOTEENN
-    print("正在进行 SMOTEENN 重采样 (严谨流程)...")
-    final_smoteenn = SMOTEENN(random_state=random_state)
-    X_final_resampled, y_final_resampled = final_smoteenn.fit_resample(X_temp_scaled_clean, y_temp)
-    print(
-        f"重采样后: X={X_final_resampled.shape}, 正类={y_final_resampled.sum()}, 负类={(y_final_resampled == 0).sum()}")
+    # 3. 用重采样后的数据训练 CascadeRF (插补和缩放已在外部完成)
+    print("训练最终级联随机森林模型 (使用最佳参数和重采样数据) ...")
+    final_cascade_rf_clean.fit(X_resampled, y_resampled)
 
-    # 4. 用重采样后的数据训练 CascadeRF
-    print("训练最终级联随机森林模型 (带有 class_weight='balanced') ...")
-    final_cascade_rf_clean.fit(X_final_resampled, y_final_resampled)
-
-    # 5. 组装最终管道
+    # 4. 组装最终管道 (包含原始的 imputer 和 scaler)
     final_model_clean = ModelPipeline(
-        imputer=final_imputer,
-        scaler=final_scaler,
-        model=final_cascade_rf_clean
+        imputer=initial_imputer,   # 使用之前训练好的 imputer
+        scaler=initial_scaler,     # 使用之前训练好的 scaler
+        model=final_cascade_rf_clean # 使用训练好的模型
     )
 
-    # ----- 5. 在 Holdout 集上评估最终模型 (多种阈值策略) -----
+    # ----- 6. 在 Holdout 集上评估最终模型 (多种阈值策略) -----
     print("\n在 Holdout 集上评估最终模型...")
     # 获取最后一层的概率预测 (对于二分类，我们通常取正类概率)
     holdout_probas = final_model_clean.predict_proba(X_holdout)[:, 1]
@@ -402,7 +438,7 @@ if __name__ == "__main__":
     y_pred_holdout_pr = (holdout_probas >= best_thresh_pr).astype(int)
     evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow") # 调用已修复的函数
 
-    # ----- 6. 保存完整模型管道 (使用 Youden's J 阈值) -----
+    # ----- 7. 保存完整模型管道 (使用 Youden's J 阈值) -----
     # (可根据业务需求选择保存哪个阈值的结果)
     model_dict = {
         "imputer": final_model_clean.imputer,
