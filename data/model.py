@@ -5,15 +5,17 @@ import warnings
 import numpy as np
 import pandas as pd
 from imblearn.combine import SMOTEENN
-# 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
+# 注意：如果环境中没有安装 imblearn 和 xgboost，需要先通过 pip 安装
+# pip install imbalanced-learn xgboost
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, \
     precision_recall_curve
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
+# from sklearn.ensemble import RandomForestClassifier # 已移除
+# from sklearn.decomposition import PCA # 已移除
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA # 新增 PCA
 from sklearn.base import BaseEstimator, ClassifierMixin
+import xgboost as xgb  # 新增 XGBoost
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -52,33 +54,38 @@ def evaluate_and_print_metrics(y_true, y_pred, y_proba, threshold_name):
     print("-" * 30)
 
 
-class CascadeRandomForest(BaseEstimator, ClassifierMixin):
+# class CascadeRandomForest(BaseEstimator, ClassifierMixin): # 已重命名并修改
+class CascadeXGBoost(BaseEstimator, ClassifierMixin):
     """
-    级联随机森林模型。
-    通过逐层训练随机森林，并将预测概率作为新特征传递给下一层，
+    级联 XGBoost 模型。
+    通过逐层训练 XGBoost 分类器，并将预测概率作为新特征传递给下一层，
     实现层次化的特征学习。
     """
 
-    def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42):
+    # def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42): # 已修改
+    def __init__(self, n_layers=3, early_stopping_rounds=10, eval_metric='logloss', random_state=42, xgb_params=None):
         """
-        初始化级联随机森林。
+        初始化级联 XGBoost。
 
         :param n_layers: 级联的层数。
-        :param n_estimators: 每层中随机森林的树的数量。
-        :param max_depth: 每棵树的最大深度。
+        :param early_stopping_rounds: XGBoost 早停轮数。
+        :param eval_metric: XGBoost 评估指标。
         :param random_state: 随机种子。
+        :param xgb_params: 传递给 xgb.XGBClassifier 的参数字典。
+                           示例: {'n_estimators': 100, 'max_depth': 6, 'learning_rate': 0.1}
         """
         self.n_layers = n_layers
-        self.n_estimators = n_estimators
-        self.max_depth = max_depth
+        self.early_stopping_rounds = early_stopping_rounds
+        self.eval_metric = eval_metric
         self.random_state = random_state
+        self.xgb_params = xgb_params or {}
         self.layers = []
         # 用于存储训练时的原始特征维度，预测时需要
         self.initial_feature_count = None
 
     def fit(self, X, y):
         """
-        训练级联随机森林模型。
+        训练级联 XGBoost 模型。
 
         :param X: 训练特征 (numpy array or pandas DataFrame)。
         :param y: 训练标签 (numpy array or pandas Series)。
@@ -86,25 +93,48 @@ class CascadeRandomForest(BaseEstimator, ClassifierMixin):
         self.initial_feature_count = X.shape[1]
         X_current = X.copy()  # 避免修改原始输入
         self.layers = []  # 重置 layers 列表，确保 fit 是幂等的
+
+        # 为了启用早停，我们需要划分一部分训练数据作为验证集
+        X_train_fit, X_val_fit, y_train_fit, y_val_fit = train_test_split(
+            X_current, y, test_size=0.15, stratify=y, random_state=self.random_state
+        )
+
         for i in range(self.n_layers):
-            # 为了增加多样性，可以对每层使用不同的随机种子
-            # 或者调整其他超参数
-            rf = RandomForestClassifier(
-                n_estimators=self.n_estimators,
-                max_depth=self.max_depth,
-                random_state=self.random_state + i,  # 改变随机种子
-                n_jobs=-1
-                # 移除了 class_weight 参数
+            # 合并基础参数和用户提供的参数
+            params_to_use = {
+                'random_state': self.random_state + i,  # 改变每层的随机种子
+                'n_jobs': -1
+            }
+            params_to_use.update(self.xgb_params)
+
+            # 创建 XGBoost 分类器实例
+            clf = xgb.XGBClassifier(**params_to_use)
+
+            # print(f"训练第 {i + 1} 层 XGBoost...") # 为简洁可关闭此打印
+
+            # 使用带验证集的拟合进行早停
+            clf.fit(
+                X_train_fit, y_train_fit,
+                eval_set=[(X_val_fit, y_val_fit)],
+                early_stopping_rounds=self.early_stopping_rounds,
+                eval_metric=self.eval_metric,
+                verbose=False  # 关闭详细输出
             )
-            # print(f"训练第 {i + 1} 层随机森林...") # 为简洁可关闭此打印
-            rf.fit(X_current, y)
-            self.layers.append(rf)
+
+            self.layers.append(clf)
 
             # 将原始特征与当前层的概率预测拼接，作为下一层的输入
-            probas = rf.predict_proba(X_current)
+            # 使用完整的 X_current 来获取概率，以便下一层看到所有训练样本的信息
+            probas = clf.predict_proba(X_current)
             X_current = np.hstack([X, probas])  # 始终与原始特征拼接
 
-        # print("级联随机森林训练完成。")
+            # 更新下一循环使用的训练/验证集 (虽然不改变结构，但保持一致性)
+            # 这里简单地重新分割 X_current, y 供下一层潜在使用（尽管本次实现没用上）
+            # X_train_fit, X_val_fit, y_train_fit, y_val_fit = train_test_split(
+            #     X_current, y, test_size=0.15, stratify=y, random_state=self.random_state
+            # )
+
+        # print("级联 XGBoost 训练完成。")
         return self  # 符合 sklearn 接口
 
     def predict_proba(self, X):
@@ -120,9 +150,9 @@ class CascadeRandomForest(BaseEstimator, ClassifierMixin):
             raise ValueError(f"输入特征维度 {X.shape[1]} 与训练时的维度 {self.initial_feature_count} 不符。")
 
         X_current = X.copy()
-        for i, rf in enumerate(self.layers):
+        for i, clf in enumerate(self.layers):
             # 将原始特征与当前层的概率预测拼接
-            probas = rf.predict_proba(X_current)
+            probas = clf.predict_proba(X_current)
             if i < len(self.layers) - 1:  # 最后一层不需要拼接，直接输出
                 X_current = np.hstack([X, probas])
         # 返回最后一层的概率预测
@@ -186,43 +216,46 @@ def pr_threshold(y_true, probas):
 
 # --- 新增：封装完整模型管道以支持 GridSearchCV ---
 # --- 修改：移除内部 SMOTEENN 步骤，因为数据将在外部预处理 ---
-# --- 修改：加入 PCA 步骤 ---
+# --- 修改：移除 PCA 步骤 ---
+# class ModelPipeline(BaseEstimator, ClassifierMixin): # 已修改 docstring
 class ModelPipeline(BaseEstimator, ClassifierMixin):
-    """整合预处理 (插补, 缩放, PCA) 和 CascadeRandomForest 的管道 (移除了内部 SMOTEENN)"""
+    """整合预处理 (插补, 缩放) 和 CascadeXGBoost 的管道 (移除了内部 SMOTEENN 和 PCA)"""
 
-    def __init__(self, imputer=None, scaler=None, pca=None, model=None): # 新增 pca 参数
+    def __init__(self, imputer=None, scaler=None, model=None):  # 移除 pca 参数
         self.imputer = imputer or SimpleImputer(strategy="mean")
         self.scaler = scaler or StandardScaler()
-        self.pca = pca or PCA(n_components=0.95) # 默认保留 95% 方差 # 新增 PCA
-        # 默认模型，不再设置 class_weight
-        self.model = model or CascadeRandomForest()
+        # self.pca = pca or PCA(n_components=0.95) # 默认保留 95% 方差 # 已移除 PCA
+        # 默认模型使用 CascadeXGBoost
+        self.model = model or CascadeXGBoost()
 
     def fit(self, X, y):
-        """拟合整个管道：插补 -> 缩放 -> PCA -> 模型训练"""
+        """拟合整个管道：插补 -> 缩放 -> 模型训练"""
         X_imputed = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_imputed)
-        X_pca = self.pca.fit_transform(X_scaled) # 新增 PCA 拟合和变换
-        print(f"PCA 后数据维度: {X_pca.shape}")
-        self.model.fit(X_pca, y) # 在 PCA 变换后的数据上训练模型
+        # X_pca = self.pca.fit_transform(X_scaled) # 已移除 PCA 拟合和变换
+        print(f"预处理后数据维度: {X_scaled.shape}")  # 更新打印信息
+        # self.model.fit(X_pca, y) # 在 PCA 变换后的数据上训练模型 # 已修改
+        self.model.fit(X_scaled, y)  # 在缩放后的数据上训练模型
         return self
 
     def predict_proba(self, X):
-        """预测概率：插补 -> 缩放 -> PCA -> 模型预测"""
+        """预测概率：插补 -> 缩放 -> 模型预测"""
         X_imputed = self.imputer.transform(X)
         X_scaled = self.scaler.transform(X_imputed)
-        X_pca = self.pca.transform(X_scaled) # 新增 PCA 变换
-        return self.model.predict_proba(X_pca) # 在 PCA 变换后的数据上预测
+        # X_pca = self.pca.transform(X_scaled) # 已移除 PCA 变换
+        # return self.model.predict_proba(X_pca) # 在 PCA 变换后的数据上预测 # 已修改
+        return self.model.predict_proba(X_scaled)  # 在缩放后的数据上预测
 
     def predict(self, X):
-        """预测标签：插补 -> 缩放 -> PCA -> 模型预测"""
+        """预测标签：插补 -> 缩放 -> 模型预测"""
         probas = self.predict_proba(X)
         return np.argmax(probas, axis=1)
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("开始训练：SMOTEENN -> PCA -> 级联随机森林 (Cascade RF) (无网格搜索，无代价敏感)")
-    print("优化方向: 1. 先采样再训练; 2. 加入 PCA 降维; 3. PR曲线拐点阈值")
+    print("开始训练：SMOTEENN -> 标准化 -> 级联 XGBoost (无网格搜索, 无PCA)")  # 更新标题
+    print("优化方向: 1. 先采样再训练; 2. 使用 XGBoost; 3. PR曲线拐点阈值")
     print("=" * 70)
 
     # ----- 配置 -----
@@ -231,14 +264,18 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
 
-    # 固定模型超参数 (取消网格搜索和代价敏感)
+    # 固定模型超参数 (取消网格搜索和代价敏感, 移除 PCA 设置)
     fixed_params = {
         'n_layers': 3,
-        'n_estimators': 100,
-        'max_depth': None
-        # 移除了 'class_weight_option'
+        'n_estimators': 100,  # XGBoost 参数
+        'max_depth': 6,  # XGBoost 参数
+        'learning_rate': 0.1,  # XGBoost 参数
+        'subsample': 0.8,  # XGBoost 参数
+        'colsample_bytree': 0.8,  # XGBoost 参数
+        # 'class_weight_option': 'balanced' # 已移除
+        # 'pca_n_components': 0.95 # 已移除 PCA 设置
     }
-    pca_n_components = 0.95 # PCA 保留的方差比例
+    # pca_n_components = 0.95 # PCA 保留的方差比例 # 已移除
 
     # ----- 1. 读取并预处理数据 -----
     # 注意：此部分需要一个名为 'clean.csv' 的有效文件
@@ -269,14 +306,14 @@ if __name__ == "__main__":
     print(f"用于训练的数据集: {X_temp.shape}, Holdout 集: {X_holdout.shape}")
 
     # ----- 3. 数据预处理与重采样 (先采样) -----
-    print("正在进行数据预处理 (插补 & 缩放) ...")
+    print("正在进行数据预处理 (插补 & 缩放) ...")  # 更新打印信息
     # 1. 插补
     initial_imputer = SimpleImputer(strategy="mean")
     X_temp_imputed = initial_imputer.fit_transform(X_temp)
     # 2. 缩放
     initial_scaler = StandardScaler()
     X_temp_scaled = initial_scaler.fit_transform(X_temp_imputed)
-    print(f"预处理后数据形状: {X_temp_scaled.shape}")
+    print(f"预处理后数据形状: {X_temp_scaled.shape}")  # 更新打印信息
 
     print("正在进行 SMOTEENN 重采样 ...")
     # 3. SMOTEENN 重采样
@@ -284,37 +321,42 @@ if __name__ == "__main__":
     X_resampled, y_resampled = smoteenn_sampler.fit_resample(X_temp_scaled, y_temp)
     print(f"重采样后数据形状: {X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
 
-    # ----- 4. PCA 降维 (在重采样后的数据上) -----
-    print(f"正在进行 PCA 降维 (保留 {pca_n_components*100:.1f}% 方差) ...")
-    pca_transformer = PCA(n_components=pca_n_components)
-    X_resampled_pca = pca_transformer.fit_transform(X_resampled)
-    print(f"PCA 后数据形状: {X_resampled_pca.shape}")
-    n_components_retained = pca_transformer.n_components_
-    print(f"保留的主成分数量: {n_components_retained}")
+    # # ----- 4. PCA 降维 (在重采样后的数据上) ----- # 已移除整个步骤
+    # print(f"正在进行 PCA 降维 (保留 {pca_n_components*100:.1f}% 方差) ...")
+    # pca_transformer = PCA(n_components=pca_n_components)
+    # X_resampled_pca = pca_transformer.fit_transform(X_resampled)
+    # print(f"PCA 后数据形状: {X_resampled_pca.shape}")
+    # n_components_retained = pca_transformer.n_components_
+    # print(f"保留的主成分数量: {n_components_retained}")
 
     # ----- 5. 使用固定参数训练模型 -----
-    print("--- 使用固定参数训练最终模型 (已重采样和PCA数据) ---")
+    print("--- 使用固定参数训练最终模型 (已重采样和标准化数据) ---")  # 更新打印信息
     print(f"使用的固定参数: {fixed_params}")
 
-    # 1. 使用固定参数创建最终模型 (不包含 class_weight_option)
-    final_cascade_rf_clean = CascadeRandomForest(
-        n_layers=fixed_params.get('n_layers', 5),
-        n_estimators=fixed_params.get('n_estimators', 200),
-        max_depth=fixed_params.get('max_depth', None),
-        random_state=random_state
+    # 1. 使用固定参数创建最终模型 (使用 CascadeXGBoost, 不包含 class_weight_option)
+    # 提取 XGBoost 特定参数
+    xgb_specific_params = {k: v for k, v in fixed_params.items()
+                           if k in ['n_estimators', 'max_depth', 'learning_rate',
+                                    'subsample', 'colsample_bytree']}
+
+    final_cascade_xgb_clean = CascadeXGBoost(
+        n_layers=fixed_params.get('n_layers', 3),
+        random_state=random_state,
+        xgb_params=xgb_specific_params  # 传递 XGBoost 参数
         # 移除了 class_weight_option
     )
 
-    # 2. 训练 CascadeRF (在重采样和PCA后的数据上)
-    print("训练最终级联随机森林模型 (使用固定参数、重采样和PCA数据) ...")
-    final_cascade_rf_clean.fit(X_resampled_pca, y_resampled)
+    # 2. 训练 CascadeXGBoost (在重采样和标准化后的数据上) # 更新打印信息
+    print("训练最终级联 XGBoost 模型 (使用固定参数、重采样和标准化数据) ...")
+    # final_cascade_rf_clean.fit(X_resampled_pca, y_resampled) # 已修改
+    final_cascade_xgb_clean.fit(X_resampled, y_resampled)
 
-    # 3. 组装最终管道 (包含原始的 imputer, scaler, pca)
+    # 3. 组装最终管道 (包含原始的 imputer, scaler) # 更新注释
     final_model_clean = ModelPipeline(
-        imputer=initial_imputer,   # 使用之前训练好的 imputer
-        scaler=initial_scaler,     # 使用之前训练好的 scaler
-        pca=pca_transformer,       # 使用训练好的 PCA 变换器
-        model=final_cascade_rf_clean # 使用训练好的模型
+        imputer=initial_imputer,  # 使用之前训练好的 imputer
+        scaler=initial_scaler,  # 使用之前训练好的 scaler
+        # pca=pca_transformer,       # 使用训练好的 PCA 变换器 # 已移除
+        model=final_cascade_xgb_clean  # 使用训练好的模型
     )
 
     # ----- 6. 在 Holdout 集上评估最终模型 (多种阈值策略) -----
@@ -326,25 +368,25 @@ if __name__ == "__main__":
     best_thresh_youden = youden_threshold(y_holdout, holdout_probas)
     print(f"\n使用 Youden's J 统计量计算最佳阈值: {best_thresh_youden:.4f}")
     y_pred_holdout_youden = (holdout_probas >= best_thresh_youden).astype(int)
-    evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J") # 调用已修复的函数
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J")  # 调用已修复的函数
 
     # --- 阈值 2: PR 曲线拐点 (最小化 |P-R|) ---
     best_thresh_pr = pr_threshold(y_holdout, holdout_probas)
     print(f"\n使用 PR 曲线拐点 (最小化 |P-R|) 计算最佳阈值: {best_thresh_pr:.4f}")
     y_pred_holdout_pr = (holdout_probas >= best_thresh_pr).astype(int)
-    evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow") # 调用已修复的函数
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow")  # 调用已修复的函数
 
     # ----- 7. 保存完整模型管道 (使用 Youden's J 阈值) -----
     # (可根据业务需求选择保存哪个阈值的结果)
     model_dict = {
         "imputer": final_model_clean.imputer,
         "scaler": final_model_clean.scaler,
-        "pca": final_model_clean.pca, # 保存 PCA 变换器
+        # "pca": final_model_clean.pca, # 保存 PCA 变换器 # 已移除
         "model": final_model_clean.model,  # 包含了级联结构和所有层
         "threshold_youden": float(best_thresh_youden),
         "threshold_pr_elbow": float(best_thresh_pr),
         "fixed_params": fixed_params  # 保存固定参数
     }
-    save_object(model_dict, "./model_pipeline_cascade_rf_pca.pkl")
-    print("\n已保存包含PCA的完整模型管道 ./model_pipeline_cascade_rf_pca.pkl")
+    save_object(model_dict, "./model_pipeline_cascade_xgb.pkl")  # 更新保存文件名
+    print("\n已保存包含级联XGBoost的完整模型管道 ./model_pipeline_cascade_xgb.pkl")  # 更新打印信息
     print("=" * 70)
