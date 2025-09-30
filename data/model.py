@@ -92,6 +92,9 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         self.layers = []
         # 用于存储训练时的原始特征维度，预测时需要
         self.initial_feature_count = None
+        # 存储用于早停的验证集
+        self.X_val_fit = None
+        self.y_val_fit = None
 
     def fit(self, X, y):
         """
@@ -101,27 +104,18 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         :param y: 训练标签 (numpy array or pandas Series)。
         """
         self.initial_feature_count = X.shape[1]
-        original_X_shape = X.shape[1]
-
-        # 初始输入为原始特征
-        current_input = X.copy()
-        self.layers = []  # 重置 layers 列表，确保 fit 是幂等的
 
         # 为了启用早停，我们需要划分一部分训练数据作为验证集
-        X_train_fit, X_val_fit, y_train_fit, y_val_fit = train_test_split(
-            current_input, y, test_size=0.15, stratify=y, random_state=self.random_state
+        # 这个划分在整个级联过程中保持不变
+        X_train_fit, self.X_val_fit, y_train_fit, self.y_val_fit = train_test_split(
+            X, y, test_size=0.15, stratify=y, random_state=self.random_state
         )
 
+        # 初始输入为原始特征 (仅使用训练部分)
+        current_input = X_train_fit.copy()
+        self.layers = []  # 重置 layers 列表，确保 fit 是幂等的
+
         for i in range(self.n_layers):
-
-            # 构造本层独立的训练集和验证集
-            # 当前层只看到 previous_input （即来自上一层或者原始输入）
-            temp_X_train_for_this_layer = current_input
-
-            # 再次划分是为了让每一层都能有自己的val set吗？还是说只需要第一次划分即可？
-            # 更合理的做法可能是始终复用第一次split的结果来保证一致性
-            # 所以下面这部分其实可以简化，但我们保留原来的结构做最小改动示意
-            _, _, _, _ = train_test_split(current_input, y, test_size=0.15, stratify=y, random_state=self.random_state)
 
             # 合并基础参数和用户提供的参数
             params_to_use = {
@@ -136,29 +130,32 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
             # print(f"训练第 {i + 1} 层 XGBoost...") # 为简洁可关闭此打印
 
             # 使用带验证集的拟合进行早停
-            # 在新版 XGBoost 中，early_stopping_rounds 应该在构造函数中指定
+            # eval_set 使用的是在 fit 开始时划分的固定验证集
             clf.fit(
-                temp_X_train_for_this_layer, y_train_fit,
-                eval_set=[(X_val_fit, y_val_fit)],  # 修复：直接使用 NumPy 数组
+                current_input, y_train_fit,
+                eval_set=[(self.X_val_fit, self.y_val_fit)],
                 verbose=False  # 关闭详细输出
             )
 
             self.layers.append(clf)
 
-            # 获取当前层在全部数据上的预测概率
-            probas = clf.predict_proba(temp_X_train_for_this_layer)  # Shape: [n_samples, n_classes]
+            # 获取当前层在训练集上的预测概率 (用于构建下一层的输入)
+            probas_train = clf.predict_proba(X_train_fit)  # Shape: [n_samples_train, n_classes]
 
-            # 更新 current_input 为原始特征+各层预测结果的组合
-            # 下一层将会看到所有的历史信息
+            # 获取当前层在验证集上的预测概率 (用于早停, 不用于下一层输入构建)
+            # 注意：实际训练中，clf.predict_proba 已经在早停时使用了
+
+            # 更新 current_input 为原始训练特征 + 各层预测结果的组合
+            # 下一层将会看到所有的历史信息 (仅在训练集上)
             if i == 0:
-                # 第一次拼接的是原始特征 + 第一层预测结果
-                next_input = np.hstack((X, probas))
+                # 第一次拼接的是原始训练特征 + 第一层预测结果
+                next_input_train = np.hstack((X_train_fit, probas_train))
             else:
                 # 后续拼接增加新的预测结果列
-                next_input = np.hstack((next_input, probas))
+                next_input_train = np.hstack((next_input_train, probas_train))
 
-                # Prepare input for next iteration / prediction phase storage
-            current_input = next_input
+                # Prepare input for next iteration
+            current_input = next_input_train
 
             # print("级联 XGBoost 训练完成。")
         return self  # 符合 sklearn 接口
@@ -180,12 +177,12 @@ class CascadeXGBoost(BaseEstimator, ClassifierMixin):
         probas = None
 
         for i, clf in enumerate(self.layers):
-            # Predict using only the features that were available during training of this layer
-            # That means we feed it what was used to train it.
+            # Predict using the current input features
             probas = clf.predict_proba(current_input)
 
-            # Build up inputs incrementally just like in training
-            if i < len(self.layers) - 1:  # Don't concatenate after last one since output will be returned directly
+            # Build up inputs incrementally for the next layer's prediction
+            # We use the original X and predictions from all previous layers
+            if i < len(self.layers) - 1:  # Don't concatenate after last one
                 if i == 0:
                     extended_input = np.hstack((X, probas))
                 else:
@@ -437,6 +434,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_xgb.pkl")  # 更新保存文件名
     print("\n已保存包含级联XGBoost的完整模型管道 ./model_pipeline_cascade_xgb.pkl")  # 更新打印信息
     print("=" * 70)
+
 
 
 
