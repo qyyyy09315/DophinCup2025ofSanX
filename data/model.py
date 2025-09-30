@@ -9,26 +9,11 @@ from imblearn.combine import SMOTEENN
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import GaussianNB
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-
-# 导入 XGBoost
-try:
-    import xgboost as xgb
-
-    XGB_AVAILABLE = True
-except ImportError:
-    print("警告: 未找到 xgboost 库。请运行 'pip install xgboost' 进行安装。")
-    XGB_AVAILABLE = False
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
-torch.manual_seed(42)
 
 
 def save_object(obj, filepath):
@@ -37,209 +22,92 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
-def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
+class CascadeRandomForest:
     """
-    修改版cascade_predict，适用于单个基模型。
-    修复了当meta_model为None时的错误处理
+    级联随机森林模型。
+    通过逐层训练随机森林，并将预测概率作为新特征传递给下一层，
+    实现层次化的特征学习。
     """
-    try:
-        probas_base = base_model.predict_proba(X)[:, 1]
-    except Exception:
-        probas_base = base_model.predict(X).astype(float)
 
-    preds = (probas_base >= threshold).astype(int)
+    def __init__(self, n_layers=3, n_estimators=100, max_depth=None, random_state=42):
+        """
+        初始化级联随机森林。
 
-    # 简化的不确定性判断：这里我们假设当概率接近0.5时不确定
-    uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)  # 可调整阈值
+        :param n_layers: 级联的层数。
+        :param n_estimators: 每层中随机森林的树的数量。
+        :param max_depth: 每棵树的最大深度。
+        :param random_state: 随机种子。
+        """
+        self.n_layers = n_layers
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.random_state = random_state
+        self.layers = []
+        # 用于存储训练时的原始特征维度，预测时需要
+        self.initial_feature_count = None
 
-    # 只有当meta_model不为None且存在不确定样本时才使用meta_model
-    if meta_model is not None and uncertain_mask.sum() > 0:
-        meta_preds = meta_model.predict(X[uncertain_mask])
-        preds[uncertain_mask] = meta_preds
+    def fit(self, X, y):
+        """
+        训练级联随机森林模型。
 
-    return preds, probas_base
+        :param X: 训练特征 (numpy array or pandas DataFrame)。
+        :param y: 训练标签 (numpy array or pandas Series)。
+        """
+        self.initial_feature_count = X.shape[1]
+        X_current = X.copy()  # 避免修改原始输入
+        for i in range(self.n_layers):
+            # 为了增加多样性，可以对每层使用不同的随机种子
+            # 或者调整其他超参数
+            rf = RandomForestClassifier(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                random_state=self.random_state + i,  # 改变随机种子
+                n_jobs=-1
+            )
+            print(f"训练第 {i + 1} 层随机森林...")
+            rf.fit(X_current, y)
+            self.layers.append(rf)
 
+            # 将原始特征与当前层的概率预测拼接，作为下一层的输入
+            probas = rf.predict_proba(X_current)
+            X_current = np.hstack([X, probas])  # 始终与原始特征拼接
 
-# 定义一个带残差连接的块
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.0):
-        super(ResidualBlock, self).__init__()
-        # 主路径
-        self.linear1 = nn.Linear(in_features, out_features)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-        self.linear2 = nn.Linear(out_features, out_features)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+        print("级联随机森林训练完成。")
 
-        # 残差连接路径 (如果输入输出维度不同)
-        self.shortcut = nn.Identity()
-        if in_features != out_features:
-            self.shortcut = nn.Linear(in_features, out_features)
+    def predict_proba(self, X):
+        """
+        预测样本属于各个类别的概率。
 
-    def forward(self, x):
-        identity = self.shortcut(x)
+        :param X: 待预测特征。
+        :return: 概率矩阵 (numpy array)。
+        """
+        if not self.layers:
+            raise ValueError("模型尚未训练，请先调用 fit 方法。")
+        if X.shape[1] != self.initial_feature_count:
+            raise ValueError(f"输入特征维度 {X.shape[1]} 与训练时的维度 {self.initial_feature_count} 不符。")
 
-        out = self.linear1(x)
-        out = self.relu1(out)
-        if self.dropout1:
-            out = self.dropout1(out)
+        X_current = X.copy()
+        for i, rf in enumerate(self.layers):
+            # 将原始特征与当前层的概率预测拼接
+            probas = rf.predict_proba(X_current)
+            if i < len(self.layers) - 1:  # 最后一层不需要拼接，直接输出
+                X_current = np.hstack([X, probas])
+        # 返回最后一层的概率预测
+        return probas
 
-        out = self.linear2(out)
-        # 残差连接
-        out += identity
-        out = self.relu2(out)
-        if self.dropout2:
-            out = self.dropout2(out)
+    def predict(self, X):
+        """
+        对样本进行分类预测。
 
-        return out
-
-
-class DeepFeatureSelector(nn.Module):
-    """更深的全连接网络，包含残差连接"""
-
-    def __init__(self, input_dim):
-        super().__init__()
-        # 使用残差块构建网络
-        self.block1 = ResidualBlock(input_dim, 1024, 0.4)
-        self.block2 = ResidualBlock(1024, 512, 0.3)
-        self.block3 = ResidualBlock(512, 256, 0.3)
-        self.block4 = ResidualBlock(256, 128, 0.2)
-
-        # 输出层
-        self.output_layer = nn.Linear(128, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.output_layer(x)
-        x = self.sigmoid(x)
-        return x
-
-
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=128, lr=1e-3, device="cpu"):
-    """
-    训练DNN特征选择器，包含早停和学习率调度。
-    """
-    # 确保模型在指定设备上
-    model = DeepFeatureSelector(input_dim).to(device)
-    criterion = nn.BCELoss()
-
-    # 使用 AdamW 优化器，通常比 Adam 更好
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-
-    # 学习率调度器：当验证损失停止改善时，降低学习率
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
-
-    # 将数据也移动到指定设备
-    # 划分训练集和验证集用于早停
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, stratify=y, random_state=42)
-
-    train_dataset = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32).to(device),
-        torch.tensor(y_train, dtype=torch.float32).to(device)
-    )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    val_dataset = TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32).to(device),
-        torch.tensor(y_val, dtype=torch.float32).to(device)
-    )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)  # 验证集不需要 shuffle
-
-    model.train()
-
-    # 早停参数
-    best_val_loss = np.inf
-    patience_counter = 0
-    patience_limit = 50  # 如果验证损失在50个epoch内没有改善，则停止训练
-    best_model_state = None
-
-    for epoch in range(epochs):
-        # ----- 训练阶段 -----
-        model.train()
-        total_train_loss = 0.0
-        num_train_batches = 0
-        for xb, yb in train_loader:
-            yb = yb.unsqueeze(1)  # 调整标签形状
-            optimizer.zero_grad()
-            outputs = model(xb)
-            loss = criterion(outputs, yb)
-            loss.backward()
-            # 梯度裁剪，防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_train_loss += loss.item()
-            num_train_batches += 1
-        avg_train_loss = total_train_loss / num_train_batches
-
-        # ----- 验证阶段 -----
-        model.eval()
-        total_val_loss = 0.0
-        num_val_batches = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                yb = yb.unsqueeze(1)
-                outputs = model(xb)
-                loss = criterion(outputs, yb)
-                total_val_loss += loss.item()
-                num_val_batches += 1
-        avg_val_loss = total_val_loss / num_val_batches
-
-        # 更新学习率调度器
-        scheduler.step(avg_val_loss)
-
-        # ----- 早停逻辑 -----
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            # 保存当前最佳模型状态
-            best_model_state = model.state_dict()
-        else:
-            patience_counter += 1
-
-        if patience_counter >= patience_limit:
-            print(f"早停触发: Epoch {epoch + 1}, 最佳验证损失: {best_val_loss:.6f}")
-            break
-
-        # 打印进度（可选）
-        if (epoch + 1) % 100 == 0:
-            print(f"Epoch [{epoch + 1}/{epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-
-    # 训练结束后，加载最佳模型权重
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print(f"训练完成，加载最佳模型权重，最佳验证损失: {best_val_loss:.6f}")
-    else:
-        print("训练完成，未触发早停。")
-
-    # 提取第一层权重以计算特征重要性
-    # 注意：现在第一层是 ResidualBlock，我们需要访问其内部的 linear1 层
-    first_linear_layer = None
-    if hasattr(model, 'block1') and hasattr(model.block1, 'linear1'):
-        first_linear_layer = model.block1.linear1
-    else:
-        # 如果结构改变，尝试查找第一个 nn.Linear 层
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                first_linear_layer = module
-                break
-
-    if first_linear_layer is not None:
-        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
-        feature_importance = np.mean(np.abs(weights), axis=0)
-    else:
-        # 如果找不到线性层，则返回零重要性（理论上不应发生）
-        print("警告：无法找到第一层线性层以计算特征重要性。")
-        feature_importance = np.zeros(input_dim)
-
-    return feature_importance
+        :param X: 待预测特征。
+        :return: 预测标签 (numpy array)。
+        """
+        probas = self.predict_proba(X)
+        return np.argmax(probas, axis=1)
 
 
 def youden_threshold(y_true, probas):
+    """计算 Youden's J 统计量下的最佳阈值"""
     thresholds = np.linspace(0, 1, 101)
     best_t, best_j = 0.5, -1
     for t in thresholds:
@@ -268,13 +136,8 @@ def youden_threshold(y_true, probas):
 
 
 if __name__ == "__main__":
-    if not XGB_AVAILABLE:
-        print("错误: 缺少必要依赖库 xgboost 程序退出")
-        exit(1)
-
     print("=" * 60)
-    print("开始训练：SMOTEENN -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
-    print("-> DNN 使用残差网络并利用 GPU (如果可用)")
+    print("开始训练：SMOTEENN -> 级联随机森林 (Cascade Random Forest)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -282,22 +145,13 @@ if __name__ == "__main__":
 
     test_size = 0.10
     random_state = 42
-    # 关键修改: 确定设备，优先使用 CUDA
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"当前计算设备: {device}")
 
-    # XGBoost 超参
-    xgb_params = {
+    # 级联随机森林超参
+    cascade_params = {
+        'n_layers': 3,
+        'n_estimators': 100,
         'max_depth': 6,
-        'learning_rate': 0.1,
-        'n_estimators': 300,
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',  # 用于早停
-        'random_state': random_state,
-        'n_jobs': -1,
-        # 启用 GPU (如果可用且配置了 GPU 支持的 XGBoost)
-        'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist',
-        'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
+        'random_state': random_state
     }
 
     # ----- 1. 读取并预处理数据 -----
@@ -322,124 +176,61 @@ if __name__ == "__main__":
     save_object(imputer, "./imputer.pkl")
     save_object(scaler, "./scaler.pkl")
 
-    # ----- 2. DNN 特征权重 -----
-    print("使用 Torch DNN (带残差连接) 训练获取特征权重 ...")
-    # 关键修改: 将设备传递给训练函数, epochs改为1000
-    feature_importance = train_dnn_feature_selector_torch(
-        X_scaled, y_all,
-        input_dim=X_scaled.shape[1],
-        epochs=1000,  # 训练1000次
-        device=device  # 使用指定的设备
-    )
-    ranked_idx = np.argsort(-feature_importance)
-    # 根据特征重要性排序选择所有特征
-    X_selected = X_scaled[:, ranked_idx]
-    print(f"Torch DNN 特征加权完成，特征总数={X_selected.shape[1]}")
-
-    save_object(ranked_idx, "./dnn_feature_ranking.pkl")
-
-    # ----- 3. 划分训练/验证集 -----
+    # ----- 2. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
-        X_selected, y_all, test_size=test_size, stratify=y_all, random_state=random_state
+        X_scaled, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
-    print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
+    print(f"训练集: {X_train_full.shape}, 验证集 (Holdout): {X_holdout.shape}")
 
-    # ----- 4. SMOTEENN 重采样 -----
+    # ----- 3. SMOTEENN 重采样 -----
     print("正在进行 SMOTEENN 重采样 ...")
     smoteenn = SMOTEENN(random_state=random_state)
     X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
     print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
 
-    # ----- 5. 训练基模型 (改为 XGBoost) -----
-    print("训练 XGBoost 基模型 ...")
-    # 准备 XGBoost 数据集以便使用早停功能（可选）
-    dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
-    dval = xgb.DMatrix(X_holdout, label=y_holdout)
+    # ----- 4. 训练级联随机森林模型 -----
+    print("训练级联随机森林模型 ...")
+    cascade_rf_model = CascadeRandomForest(**cascade_params)
+    cascade_rf_model.fit(X_resampled, y_resampled)
 
-    evals_result = {}
-    # 训练 XGBoost 模型
-    xgb_model = xgb.train(
-        xgb_params,
-        dtrain=dtrain_full,
-        num_boost_round=xgb_params['n_estimators'],
-        evals=[(dval, 'validation')],
-        early_stopping_rounds=50,  # 可选：启用早停
-        verbose_eval=False,  # 设置为True可以看到训练过程
-        evals_result=evals_result
-    )
+    save_object(cascade_rf_model, "./cascade_random_forest_model.pkl")
+    print("已训练并保存级联随机森林模型 ./cascade_random_forest_model.pkl")
 
+    # ----- 5. 模型评估与阈值选择 -----
+    print("在 Holdout 集上评估模型...")
+    # 获取最后一层的概率预测 (对于二分类，我们通常取正类概率)
+    holdout_probas = cascade_rf_model.predict_proba(X_holdout)[:, 1]
 
-    # 为了兼容后续的 predict_proba 接口，我们可以包装一下
-    class WrappedXGBModel:
-        def __init__(self, booster):
-            self.booster = booster
-
-        def predict_proba(self, X):
-            dmatrix = xgb.DMatrix(X)
-            probs = self.booster.predict(dmatrix)
-            # 返回二维数组 [[prob_0, prob_1], ...]
-            return np.vstack([1 - probs, probs]).T
-
-        def predict(self, X):
-            dmatrix = xgb.DMatrix(X)
-            probs = self.booster.predict(dmatrix)
-            return (probs > 0.5).astype(int)
-
-
-    wrapped_xgb_model = WrappedXGBModel(xgb_model)
-
-    save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
-    print("已训练基模型：XGBoost")
-
-    # ----- 6. 训练级联修正器 -----
-    print("识别基模型误分类样本，训练级联修正器...")
-    # 使用新的预测方法，传入None作为meta_model
-    _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
-    base_train_preds = (train_probas >= 0.5).astype(int)
-
-    misclassified_mask = (base_train_preds != y_resampled)
-    X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
-
-    if len(X_hard) > 0 and len(np.unique(y_hard)) > 1:  # 确保困难样本集中至少有两个类别
-        meta_clf = GaussianNB()
-        meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器训练完成，困难样本数={len(X_hard)}")
-    else:
-        # 如果没有误分类样本或困难样本只属于一个类别，则使用全部重采样后的数据训练
-        meta_clf = GaussianNB()
-        meta_clf.fit(X_resampled, y_resampled)
-        print("未发现足够的误分类样本，使用全部重采样数据训练修正器")
-
-    # ----- 7. 阈值选择（Youden's J） -----
-    # 使用新的预测函数
-    _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
+    # 使用 Youden's J 统计量选择最佳阈值
     best_thresh = youden_threshold(y_holdout, holdout_probas)
+    print(f"使用 Youden's J 统计量计算最佳阈值: {best_thresh:.4f}")
 
+    # 根据最佳阈值进行预测
     y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
+
+    # 计算评估指标
     recall = recall_score(y_holdout, y_pred_holdout, zero_division=0)
     auc = roc_auc_score(y_holdout, holdout_probas)
     precision = precision_score(y_holdout, y_pred_holdout, zero_division=0)
     f1 = f1_score(y_holdout, y_pred_holdout, zero_division=0)
-    # 自定义评分公式 (注意：原注释中的系数总和不是100%，这里保持原样)
+    # 自定义评分公式
     final_score = 30 * recall + 50 * auc + 20 * precision
 
-    print(f"最佳阈值={best_thresh:.4f}, F1={f1:.4f}")
-    print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
+    print(f"--- Holdout 集评估结果 (阈值={best_thresh:.4f}) ---")
+    print(f"F1-Score: {f1:.5f}")
+    print(f"Recall:   {recall:.5f}")
+    print(f"AUC:      {auc:.5f}")
+    print(f"Precision:{precision:.5f}")
+    print(f"Final Score (30*R + 50*AUC + 20*P): {final_score:.5f}")
+    print("-" * 40)
 
-    # ----- 8. 保存完整模型 -----
+    # ----- 6. 保存完整模型管道 -----
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
-        "dnn_feature_ranking": ranked_idx,
-        "base_models": wrapped_xgb_model,  # 单一模型
-        "base_types": ["XGBoost"],  # 类型列表
-        "meta_nb": meta_clf,
+        "model": cascade_rf_model,  # 包含了级联结构和所有层
         "threshold": float(best_thresh),
     }
-    save_object(model_dict, "./model_pipeline_cascade_dnn_torch.pkl")
-    print("已保存完整模型 ./model_pipeline_cascade_dnn_torch.pkl")
+    save_object(model_dict, "./model_pipeline_cascade_rf.pkl")
+    print("已保存完整模型管道 ./model_pipeline_cascade_rf.pkl")
     print("=" * 60)
-
-
-
-
