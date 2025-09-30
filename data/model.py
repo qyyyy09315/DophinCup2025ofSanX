@@ -25,6 +25,32 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
+# --- 新增/修复：将 evaluate_and_print_metrics 函数定义移到前面 ---
+def evaluate_and_print_metrics(y_true, y_pred, y_proba, threshold_name):
+    """辅助函数：计算并打印评估指标"""
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    # 处理 AUC 计算可能的错误（例如，只有一个类）
+    try:
+        auc = roc_auc_score(y_true, y_proba)
+    except ValueError:
+        auc = 0.0
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    # 自定义评分公式 (使用 Holdout 集上的指标)
+    # 避免 auc 为 nan 的情况影响整体评分
+    if np.isnan(auc):
+        auc = 0.0
+    final_score = 30 * recall + 50 * auc + 20 * precision
+
+    print(f"--- Holdout 集评估结果 ({threshold_name}) ---")
+    print(f"F1-Score:     {f1:.5f}")
+    print(f"Recall:       {recall:.5f}")
+    print(f"AUC:          {auc:.5f}")
+    print(f"Precision:    {precision:.5f}")
+    print(f"Final Score (30*R + 50*AUC + 20*P): {final_score:.5f}")
+    print("-" * 30)
+
+
 class CascadeRandomForest(BaseEstimator, ClassifierMixin):
     """
     级联随机森林模型。
@@ -188,12 +214,13 @@ class ModelPipeline(BaseEstimator, ClassifierMixin):
         return np.argmax(probas, axis=1)
 
 
-# --- 新增：自定义评分函数 ---
-def custom_score_function(y_true, y_proba):
+# --- 修复：修改自定义评分函数以接受任意额外关键字参数 ---
+def custom_score_function(y_true, y_proba, **kwargs):
     """
     计算自定义评分：30 * Recall + 50 * AUC + 20 * Precision
     注意：GridSearchCV 传入的是概率，需要处理阈值或直接使用概率计算 AUC。
     这里我们直接使用 y_proba 计算 AUC，并使用默认 0.5 阈值计算其他指标。
+    修复：添加 **kwargs 以捕获可能由 make_scorer 传递的意外参数 (如 needs_proba)。
     """
     # GridSearchCV 传给 make_scorer 的是 predict_proba 的结果，对于二分类是 (n_samples, 2)
     # 我们通常取正类的概率
@@ -231,6 +258,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # ----- 配置 -----
+    # 注意：请确保 './clean.csv' 文件存在于当前工作目录或提供完整路径
     data_path = "./clean.csv"
     test_size = 0.10
     random_state = 42
@@ -238,16 +266,41 @@ if __name__ == "__main__":
     # 网格搜索配置
     param_grid = {
         # 注意：参数名需要与 ModelPipeline.model 的属性对应
-        'model__n_layers': [3, 5],
-        'model__n_estimators': [100, 200],
-        'model__max_depth': [4, 6, None]  # None 表示不限制深度
+        'model__n_layers': [3, 5], # 示例：减少搜索空间以加快速度
+        'model__n_estimators': [100, 200], # 示例：减少搜索空间以加快速度
+        'model__max_depth': [4, None]  # None 表示不限制深度 # 示例：减少搜索空间以加快速度
         # 'model__class_weight_option': ['balanced'] # 可以也将其加入网格搜索
     }
     cv_folds = 3  # 交叉验证折数
     n_jobs = -1  # 并行运行作业数
 
     # ----- 1. 读取并预处理数据 -----
-    data = pd.read_csv(data_path)
+    # 注意：此部分需要一个名为 'clean.csv' 的有效文件
+    try:
+        data = pd.read_csv(data_path)
+    except FileNotFoundError:
+        print(f"错误: 找不到文件 '{data_path}'。请确保文件路径正确。")
+        # 如果没有文件，可以创建一个示例数据集用于演示
+        print("创建示例数据集用于演示...")
+        n_samples = 1000
+        n_features = 20
+        np.random.seed(42)
+        X_demo = np.random.randn(n_samples, n_features)
+        # 创建一个稍微不平衡的目标变量
+        y_demo = np.random.binomial(1, 0.1, n_samples) # 10% 正类
+        # 添加一些与目标相关的特征
+        X_demo[y_demo==1, 0] += 1
+        X_demo[y_demo==1, 1] += 1
+        data = pd.DataFrame(X_demo, columns=[f"feature_{i}" for i in range(n_features)])
+        data['target'] = y_demo
+        # 添加一个分类特征并进行独热编码
+        data['category'] = np.random.choice(['A', 'B', 'C'], size=n_samples)
+        # 确保至少有一个 'company_id' 列用于演示删除
+        data['company_id'] = range(n_samples)
+        # 重新生成 target 列以确保它在最后
+        target_col = data.pop('target')
+        data['target'] = target_col
+
     # 删除 company_id 列（如果存在）
     if 'company_id' in data.columns:
         data = data.drop(columns=["company_id"])
@@ -280,7 +333,7 @@ if __name__ == "__main__":
     grid_search = GridSearchCV(
         estimator=pipeline,
         param_grid=param_grid,
-        scoring=custom_scorer,  # 使用自定义评分函数
+        scoring=custom_scorer,  # 使用修复后的自定义评分函数
         cv=cv_folds,
         n_jobs=n_jobs,
         verbose=2  # 显示进度
@@ -341,13 +394,13 @@ if __name__ == "__main__":
     best_thresh_youden = youden_threshold(y_holdout, holdout_probas)
     print(f"\n使用 Youden's J 统计量计算最佳阈值: {best_thresh_youden:.4f}")
     y_pred_holdout_youden = (holdout_probas >= best_thresh_youden).astype(int)
-    # evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J")
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_youden, holdout_probas, "Youden's J") # 调用已修复的函数
 
     # --- 阈值 2: PR 曲线拐点 (最小化 |P-R|) ---
     best_thresh_pr = pr_threshold(y_holdout, holdout_probas)
     print(f"\n使用 PR 曲线拐点 (最小化 |P-R|) 计算最佳阈值: {best_thresh_pr:.4f}")
     y_pred_holdout_pr = (holdout_probas >= best_thresh_pr).astype(int)
-    # evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow")
+    evaluate_and_print_metrics(y_holdout, y_pred_holdout_pr, holdout_probas, "PR Curve Elbow") # 调用已修复的函数
 
     # ----- 6. 保存完整模型管道 (使用 Youden's J 阈值) -----
     # (可根据业务需求选择保存哪个阈值的结果)
@@ -362,24 +415,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_rf_optimized.pkl")
     print("\n已保存优化后的完整模型管道 ./model_pipeline_cascade_rf_optimized.pkl")
     print("=" * 70)
-
-
-def evaluate_and_print_metrics(y_true, y_pred, y_proba, threshold_name):
-    """辅助函数：计算并打印评估指标"""
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    auc = roc_auc_score(y_true, y_proba)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    # 自定义评分公式 (使用 Holdout 集上的指标)
-    final_score = 30 * recall + 50 * auc + 20 * precision
-
-    print(f"--- Holdout 集评估结果 ({threshold_name}) ---")
-    print(f"F1-Score:     {f1:.5f}")
-    print(f"Recall:       {recall:.5f}")
-    print(f"AUC:          {auc:.5f}")
-    print(f"Precision:    {precision:.5f}")
-    print(f"Final Score (30*R + 50*AUC + 20*P): {final_score:.5f}")
-    print("-" * 30)
 
 
 
