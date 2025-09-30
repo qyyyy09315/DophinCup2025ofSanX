@@ -120,39 +120,101 @@ class DeepFeatureSelector(nn.Module):
         return x
 
 
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128, lr=1e-3, device="cpu"):
+def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=128, lr=1e-3, device="cpu"):
+    """
+    训练DNN特征选择器，包含早停和学习率调度。
+    """
     # 确保模型在指定设备上
     model = DeepFeatureSelector(input_dim).to(device)
     criterion = nn.BCELoss()
-    # 可以考虑使用 weight_decay 进行 L2 正则化
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # 使用 AdamW 优化器，通常比 Adam 更好
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    # 学习率调度器：当验证损失停止改善时，降低学习率
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
 
     # 将数据也移动到指定设备
-    dataset = TensorDataset(
-        torch.tensor(X, dtype=torch.float32).to(device),
-        torch.tensor(y, dtype=torch.float32).to(device)
+    # 划分训练集和验证集用于早停
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, stratify=y, random_state=42)
+
+    train_dataset = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32).to(device),
+        torch.tensor(y_train, dtype=torch.float32).to(device)
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    val_dataset = TensorDataset(
+        torch.tensor(X_val, dtype=torch.float32).to(device),
+        torch.tensor(y_val, dtype=torch.float32).to(device)
+    )
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)  # 验证集不需要 shuffle
 
     model.train()
+
+    # 早停参数
+    best_val_loss = np.inf
+    patience_counter = 0
+    patience_limit = 50  # 如果验证损失在50个epoch内没有改善，则停止训练
+    best_model_state = None
+
     for epoch in range(epochs):
-        total_loss = 0.0
-        num_batches = 0
-        for xb, yb in loader:
-            # 数据已经在设备上了，无需再次移动
-            # xb, yb = xb.to(device), yb.to(device)
+        # ----- 训练阶段 -----
+        model.train()
+        total_train_loss = 0.0
+        num_train_batches = 0
+        for xb, yb in train_loader:
             yb = yb.unsqueeze(1)  # 调整标签形状
             optimizer.zero_grad()
             outputs = model(xb)
             loss = criterion(outputs, yb)
             loss.backward()
+            # 梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
-            num_batches += 1
-        # 可选：打印平均损失
-        # if (epoch + 1) % 50 == 0:
-        #     avg_loss = total_loss / num_batches
-        #     print(f"Epoch {epoch+1}/{epochs}, Avg Loss={avg_loss:.4f}")
+            total_train_loss += loss.item()
+            num_train_batches += 1
+        avg_train_loss = total_train_loss / num_train_batches
+
+        # ----- 验证阶段 -----
+        model.eval()
+        total_val_loss = 0.0
+        num_val_batches = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                yb = yb.unsqueeze(1)
+                outputs = model(xb)
+                loss = criterion(outputs, yb)
+                total_val_loss += loss.item()
+                num_val_batches += 1
+        avg_val_loss = total_val_loss / num_val_batches
+
+        # 更新学习率调度器
+        scheduler.step(avg_val_loss)
+
+        # ----- 早停逻辑 -----
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # 保存当前最佳模型状态
+            best_model_state = model.state_dict()
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience_limit:
+            print(f"早停触发: Epoch {epoch + 1}, 最佳验证损失: {best_val_loss:.6f}")
+            break
+
+        # 打印进度（可选）
+        if (epoch + 1) % 100 == 0:
+            print(f"Epoch [{epoch + 1}/{epochs}], Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+
+    # 训练结束后，加载最佳模型权重
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"训练完成，加载最佳模型权重，最佳验证损失: {best_val_loss:.6f}")
+    else:
+        print("训练完成，未触发早停。")
 
     # 提取第一层权重以计算特征重要性
     # 注意：现在第一层是 ResidualBlock，我们需要访问其内部的 linear1 层
@@ -207,7 +269,7 @@ def youden_threshold(y_true, probas):
 
 if __name__ == "__main__":
     if not XGB_AVAILABLE:
-        print("错误: 缺少必要依赖库 xgboost。程序退出。")
+        print("错误: 缺少必要依赖库 xgboost 程序退出")
         exit(1)
 
     print("=" * 60)
@@ -217,19 +279,6 @@ if __name__ == "__main__":
 
     # ----- 配置 -----
     data_path = "./clean.csv"
-    # 检查数据文件是否存在
-    if not os.path.exists(data_path):
-        # 创建示例数据用于演示目的，实际运行时请替换为真实数据路径
-        print(f"警告: 未找到数据文件 '{data_path}'。正在创建示例数据...")
-        sample_data = pd.DataFrame({
-            'feature1': np.random.randn(1000),
-            'feature2': np.random.rand(1000) * 100,
-            'category_A': ['Y'] * 300 + ['N'] * 700,
-            'target': ([1] * 150 + [0] * 150) + ([1] * 50 + [0] * 650)  # 制造不平衡
-        })
-        sample_data = pd.get_dummies(sample_data, drop_first=True)
-        sample_data.to_csv(data_path, index=False)
-        print(f"已生成示例数据并保存至 {data_path}")
 
     test_size = 0.10
     random_state = 42
@@ -275,10 +324,11 @@ if __name__ == "__main__":
 
     # ----- 2. DNN 特征权重 -----
     print("使用 Torch DNN (带残差连接) 训练获取特征权重 ...")
-    # 关键修改: 将设备传递给训练函数
+    # 关键修改: 将设备传递给训练函数, epochs改为1000
     feature_importance = train_dnn_feature_selector_torch(
         X_scaled, y_all,
         input_dim=X_scaled.shape[1],
+        epochs=1000,  # 训练1000次
         device=device  # 使用指定的设备
     )
     ranked_idx = np.argsort(-feature_importance)
@@ -389,3 +439,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_dnn_torch.pkl")
     print("已保存完整模型 ./model_pipeline_cascade_dnn_torch.pkl")
     print("=" * 60)
+
+
+
+
