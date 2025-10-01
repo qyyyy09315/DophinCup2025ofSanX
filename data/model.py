@@ -67,9 +67,11 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         # 主路径
         self.linear1 = nn.Linear(in_features, out_features)
+        self.bn1 = nn.BatchNorm1d(out_features)  # 添加批归一化
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
         self.linear2 = nn.Linear(out_features, out_features)
+        self.bn2 = nn.BatchNorm1d(out_features)  # 添加批归一化
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
@@ -82,11 +84,13 @@ class ResidualBlock(nn.Module):
         identity = self.shortcut(x)
 
         out = self.linear1(x)
+        out = self.bn1(out)  # 批归一化
         out = self.relu1(out)
         if self.dropout1:
             out = self.dropout1(out)
 
         out = self.linear2(out)
+        out = self.bn2(out)  # 批归一化
         # 残差连接
         out += identity
         out = self.relu2(out)
@@ -101,15 +105,15 @@ class DeepFeatureSelector(nn.Module):
 
     def __init__(self, input_dim):
         super().__init__()
-        # 使用残差块构建网络
-        self.block1 = ResidualBlock(input_dim, 2048, 0.3)
-        self.block2 = ResidualBlock(2048, 1024, 0.2)
-        self.block3 = ResidualBlock(1024, 512, 0.2)
-        self.block4 = ResidualBlock(512, 256, 0.2)
-        self.block5 = ResidualBlock(256, 128, 0.1)
+        # 使用残差块构建网络，修改为512-256-256-128-64结构
+        self.block1 = ResidualBlock(input_dim, 512, 0.3)
+        self.block2 = ResidualBlock(512, 256, 0.2)
+        self.block3 = ResidualBlock(256, 256, 0.2)
+        self.block4 = ResidualBlock(256, 128, 0.2)
+        self.block5 = ResidualBlock(128, 64, 0.1)
 
         # 输出层
-        self.output_layer = nn.Linear(128, 1)
+        self.output_layer = nn.Linear(64, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -233,7 +237,7 @@ def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=25
                 break
 
     if first_linear_layer is not None:
-        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
+        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(512, input_dim)
         feature_importance = np.mean(np.abs(weights), axis=0)
     else:
         # 如果找不到线性层，则返回零重要性（理论上不应发生）
@@ -458,7 +462,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model_pipeline_cascade_dnn_torch.pkl")
     print("已保存完整模型 ./model_pipeline_cascade_dnn_torch.pkl")
     print("=" * 60)
-
 
 
 
