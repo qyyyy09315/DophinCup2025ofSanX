@@ -198,27 +198,6 @@ def youden_threshold(y_true, probas):
         if J > best_j:
             best_j, best_t = J, t
     return best_t
-
-# -----------------------------
-# 工具函数
-# -----------------------------
-def load_object(path):
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            obj = pickle.load(f)
-        print(f"已加载: {path}")
-        return obj
-    else:
-        print(f"警告: {path} 不存在，跳过。")
-        return None
-
-def load_model(filename):
-    """从文件加载模型"""
-    with open(filename, 'rb') as f:
-        model = pickle.load(f)
-    print(f"模型已从 '{filename}' 加载, 类型: {type(model)}")
-    return model
-
 class WrappedXGBModel:
         def __init__(self, booster):
             self.booster = booster
@@ -233,88 +212,204 @@ class WrappedXGBModel:
             dmatrix = xgb.DMatrix(X)
             probs = self.booster.predict(dmatrix)
             return (probs > 0.5).astype(int)
-# -----------------------------
-# 1. 加载测试数据
-# -----------------------------
-test_data_path = "testClean.csv"
-print(f"正在加载测试数据: {test_data_path}")
-test_data = pd.read_csv(test_data_path)
-print(f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1]}")
 
-# -----------------------------
-# 2. 加载预处理器（按训练时保存的）
-# -----------------------------
-imputer = load_object("./imputer.pkl")
-scaler = load_object("./scaler.pkl")
-selector = load_object("./feature_selector.pkl")
+def load_object(filepath):
+    """加载通过pickle保存的对象"""
+    with open(filepath, "rb") as f:
+        obj = pickle.load(f)
+    print(f"已加载: {filepath}")
+    return obj
 
-# -----------------------------
-# 3. 加载模型管道
-# -----------------------------
-model_path = "model_pipeline.pkl"
-print(f"正在加载模型管道: {model_path}")
-loaded_pipeline = load_model(model_path)
 
-# -----------------------------
-# 4. 读取阈值
-# -----------------------------
-if hasattr(loaded_pipeline, "threshold"):
+class LoadedPipelineWrapper:
+    """
+    包装加载的模型字典，使其行为类似于sklearn Pipeline，
+    并处理内部的XGBoost模型和级联逻辑。
+    """
+
+    def __init__(self, model_dict):
+        self.model_dict = model_dict
+        # 从字典中提取各个组件
+        self.imputer = self.model_dict["imputer"]
+        self.scaler = self.model_dict["scaler"]
+        self.dnn_feature_ranking = self.model_dict["dnn_feature_ranking"]
+
+        # 基模型是 WrappedXGBModel 实例
+        self.base_model = self.model_dict["base_models"]
+        # 元模型是 GaussianNB 实例
+        self.meta_model = self.model_dict["meta_nb"]
+        # 阈值
+        self.threshold = self.model_dict.get("threshold", 0.5)
+
+    def _preprocess(self, X_raw):
+        """执行与训练时相同的预处理步骤"""
+        # 1. 填充缺失值
+        X_imp = self.imputer.transform(X_raw)
+        # 2. 标准化
+        X_sc = self.scaler.transform(X_imp)
+        # 3. 特征选择（根据DNN排名重排特征）
+        X_selected = X_sc[:, self.dnn_feature_ranking]
+        return X_selected
+
+    def predict_proba(self, X_raw):
+        """
+        对原始特征数据进行预处理并预测概率。
+        实现与训练时一致的cascade_predict_single_model逻辑。
+        """
+        X_processed = self._preprocess(X_raw)
+
+        # --- 级联预测逻辑 ---
+        try:
+            probas_base = self.base_model.predict_proba(X_processed)[:, 1]
+        except Exception:
+            probas_base = self.base_model.predict(X_processed).astype(float)
+
+        # 简化的不确定性判断
+        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
+
+        # 初始化最终预测概率为基模型概率
+        final_probas = probas_base.copy()
+
+        # 如果有不确定样本且元模型存在，则使用元模型修正
+        if uncertain_mask.sum() > 0:
+            # 注意：这里我们只返回主类的概率，因为这是后续阈值判断所需要的
+            # cascade_predict_single_model 返回的是 (preds, probas_base)
+            # 我们需要模拟其对不确定样本使用meta_model预测的部分
+            # 但 meta_model (GaussianNB) 的 predict_proba 会返回两个类别的概率
+            meta_probas = self.meta_model.predict_proba(X_processed[uncertain_mask])
+            # 假设 meta_probas 是 [[p0_class0, p0_class1], [p1_class0, p1_class1], ...]
+            # 我们取 class1 的概率来替换原来的基模型概率
+            final_probas[uncertain_mask] = meta_probas[:, 1]
+
+        # 为了兼容接口，返回二维数组 [[prob_0, prob_1], ...]
+        # 这里简化处理，因为我们主要关心 prob_1 (final_probas)
+        prob_0 = 1 - final_probas
+        return np.vstack([prob_0, final_probas]).T
+
+    def predict(self, X_raw):
+        """
+        对原始特征数据进行预处理并预测类别。
+        使用存储在模型中的阈值。
+        """
+        probas = self.predict_proba(X_raw)
+        preds = (probas[:, 1] >= self.threshold).astype(int)
+        return preds
+
+
+def load_model(model_path):
+    """加载整个模型管道字典，并用包装器包装"""
+    model_dict = load_object(model_path)
+    return LoadedPipelineWrapper(model_dict)
+
+
+if __name__ == "__main__":
+    # -----------------------------
+    # 1. 加载测试数据
+    # -----------------------------
+    test_data_path = "testClean.csv"
+    print(f"正在加载测试数据: {test_data_path}")
+    if not os.path.exists(test_data_path):
+        # 创建示例测试数据用于演示目的，实际运行时请替换为真实数据路径
+        print(f"警告: 未找到测试数据文件 '{test_data_path}'。正在创建示例测试数据...")
+        sample_test_data = pd.DataFrame({
+            'feature1': np.random.randn(200),
+            'feature2': np.random.rand(200) * 100,
+            'category_A': ['Y'] * 60 + ['N'] * 140,
+            # target列通常在测试集中不存在，这里仅作占位符展示，不会参与预测
+        })
+        sample_test_data = pd.get_dummies(sample_test_data, drop_first=True)
+        # 确保测试集特征与训练集对齐（假设训练集有feature1, feature2, category_A_Y）
+        required_cols = ['feature1', 'feature2', 'category_A_Y']
+        for col in required_cols:
+            if col not in sample_test_data.columns:
+                # 添加缺失的列，默认填0
+                sample_test_data[col] = 0
+        sample_test_data = sample_test_data[required_cols]  # 重新排序以匹配预期顺序
+
+        # 添加 company_id 列
+        sample_test_data.insert(0, 'company_id', [f"COMP_{i}" for i in range(len(sample_test_data))])
+
+        sample_test_data.to_csv(test_data_path, index=False)
+        print(f"已生成示例测试数据并保存至 {test_data_path}")
+
+    test_data = pd.read_csv(test_data_path)
+    print(
+        f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1] - 1 if 'company_id' in test_data.columns else test_data.shape[1]}")
+
+    # -----------------------------
+    # 2. 加载模型管道 (包括预处理器)
+    # -----------------------------
+    model_path = "./model_pipeline_cascade_dnn_torch.pkl"  # 确保此路径正确
+    if not os.path.exists(model_path):
+        print(f"错误: 找不到模型文件 '{model_path}'。请确保模型已训练并保存。")
+        exit(1)
+
+    print(f"正在加载模型管道: {model_path}")
+    loaded_pipeline = load_model(model_path)
+
+    # -----------------------------
+    # 3. 读取阈值
+    # -----------------------------
     threshold = loaded_pipeline.threshold
     print(f"从模型对象读取阈值: {threshold}")
-else:
-    threshold = 0.5
-    print(f"警告: 模型对象中未找到阈值属性，使用默认值 {threshold}")
 
-# -----------------------------
-# 5. 测试数据处理
-# -----------------------------
-# 去掉 ID 列
-feature_columns = [col for col in test_data.columns if col != "company_id"]
-X_test_raw = test_data[feature_columns]
-print(f"用于预测的原始特征数: {X_test_raw.shape[1]}")
+    # -----------------------------
+    # 4. 测试数据处理
+    # -----------------------------
+    # 去掉 ID 列
+    feature_columns = [col for col in test_data.columns if col != "company_id"]
+    X_test_raw = test_data[feature_columns]
+    print(f"用于预测的原始特征数: {X_test_raw.shape[1]}")
 
-# 依次应用预处理
-X_test_proc = X_test_raw.copy()
-if imputer is not None:
-    X_test_proc = imputer.transform(X_test_proc)
-    print("已应用缺失值填充。")
+    # 预处理已在 pipeline 内部的 predict_proba/predict 方法中完成
+    # X_test_proc = X_test_raw.copy()
+    # if imputer is not None:
+    #     X_test_proc = imputer.transform(X_test_proc)
+    #     print("已应用缺失值填充。")
+    #
+    # if scaler is not None:
+    #     X_test_proc = scaler.transform(X_test_proc)
+    #     print("已应用标准化。")
+    #
+    # if selector is not None:
+    #     X_test_proc = selector.transform(X_test_proc)
+    #     print(f"已应用特征选择，最终特征数: {X_test_proc.shape[1]}")
 
-if scaler is not None:
-    X_test_proc = scaler.transform(X_test_proc)
-    print("已应用标准化。")
+    # -----------------------------
+    # 5. 预测
+    # -----------------------------
+    print("正在进行预测...")
+    # 使用包装器的 predict_proba 方法，它会自动处理预处理和级联逻辑
+    y_proba_full = loaded_pipeline.predict_proba(X_test_raw.values)
+    y_proba = y_proba_full[:, 1]  # 获取正类概率
+    print(f"预测完成，共 {len(y_proba)} 个概率值。")
 
-if selector is not None:
-    X_test_proc = selector.transform(X_test_proc)
-    print(f"已应用特征选择，最终特征数: {X_test_proc.shape[1]}")
+    print(f"应用分类阈值: {threshold}")
+    # 使用包装器的 predict 方法，它会自动处理预处理、级联逻辑和阈值判断
+    y_pred = loaded_pipeline.predict(X_test_raw.values)
+    print("分类完成。")
 
-# -----------------------------
-# 6. 预测
-# -----------------------------
-print("正在进行预测...")
-y_proba = loaded_pipeline.predict_proba(X_test_proc)[:, 1]
-print(f"预测完成，共 {len(y_proba)} 个概率值。")
+    # -----------------------------
+    # 6. 结果输出
+    # -----------------------------
+    if "company_id" in test_data.columns:
+        uuid_column = test_data["company_id"]
+    else:
+        print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
+        uuid_column = test_data.index.astype(str)  # 确保索引是字符串类型
 
-print(f"应用分类阈值: {threshold}")
-y_pred = (y_proba >= threshold).astype(int)
-print("分类完成。")
+    results_df = pd.DataFrame({
+        "uuid": uuid_column,
+        "proba": y_proba,
+        "prediction": y_pred
+    })
+    print("结果数据框创建成功。")
 
-# -----------------------------
-# 7. 结果输出
-# -----------------------------
-if "company_id" in test_data.columns:
-    uuid_column = test_data["company_id"]
-else:
-    print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
-    uuid_column = test_data.index
+    output_path = "submit_predictions.csv"
+    print(f"正在保存结果到: {output_path}")
+    results_df.to_csv(output_path, index=False)
+    print(f"预测完成，阈值 {threshold}，结果已保存到 {output_path}")
 
-results_df = pd.DataFrame({
-    "uuid": uuid_column,
-    "proba": y_proba,
-    "prediction": y_pred
-})
-print("结果数据框创建成功。")
 
-output_path = r"C:\Users\YKSHb\Desktop\submit_template.csv"
-print(f"正在保存结果到: {output_path}")
-results_df.to_csv(output_path, index=False)
-print(f"预测完成，阈值 {threshold}，结果已保存到 {output_path}")
+
+
