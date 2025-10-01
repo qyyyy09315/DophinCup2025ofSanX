@@ -293,7 +293,7 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0  # 设置方差阈值
-    top_percentile_to_select = 0.80  # 保留前90%重要的特征
+    top_percentile_to_select = 0.90  # 保留前90%重要的特征
 
     # 关键修改: 确定设备，优先使用 CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
