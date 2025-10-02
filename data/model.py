@@ -5,30 +5,24 @@ import warnings
 import numpy as np
 import pandas as pd
 
-# 导入 KNNImputer
-from sklearn.impute import KNNImputer  # <-- 修改点1: 导入KNNImputer
+# 导入 KNNImputer 和 ADASYN
+from sklearn.impute import KNNImputer
 from sklearn.feature_selection import VarianceThreshold, SelectFromModel, RFE
 # 导入交叉验证相关的工具
-from sklearn.model_selection import StratifiedKFold, cross_val_score  # <-- 新增导入用于交叉验证
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
+# 导入 ADASYN
+from imblearn.over_sampling import ADASYN  # <-- 新增导入ADASYN
 
 import torch
 
-# import torch.nn as nn
-# import torch.optim as optim
-# from torch.utils.data import DataLoader, TensorDataset
-# from tqdm import tqdm
-
 warnings.filterwarnings("ignore")
 np.random.seed(42)
-
-
-# torch.manual_seed(42) # 如果不使用PyTorch模型，可以注释掉
 
 
 def save_object(obj, filepath):
@@ -70,61 +64,20 @@ def f1_2_threshold(y_true, probas):
     return best_t
 
 
-def custom_resample(X, y, pos_ratio=1.4, neg_ratio=0.6, random_state=None):
-    if random_state is not None:
-        np.random.seed(random_state)
-
-    unique_classes, class_counts = np.unique(y, return_counts=True)
-    if len(unique_classes) != 2:
-        raise ValueError("仅支持二分类问题")
-    neg_class, pos_class = unique_classes[0], unique_classes[1]
-    neg_count, pos_count = class_counts[0], class_counts[1]
-
-    print(f"原始数据分布: 负类({neg_class})={neg_count}, 正类({pos_class})={pos_count}")
-
-    neg_indices = np.where(y == neg_class)[0]
-    pos_indices = np.where(y == pos_class)[0]
-
-    target_neg_count = int(neg_count * neg_ratio)
-    target_pos_count = int(pos_count * pos_ratio)
-
-    print(f"目标采样后分布: 负类={target_neg_count}, 正类={target_pos_count}")
-
-    if target_neg_count < neg_count:
-        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=False)
-    else:
-        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=True)
-
-    if target_pos_count < pos_count:
-        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=False)
-    else:
-        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=True)
-
-    combined_indices = np.concatenate([sampled_neg_indices, sampled_pos_indices])
-    np.random.shuffle(combined_indices)
-
-    X_resampled = X[combined_indices]
-    y_resampled = y[combined_indices]
-
-    resampled_neg_count = np.sum(y_resampled == neg_class)
-    resampled_pos_count = np.sum(y_resampled == pos_class)
-    print(f"重采样后实际分布: 负类={resampled_neg_count}, 正类={resampled_pos_count}")
-
-    return X_resampled, y_resampled
-
+# 注意：custom_resample 函数已被移除，因为我们改用 ADASYN
 
 if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> ADASYN -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
     print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 已移除 SMOTEENN，使用自定义采样方法")
+    print("-> 关键修改: 采样方法由自定义采样改为 ADASYN")  # <-- 更新日志
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
-    print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")  # <-- 修改点2: 更新日志
-    print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")  # <-- 新增日志项
+    print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
+    print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -150,10 +103,17 @@ if __name__ == "__main__":
     random_state = 42
     variance_threshold_value = 0.0
     top_percentile_to_select = 0.9
-    pos_resample_ratio = 1.6
-    neg_resample_ratio = 0.6
+    # pos_resample_ratio = 1.6 # <-- 移除旧配置
+    # neg_resample_ratio = 0.6  # <-- 移除旧配置
     num_features_to_select_brf = 90
-    cv_folds_for_rfe = 3  # <-- 新增配置项：用于RFE的交叉验证折数
+    cv_folds_for_rfe = 3
+
+    # ADASYN 配置
+    adasyn_config = {
+        'sampling_strategy': 'auto',  # 可根据需要调整
+        'random_state': random_state,
+        'n_jobs': -1
+    }
 
     # XGBoost 超参
     xgb_params = {
@@ -164,9 +124,7 @@ if __name__ == "__main__":
         'eval_metric': 'logloss',
         'random_state': random_state,
         'n_jobs': -1,
-        # 'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist', # 移除GPU依赖以简化示例
-        # 'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
-        'tree_method': 'hist',  # 默认CPU hist方法
+        'tree_method': 'hist',
         'predictor': 'cpu_predictor'
     }
 
@@ -194,8 +152,7 @@ if __name__ == "__main__":
 
     # ---- 3. 数据清洗与标准化 ----
     # 使用 KNNImputer 替代 SimpleImputer
-    # imputer = SimpleImputer(strategy="mean") # <-- 修改点3a: 注释掉旧的均值填充
-    imputer = KNNImputer(n_neighbors=5)  # <-- 修改点3b: 使用KNN填充
+    imputer = KNNImputer(n_neighbors=5)
     X_imputed = imputer.fit_transform(X_var_filtered)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
@@ -221,16 +178,7 @@ if __name__ == "__main__":
     estimator_rfe = LogisticRegression(penalty='l2', C=0.1, solver='liblinear', random_state=random_state,
                                        max_iter=1000)
 
-    # 创建StratifiedKFold对象用于交叉验证
     skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
-
-    # 初始化RFE对象（注意：这里我们暂时不确定最终要选多少特征，
-    # 因此先用一个较大的数字或默认行为，然后通过手动循环和CV分数决定）
-    # 或者我们可以直接指定最终想要的特征数量，并让RFE执行CV
-
-    # 方法一：如果想在RFE过程中就做CV筛选最优特征数（sklearn内置有限制），一种常见做法是：
-    # 先确定候选的特征数列表，然后对每个候选数跑一次RFE+CV，比较得分。
-    # 这里为了演示，在RFE设定好固定的目标特征数后进行CV评估其稳定性。
 
     rfe_num_features_to_select = int(top_percentile_to_select * X_brf_selected.shape[1])
     if rfe_num_features_to_select <= 0:
@@ -238,16 +186,13 @@ if __name__ == "__main__":
 
     print(f"目标选定特征数: {rfe_num_features_to_select}")
 
-    # 直接运行带有固定步长和特征数的RFE
     selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
     selector_rfe.fit(X_brf_selected, y_all)
 
     # --- 新增部分：在选定特征上进行交叉验证评分 ---
-    # 获取被选中的特征索引
     selected_top_feature_indices = selector_rfe.support_
     X_rfe_selected = X_brf_selected[:, selected_top_feature_indices]
 
-    # 对选出的特征子集做一个简单的交叉验证评分（例如AUC）
     cv_scores = cross_val_score(estimator_rfe, X_rfe_selected, y_all, cv=skf_cv, scoring='roc_auc')
     mean_cv_score = np.mean(cv_scores)
     std_cv_score = np.std(cv_scores)
@@ -257,14 +202,8 @@ if __name__ == "__main__":
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
-    # selected_top_feature_indices 已经从selector_rfe.support_获得
-    # selected_top_feature_indices = np.where(feature_ranking == 1)[0]
-
     X_selected = X_brf_selected[:, selected_top_feature_indices]
-    selected_feature_names_final = [selected_feature_names_brf[i] for i in np.where(selected_top_feature_indices)[0]]
-    # 注意上面这行需要调整，因为selected_top_feature_indices现在是一个布尔数组
-    # 正确方式应该是找出True的位置对应的原始BRF特征索引
-    original_brf_indices_of_selected = np.where(selected_top_feature_indices)[0]  # BRFSelcted空间里的index
+    original_brf_indices_of_selected = np.where(selected_top_feature_indices)[0]
     selected_feature_names_final = [selected_feature_names_brf[i] for i in original_brf_indices_of_selected]
 
     print(
@@ -279,12 +218,20 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 7. 自定义重采样 (替换 SMOTEENN) -----
-    print(f"正在进行自定义重采样 (正类x{pos_resample_ratio}, 负类x{neg_resample_ratio}) ...")
-    X_resampled, y_resampled = custom_resample(X_train_full, y_train_full,
-                                               pos_ratio=pos_resample_ratio,
-                                               neg_ratio=neg_resample_ratio,
-                                               random_state=random_state)
+    # ----- 7. 过采样 (使用 ADASYN 替换 自定义重采样) -----
+    print(f"正在进行 ADASYN 过采样 ...")
+    # 检查类别分布
+    unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
+    print(f"ADASYN前训练集分布: {dict(zip(unique_classes, class_counts))}")
+
+    # 应用 ADASYN
+    adasyn_sampler = ADASYN(**adasyn_config)
+    try:
+        X_resampled, y_resampled = adasyn_sampler.fit_resample(X_train_full, y_train_full)
+        print(f"ADASYN后训练集分布: {dict(zip(*np.unique(y_resampled, return_counts=True)))}")
+    except ValueError as e:
+        print(f"ADASYN采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
+        X_resampled, y_resampled = X_train_full, y_train_full
 
     # ----- 8. 训练基模型 (改为 XGBoost) -----
     print("训练 XGBoost 基模型 ...")
@@ -383,6 +330,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
 
 
 
