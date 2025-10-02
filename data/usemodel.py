@@ -1,25 +1,136 @@
 import os
 import pickle
+
+import numpy as np
+import pandas as pd
+
+
+def load_object(filepath):
+    """加载通过pickle保存的对象"""
+    with open(filepath, "rb") as f:
+        obj = pickle.load(f)
+    print(f"已加载: {filepath}")
+    return obj
+
+
+class ModelPipelineWrapper:
+    """
+    将训练脚本中保存的各个组件封装成一个类似sklearn Pipeline的预测接口。
+    """
+
+    def __init__(self, model_dict):
+        self.imputer = model_dict["imputer"]
+        self.scaler = model_dict["scaler"]
+        self.variance_selector = model_dict["variance_selector"]
+        self.brf_feature_selector = model_dict["brf_feature_selector"]
+        self.dnn_feature_ranking = model_dict["dnn_feature_ranking"]
+        self.selected_feature_names = model_dict["selected_feature_names"]
+
+        # 假设 base_models 是一个包含单一模型的列表
+        # 根据训练脚本，这里应该是单个模型
+        self.base_model = model_dict["base_models"]
+        self.meta_model = model_dict["meta_nb"]  # 在训练脚本中已经是 LogisticRegression
+        self.threshold = model_dict["threshold"]
+
+    def _preprocess(self, X_raw):
+        """
+        对原始特征矩阵执行完整的预处理流水线。
+        """
+        # 1. 方差过滤 (需要与训练时相同的特征顺序)
+        X_var_filtered = self.variance_selector.transform(X_raw)
+
+        # 2. 缺失值填充和标准化
+        X_imputed = self.imputer.transform(X_var_filtered)
+        X_scaled = self.scaler.transform(X_imputed)
+
+        # 3. BRF特征选择
+        X_brf_selected = self.brf_feature_selector.transform(X_scaled)
+
+        # 4. DNN特征排名筛选 (根据训练时保存的排名索引进行选择)
+        # 注意：ranked_idx_by_importance 是对 BRF 选出特征的重要性排序
+        # 我们需要选择前 N 个最重要的特征，N 由 selected_feature_names 的长度决定
+        # 或者更准确地，使用 ranking 索引来选择对应列
+        # 训练时是 selected_top_feature_indices = ranked_idx_by_importance[:num_top_features]
+        # 所以我们也需要取 ranking 的前 len(selected_feature_names) 项作为列索引
+        num_final_features = len(self.selected_feature_names)
+        selected_top_indices_from_brf = self.dnn_feature_ranking[:num_final_features]
+
+        # 确保索引不越界（理论上不应该）
+        if np.max(selected_top_indices_from_brf) >= X_brf_selected.shape[1]:
+            raise IndexError("DNN feature ranking indices are out of bounds for BRF selected features.")
+
+        X_final_selected = X_brf_selected[:, selected_top_indices_from_brf]
+
+        return X_final_selected
+
+    def predict_proba(self, X_raw):
+        """
+        对原始特征数据进行预处理并返回基模型的概率预测。
+        注意：此函数直接返回基模型的概率，级联逻辑在predict中处理阈值，
+        但为了与旧代码兼容，我们在这里也应用级联逻辑的一部分（获取基础概率）。
+        实际上，应将 cascade_predict_single_model 逻辑整合进来。
+        为保持一致性，我们模仿其行为：只返回基模型概率。
+        """
+        X_processed = self._preprocess(X_raw)
+        # 调用基模型的 predict_proba
+        try:
+            probas_base = self.base_model.predict_proba(X_processed)[:, 1]
+        except Exception:
+            # 如果没有 predict_proba，尝试用 predict 并转换
+            preds_base = self.base_model.predict(X_processed)
+            # 这里简化处理，假设输出是 0/1，转为概率近似 (0.01, 0.99)
+            probas_base = np.where(preds_base == 1, 0.99, 0.01)
+        return np.column_stack([1 - probas_base, probas_base])
+
+    def predict(self, X_raw):
+        """
+        对原始特征数据进行预处理、预测，并根据阈值和级联模型返回最终预测。
+        """
+        X_processed = self._preprocess(X_raw)
+
+        # 导入 cascade_predict_single_model 函数中的核心逻辑
+        # 因为它不是全局可导入的，我们需要在这里重现实现关键部分
+        # 或者更好的方式是在此类中定义一个相似的方法
+
+        # --- 重现 cascade_predict_single_model 逻辑 ---
+        try:
+            probas_base = self.base_model.predict_proba(X_processed)[:, 1]
+        except Exception:
+            probas_base = self.base_model.predict(X_processed).astype(float)
+
+        # 使用类中存储的阈值
+        preds = (probas_base >= self.threshold).astype(int)
+
+        # 简化的不确定性判断
+        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
+
+        # 使用 meta_model 进行修正
+        if self.meta_model is not None and uncertain_mask.sum() > 0:
+            meta_preds = self.meta_model.predict(X_processed[uncertain_mask])
+            preds[uncertain_mask] = meta_preds
+
+        return preds
+import os
+import pickle
 import warnings
 
 import numpy as np
 import pandas as pd
-# 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
-from sklearn.metrics import confusion_matrix
 
-# 导入 XGBoost
-try:
-    import xgboost as xgb
-
-    XGB_AVAILABLE = True
-except ImportError:
-    print("警告: 未找到 xgboost 库。请运行 'pip install xgboost' 进行安装。")
-    XGB_AVAILABLE = False
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression  # 导入逻辑回归
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm  # 引入进度条库
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -55,72 +166,82 @@ def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
     return preds, probas_base
 
 
-# 定义一个带残差连接的块
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.0):
-        super(ResidualBlock, self).__init__()
-        # 主路径
-        self.linear1 = nn.Linear(in_features, out_features)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-        self.linear2 = nn.Linear(out_features, out_features)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-
-        # 残差连接路径 (如果输入输出维度不同)
-        self.shortcut = nn.Identity()
-        if in_features != out_features:
-            self.shortcut = nn.Linear(in_features, out_features)
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-
-        out = self.linear1(x)
-        out = self.relu1(out)
-        if self.dropout1:
-            out = self.dropout1(out)
-
-        out = self.linear2(out)
-        # 残差连接
-        out += identity
-        out = self.relu2(out)
-        if self.dropout2:
-            out = self.dropout2(out)
-
-        return out
-
-
 class DeepFeatureSelector(nn.Module):
-    """更深的全连接网络，包含残差连接"""
+    """更深的全连接网络，不含自注意力机制"""
 
     def __init__(self, input_dim):
         super().__init__()
-        # 使用残差块构建网络
-        self.block1 = ResidualBlock(input_dim, 1024, 0.4)
-        self.block2 = ResidualBlock(1024, 512, 0.3)
-        self.block3 = ResidualBlock(512, 256, 0.3)
-        self.block4 = ResidualBlock(256, 128, 0.2)
+        # 使用线性层构建网络，修改为1024-512-256-128-64结构
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
 
-        # 输出层
-        self.output_layer = nn.Linear(128, 1)
-        self.sigmoid = nn.Sigmoid()
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.output_layer(x)
-        x = self.sigmoid(x)
-        return x
+        return self.network(x)
 
 
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128, lr=1e-3, device="cpu"):
+def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1500, batch_size=256, lr=1e-3, device="cpu", patience=50):
+    """
+    训练带有早停和学习率调度的深度特征选择器
+
+    参数:
+        X : array-like, shape (n_samples, n_features)
+            输入特征.
+        y : array-like, shape (n_samples,)
+            目标变量.
+        input_dim : int
+            输入特征维度.
+        epochs : int, optional (default=1000)
+            最大训练轮数.
+        batch_size : int, optional (default=128)
+            批次大小.
+        lr : float, optional (default=1e-3)
+            初始学习率.
+        device : str or torch.device, optional (default="cpu")
+            计算设备 ("cpu" 或 "cuda").
+        patience : int, optional (default=20)
+            早停耐心值.
+
+    返回:
+        feature_importance : ndarray, shape (input_dim,)
+            特征重要性分数.
+    """
     # 确保模型在指定设备上
     model = DeepFeatureSelector(input_dim).to(device)
     criterion = nn.BCELoss()
-    # 可以考虑使用 weight_decay 进行 L2 正则化
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # 使用 AdamW 优化器，通常比 Adam 更好
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    # 添加学习率调度器，在验证损失停滞时降低学习率
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=patience // 2
+                                                     )
 
     # 将数据也移动到指定设备
     dataset = TensorDataset(
@@ -129,40 +250,77 @@ def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    # 初始化早停相关变量
+    best_loss = float('inf')
+    trigger_times = 0
+    early_stop = False
+
     model.train()
-    for epoch in range(epochs):
+
+    # 使用tqdm显示训练进度条
+    pbar = tqdm(range(epochs), desc="Training DNN Feature Selector")
+
+    for epoch in pbar:
         total_loss = 0.0
         num_batches = 0
+
         for xb, yb in loader:
-            # 数据已经在设备上了，无需再次移动
-            # xb, yb = xb.to(device), yb.to(device)
             yb = yb.unsqueeze(1)  # 调整标签形状
             optimizer.zero_grad()
+
             outputs = model(xb)
             loss = criterion(outputs, yb)
+
             loss.backward()
+            # 添加梯度裁剪防止爆炸梯度
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
+
             total_loss += loss.item()
             num_batches += 1
-        # 可选：打印平均损失
-        # if (epoch + 1) % 50 == 0:
-        #     avg_loss = total_loss / num_batches
-        #     print(f"Epoch {epoch+1}/{epochs}, Avg Loss={avg_loss:.4f}")
+
+        avg_loss = total_loss / num_batches
+
+        # 更新学习率调度器
+        scheduler.step(avg_loss)
+
+        # 更新进度条信息
+        current_lr = optimizer.param_groups[0]['lr']
+        pbar.set_postfix({'Avg Loss': f'{avg_loss:.4f}', 'LR': f'{current_lr:.2e}'})
+
+        # --- Early Stopping Logic ---
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            trigger_times = 0
+            # 在这里可以保存最佳模型状态字典，但因为我们只需要最终权重来计算特征重要性，
+            # 并且不会恢复到这个检查点，所以省略了保存步骤。
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs.")
+                break
+
+    # 训练结束后关闭进度条
+    pbar.close()
 
     # 提取第一层权重以计算特征重要性
-    # 注意：现在第一层是 ResidualBlock，我们需要访问其内部的 linear1 层
     first_linear_layer = None
-    if hasattr(model, 'block1') and hasattr(model.block1, 'linear1'):
-        first_linear_layer = model.block1.linear1
+    if hasattr(model, 'network') and len(list(model.network)) > 0:
+        # 获取第一个 Linear 层
+        for layer in model.network:
+            if isinstance(layer, nn.Linear):
+                first_linear_layer = layer
+                break
     else:
-        # 如果结构改变，尝试查找第一个 nn.Linear 层
+        # 如果直接是 Sequential 或者其他情况，尝试查找第一个 nn.Linear 层
         for module in model.modules():
             if isinstance(module, nn.Linear):
                 first_linear_layer = module
                 break
 
     if first_linear_layer is not None:
-        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
+        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(output_dim_of_first_layer, input_dim)
         feature_importance = np.mean(np.abs(weights), axis=0)
     else:
         # 如果找不到线性层，则返回零重要性（理论上不应发生）
@@ -172,32 +330,81 @@ def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128
     return feature_importance
 
 
-def youden_threshold(y_true, probas):
+def f1_2_threshold(y_true, probas):
+    """
+    基于 F1.2 分数寻找最优阈值。
+    F1.2 更重视召回率 (Recall)。
+    """
     thresholds = np.linspace(0, 1, 101)
-    best_t, best_j = 0.5, -1
+    best_t, best_f1_2 = 0.5, -1
+    beta = 1.2  # F1.2 的 beta 值
+
     for t in thresholds:
         preds = (probas >= t).astype(int)
-        # 处理只有一个类别的情况
-        cm = confusion_matrix(y_true, preds, labels=[0, 1])
-        if cm.size == 4:
-            tn, fp, fn, tp = cm.ravel()
-        elif cm.size == 1:
-            # 所有预测都是同一类
-            if y_true[0] == 0:
-                tn, fp, fn, tp = cm[0, 0], 0, 0, 0  # All predicted negative
-            else:
-                tn, fp, fn, tp = 0, 0, 0, cm[0, 0]  # All predicted positive
-        else:
-            # 不规则矩阵，填充缺失项
-            padded_cm = np.pad(cm, ((0, 2 - cm.shape[0]), (0, 2 - cm.shape[1])), mode='constant')
-            tn, fp, fn, tp = padded_cm.ravel()
+        # 计算 F1.2 分数
+        # 注意：fbeta_score 在某些极端情况下（如所有预测为一类）可能返回 0.0
+        # 我们接受这种行为，因为它反映了模型在该阈值下的性能不佳
+        try:
+            f1_2 = fbeta_score(y_true, preds, beta=beta, zero_division=0)
+        except ValueError:
+            # 如果 y_true 或 preds 只有一个类别，fbeta_score 会报错
+            # 在这种情况下，我们将其视为 F1.2 = 0
+            f1_2 = 0.0
 
-        sensitivity = tp / (tp + fn + 1e-8)
-        specificity = tn / (tn + fp + 1e-8)
-        J = sensitivity + specificity - 1
-        if J > best_j:
-            best_j, best_t = J, t
+        if f1_2 > best_f1_2:
+            best_f1_2, best_t = f1_2, t
     return best_t
+
+
+def custom_resample(X, y, pos_ratio=1.4, neg_ratio=0.6, random_state=None):
+    """
+    根据指定的比例对数据进行重采样。
+    pos_ratio: 正类相对于原始正类数量的倍数 (例如 1.4 表示变为140%)
+    neg_ratio: 负类相对于原始负类数量的倍数 (例如 0.6 表示变为60%)
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    unique_classes, class_counts = np.unique(y, return_counts=True)
+    if len(unique_classes) != 2:
+        raise ValueError("仅支持二分类问题")
+    neg_class, pos_class = unique_classes[0], unique_classes[1]
+    neg_count, pos_count = class_counts[0], class_counts[1]
+
+    print(f"原始数据分布: 负类({neg_class})={neg_count}, 正类({pos_class})={pos_count}")
+
+    neg_indices = np.where(y == neg_class)[0]
+    pos_indices = np.where(y == pos_class)[0]
+
+    target_neg_count = int(neg_count * neg_ratio)
+    target_pos_count = int(pos_count * pos_ratio)
+
+    print(f"目标采样后分布: 负类={target_neg_count}, 正类={target_pos_count}")
+
+    # 下采样负类
+    if target_neg_count < neg_count:
+        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=False)
+    else:  # 上采样负类
+        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=True)
+
+    # 上采样正类
+    if target_pos_count < pos_count:
+        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=False)
+    else:  # 上采样正类
+        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=True)
+
+    # 合并并打乱
+    combined_indices = np.concatenate([sampled_neg_indices, sampled_pos_indices])
+    np.random.shuffle(combined_indices)
+
+    X_resampled = X[combined_indices]
+    y_resampled = y[combined_indices]
+
+    resampled_neg_count = np.sum(y_resampled == neg_class)
+    resampled_pos_count = np.sum(y_resampled == pos_class)
+    print(f"重采样后实际分布: 负类={resampled_neg_count}, 正类={resampled_pos_count}")
+
+    return X_resampled, y_resampled
 class WrappedXGBModel:
         def __init__(self, booster):
             self.booster = booster
@@ -205,102 +412,13 @@ class WrappedXGBModel:
         def predict_proba(self, X):
             dmatrix = xgb.DMatrix(X)
             probs = self.booster.predict(dmatrix)
-            # 返回二维数组 [[prob_0, prob_1], ...]
+
             return np.vstack([1 - probs, probs]).T
 
         def predict(self, X):
             dmatrix = xgb.DMatrix(X)
             probs = self.booster.predict(dmatrix)
             return (probs > 0.5).astype(int)
-
-def load_object(filepath):
-    """加载通过pickle保存的对象"""
-    with open(filepath, "rb") as f:
-        obj = pickle.load(f)
-    print(f"已加载: {filepath}")
-    return obj
-
-
-class LoadedPipelineWrapper:
-    """
-    包装加载的模型字典，使其行为类似于sklearn Pipeline，
-    并处理内部的XGBoost模型和级联逻辑。
-    """
-
-    def __init__(self, model_dict):
-        self.model_dict = model_dict
-        # 从字典中提取各个组件
-        self.imputer = self.model_dict["imputer"]
-        self.scaler = self.model_dict["scaler"]
-        self.dnn_feature_ranking = self.model_dict["dnn_feature_ranking"]
-
-        # 基模型是 WrappedXGBModel 实例
-        self.base_model = self.model_dict["base_models"]
-        # 元模型是 GaussianNB 实例
-        self.meta_model = self.model_dict["meta_nb"]
-        # 阈值
-        self.threshold = self.model_dict.get("threshold", 0.5)
-
-    def _preprocess(self, X_raw):
-        """执行与训练时相同的预处理步骤"""
-        # 1. 填充缺失值
-        X_imp = self.imputer.transform(X_raw)
-        # 2. 标准化
-        X_sc = self.scaler.transform(X_imp)
-        # 3. 特征选择（根据DNN排名重排特征）
-        X_selected = X_sc[:, self.dnn_feature_ranking]
-        return X_selected
-
-    def predict_proba(self, X_raw):
-        """
-        对原始特征数据进行预处理并预测概率。
-        实现与训练时一致的cascade_predict_single_model逻辑。
-        """
-        X_processed = self._preprocess(X_raw)
-
-        # --- 级联预测逻辑 ---
-        try:
-            probas_base = self.base_model.predict_proba(X_processed)[:, 1]
-        except Exception:
-            probas_base = self.base_model.predict(X_processed).astype(float)
-
-        # 简化的不确定性判断
-        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
-
-        # 初始化最终预测概率为基模型概率
-        final_probas = probas_base.copy()
-
-        # 如果有不确定样本且元模型存在，则使用元模型修正
-        if uncertain_mask.sum() > 0:
-            # 注意：这里我们只返回主类的概率，因为这是后续阈值判断所需要的
-            # cascade_predict_single_model 返回的是 (preds, probas_base)
-            # 我们需要模拟其对不确定样本使用meta_model预测的部分
-            # 但 meta_model (GaussianNB) 的 predict_proba 会返回两个类别的概率
-            meta_probas = self.meta_model.predict_proba(X_processed[uncertain_mask])
-            # 假设 meta_probas 是 [[p0_class0, p0_class1], [p1_class0, p1_class1], ...]
-            # 我们取 class1 的概率来替换原来的基模型概率
-            final_probas[uncertain_mask] = meta_probas[:, 1]
-
-        # 为了兼容接口，返回二维数组 [[prob_0, prob_1], ...]
-        # 这里简化处理，因为我们主要关心 prob_1 (final_probas)
-        prob_0 = 1 - final_probas
-        return np.vstack([prob_0, final_probas]).T
-
-    def predict(self, X_raw):
-        """
-        对原始特征数据进行预处理并预测类别。
-        使用存储在模型中的阈值。
-        """
-        probas = self.predict_proba(X_raw)
-        preds = (probas[:, 1] >= self.threshold).astype(int)
-        return preds
-
-
-def load_model(model_path):
-    """加载整个模型管道字典，并用包装器包装"""
-    model_dict = load_object(model_path)
-    return LoadedPipelineWrapper(model_dict)
-
 
 if __name__ == "__main__":
     # -----------------------------
@@ -311,20 +429,22 @@ if __name__ == "__main__":
     if not os.path.exists(test_data_path):
         # 创建示例测试数据用于演示目的，实际运行时请替换为真实数据路径
         print(f"警告: 未找到测试数据文件 '{test_data_path}'。正在创建示例测试数据...")
+        np.random.seed(100)  # 固定种子以便示例一致
+        sample_n = 200
         sample_test_data = pd.DataFrame({
-            'feature1': np.random.randn(200),
-            'feature2': np.random.rand(200) * 100,
-            'category_A': ['Y'] * 60 + ['N'] * 140,
-            # target列通常在测试集中不存在，这里仅作占位符展示，不会参与预测
+            'f0': np.random.randn(sample_n),
+            'f1': np.random.rand(sample_n) * 100,
+            'f2': np.random.randn(sample_n) * 5,
+            # 添加一些零方差特征列名，即使数据不同，只要名字匹配即可被过滤
+            'zero_var_0': [5.0] * sample_n,
+            'zero_var_1': [5.0] * sample_n,
+            # 模拟 one-hot 编码后的类别特征
+            'category_A_Y': np.random.choice([0, 1], size=sample_n, p=[0.7, 0.3]),
+
         })
-        sample_test_data = pd.get_dummies(sample_test_data, drop_first=True)
-        # 确保测试集特征与训练集对齐（假设训练集有feature1, feature2, category_A_Y）
-        required_cols = ['feature1', 'feature2', 'category_A_Y']
-        for col in required_cols:
-            if col not in sample_test_data.columns:
-                # 添加缺失的列，默认填0
-                sample_test_data[col] = 0
-        sample_test_data = sample_test_data[required_cols]  # 重新排序以匹配预期顺序
+        # 确保列名与训练集（包括经过get_dummies后）可能存在的列名一致
+        # 这里的列名是基于训练脚本中生成的示例数据的
+        # 实际使用时，应确保测试集列名与训练集处理后一致
 
         # 添加 company_id 列
         sample_test_data.insert(0, 'company_id', [f"COMP_{i}" for i in range(len(sample_test_data))])
@@ -337,66 +457,52 @@ if __name__ == "__main__":
         f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1] - 1 if 'company_id' in test_data.columns else test_data.shape[1]}")
 
     # -----------------------------
-    # 2. 加载模型管道 (包括预处理器)
+    # 2. 加载模型字典并包装
     # -----------------------------
-    model_path = "./model_pipeline_cascade_dnn_torch.pkl"  # 确保此路径正确
+    model_path = "./model.pkl"  # 使用训练脚本最后保存的模型文件
     if not os.path.exists(model_path):
         print(f"错误: 找不到模型文件 '{model_path}'。请确保模型已训练并保存。")
         exit(1)
 
-    print(f"正在加载模型管道: {model_path}")
-    loaded_pipeline = load_model(model_path)
+    print(f"正在加载模型字典: {model_path}")
+    loaded_model_dict = load_object(model_path)
+
+    # 包装模型字典以便使用
+    loaded_pipeline = ModelPipelineWrapper(loaded_model_dict)
 
     # -----------------------------
     # 3. 读取阈值
     # -----------------------------
     threshold = loaded_pipeline.threshold
-    print(f"从模型对象读取阈值: {threshold}")
+    print(f"从模型对象读取阈值: {threshold:.4f}")
 
     # -----------------------------
-    # 4. 测试数据处理
+    # 4. 测试数据处理与预测
     # -----------------------------
     # 去掉 ID 列
     feature_columns = [col for col in test_data.columns if col != "company_id"]
-    X_test_raw = test_data[feature_columns]
+    X_test_raw = test_data[feature_columns].values  # 转换为 NumPy array
     print(f"用于预测的原始特征数: {X_test_raw.shape[1]}")
 
-    # 预处理已在 pipeline 内部的 predict_proba/predict 方法中完成
-    # X_test_proc = X_test_raw.copy()
-    # if imputer is not None:
-    #     X_test_proc = imputer.transform(X_test_proc)
-    #     print("已应用缺失值填充。")
-    #
-    # if scaler is not None:
-    #     X_test_proc = scaler.transform(X_test_proc)
-    #     print("已应用标准化。")
-    #
-    # if selector is not None:
-    #     X_test_proc = selector.transform(X_test_proc)
-    #     print(f"已应用特征选择，最终特征数: {X_test_proc.shape[1]}")
-
-    # -----------------------------
-    # 5. 预测
-    # -----------------------------
     print("正在进行预测...")
-    # 使用包装器的 predict_proba 方法，它会自动处理预处理和级联逻辑
-    y_proba_full = loaded_pipeline.predict_proba(X_test_raw.values)
+    # 获取概率 (注意 predict_proba 返回的是二维数组 [[neg_prob, pos_prob], ...])
+    y_proba_full = loaded_pipeline.predict_proba(X_test_raw)
     y_proba = y_proba_full[:, 1]  # 获取正类概率
     print(f"预测完成，共 {len(y_proba)} 个概率值。")
 
-    print(f"应用分类阈值: {threshold}")
-    # 使用包装器的 predict 方法，它会自动处理预处理、级联逻辑和阈值判断
-    y_pred = loaded_pipeline.predict(X_test_raw.values)
+    print(f"应用分类阈值: {threshold:.4f}")
+    # 获取最终预测结果 (0 或 1)
+    y_pred = loaded_pipeline.predict(X_test_raw)
     print("分类完成。")
 
     # -----------------------------
-    # 6. 结果输出
+    # 5. 结果输出到桌面
     # -----------------------------
     if "company_id" in test_data.columns:
         uuid_column = test_data["company_id"]
     else:
         print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
-        uuid_column = test_data.index.astype(str)  # 确保索引是字符串类型
+        uuid_column = test_data.index.map(str)  # 确保索引是字符串类型
 
     results_df = pd.DataFrame({
         "uuid": uuid_column,
@@ -405,11 +511,15 @@ if __name__ == "__main__":
     })
     print("结果数据框创建成功。")
 
-    output_path = "submit_predictions.csv"
+    # 构造桌面路径 (跨平台基本兼容的方式)
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    if not os.path.exists(desktop_path):
+        desktop_path = "."  # 如果桌面路径不存在，则保存到当前目录
+
+    output_filename = "submit_template.csv"
+    output_path = os.path.join(desktop_path, output_filename)
+
     print(f"正在保存结果到: {output_path}")
     results_df.to_csv(output_path, index=False)
-    print(f"预测完成，阈值 {threshold}，结果已保存到 {output_path}")
-
-
-
+    print(f"预测完成，阈值 {threshold:.4f}，结果已保存到 {output_path}")
 
