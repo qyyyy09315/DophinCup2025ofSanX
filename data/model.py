@@ -71,119 +71,80 @@ def f1_2_threshold(y_true, probas):
     return best_t
 
 
-# --- WGAN-GP 相关定义 (含自注意力) ---
+# --- 条件 WGAN-GP 相关定义 ---
 
-class SelfAttention(nn.Module):
-    """自注意力模块"""
-
-    def __init__(self, in_dim, heads=8):
-        super(SelfAttention, self).__init__()
-        self.in_dim = in_dim
-        self.heads = heads
-        self.attention = nn.MultiheadAttention(embed_dim=in_dim, num_heads=heads, batch_first=True)
-        self.ln = nn.LayerNorm(in_dim)
-        # 可选：添加一个线性层来调整输出维度（如果需要）
-        # self.proj = nn.Linear(in_dim, in_dim)
-
-    def forward(self, x):
-        # x shape: (batch_size, data_dim)
-        # MultiheadAttention 需要 (batch_size, seq_len, feature_dim)
-        # 我们将 data_dim 视为 seq_len=1, feature_dim=data_dim
-        # 或者将每个特征视为一个序列元素，即 seq_len=data_dim, feature_dim=1
-        # 第二种解释更符合直觉：特征之间的自注意力
-        b, d = x.shape
-        # Reshape to (batch, seq_len, feature_dim) -> (b, d, 1)
-        x_in = x.unsqueeze(-1)  # (b, d, 1)
-        # Permute to (batch, seq_len, feature_dim) -> (b, 1, d)
-        x_in = x_in.permute(0, 2, 1)  # (b, 1, d)
-
-        # Apply attention
-        attn_out, _ = self.attention(x_in, x_in, x_in)  # (b, 1, d)
-
-        # Reshape back to (b, d)
-        attn_out = attn_out.squeeze(1)  # (b, d)
-
-        # Add & Norm
-        out = self.ln(x + attn_out)  # (b, d)
-        return out
-
-
-class Generator(nn.Module):
-    def __init__(self, latent_dim, data_dim):
-        super(Generator, self).__init__()
+class ConditionalGenerator(nn.Module):
+    def __init__(self, latent_dim, data_dim, num_classes):
+        super(ConditionalGenerator, self).__init__()
         self.data_dim = data_dim
         self.latent_dim = latent_dim
+        self.num_classes = num_classes
 
-        # 使用 Sequential 构建基础网络
-        self.pre_attn = nn.Sequential(
-            nn.Linear(latent_dim, 128),
+        # 嵌入层用于将类别信息转换为向量
+        self.label_emb = nn.Embedding(num_classes, num_classes)
+
+        # 输入维度包括噪声和嵌入后的标签
+        input_dim = latent_dim + num_classes
+
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(128, 256),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2, inplace=True),
-        )
-
-        # 自注意力层
-        self.self_attn = SelfAttention(256)
-
-        # 注意力后的处理层
-        self.post_attn = nn.Sequential(
             nn.Linear(256, 512),
             nn.BatchNorm1d(512),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(512, data_dim),
-            # 线性输出，因为数据经过StandardScaler后范围不定
         )
 
-    def forward(self, z):
-        # 输入噪声 z: (batch_size, latent_dim)
-        out = self.pre_attn(z)  # (batch_size, 256)
-        out = self.self_attn(out)  # (batch_size, 256)
-        out = self.post_attn(out)  # (batch_size, data_dim)
-        return out
+    def forward(self, z, labels):
+        # 将标签嵌入并与噪声拼接
+        gen_input = torch.cat((z, self.label_emb(labels)), -1)
+        output = self.model(gen_input)
+        return output
 
 
-class Critic(nn.Module):  # 判别器更名为Critic
-    def __init__(self, data_dim):
-        super(Critic, self).__init__()
+class ConditionalCritic(nn.Module):
+    def __init__(self, data_dim, num_classes):
+        super(ConditionalCritic, self).__init__()
         self.data_dim = data_dim
+        self.num_classes = num_classes
 
-        # 使用 Sequential 构建基础网络
-        self.pre_attn = nn.Sequential(
-            nn.Linear(data_dim, 512),
+        # 嵌入层用于将类别信息转换为向量
+        self.label_emb = nn.Embedding(num_classes, num_classes)
+
+        # 输入维度包括数据和嵌入后的标签
+        input_dim = data_dim + num_classes
+
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 512),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
             nn.Linear(512, 256),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
-        )
-
-        # 自注意力层
-        self.self_attn = SelfAttention(256)
-
-        # 注意力后的处理层
-        self.post_attn = nn.Sequential(
             nn.Linear(256, 1),
-            # 注意：WGAN 中 Critic 最后一层没有激活函数 Sigmoid
         )
 
-    def forward(self, data):
-        # 输入数据 data: (batch_size, data_dim)
-        out = self.pre_attn(data)  # (batch_size, 256)
-        out = self.self_attn(out)  # (batch_size, 256)
-        out = self.post_attn(out)  # (batch_size, 1)
-        return out
+    def forward(self, data, labels):
+        # 将标签嵌入并与数据拼接
+        d_in = torch.cat((data, self.label_emb(labels)), -1)
+        validity = self.model(d_in)
+        return validity
 
 
-def compute_gradient_penalty(critic, real_samples, fake_samples, device):
-    """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake samples
+def compute_gradient_penalty_conditional(critic, real_samples, fake_samples, labels, device):
+    """Calculates the gradient penalty loss for conditional WGAN GP"""
     alpha = torch.rand((real_samples.size(0), 1), device=device)
-    # Get random interpolation between real and fake samples
+
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-    d_interpolates = critic(interpolates)
+    # 标签需要扩展成与插值样本相同批次大小
+    interpolated_labels = labels.expand(interpolates.size(0))
+
+    d_interpolates = critic(interpolates, interpolated_labels)
     fake = torch.ones((real_samples.shape[0], 1), device=device, requires_grad=False)
-    # Get gradient w.r.t. interpolates
+
     gradients = torch.autograd.grad(
         outputs=d_interpolates,
         inputs=interpolates,
@@ -197,50 +158,51 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, device):
     return gradient_penalty
 
 
-def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
-                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, num_generation_batches=5):
+def cwgangp_resample(X_train, y_train, target_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
+                     device='cpu', n_critic=5, lambda_gp=10):
     """
-    使用 WGAN-GP 对少数类样本进行过采样，分批生成新样本。
+    使用 条件WGAN-GP 对指定类别的样本进行过采样。
     :param X_train: 训练特征 (numpy array)
     :param y_train: 训练标签 (numpy array)
-    :param minority_class: 少数类的标签
+    :param target_class: 目标少数类的标签
     :param latent_dim: 生成器输入的潜在空间维度
     :param epochs: GAN 训练轮数
-    :param batch_size: 批次大小 (用于训练)
+    :param batch_size: 批次大小
     :param lr: 学习率
     :param device: 'cpu' 或 'cuda'
     :param n_critic: 训练几次判别器才训练一次生成器
     :param lambda_gp: 梯度惩罚系数
-    :param num_generation_batches: 生成新样本时分多少批进行
     :return: resampled_X, resampled_y (numpy arrays)
     """
-    print("开始 WGAN-GP (含自注意力) 过采样 (渐进式分批生成)...")
-    # 1. 准备少数类数据
-    X_minority = X_train[y_train == minority_class]
-    if len(X_minority) == 0:
-        print("警告: 少数类样本数为0，无法进行WGAN-GP采样。")
+    print("开始 条件WGAN-GP 过采样...")
+    # 1. 准备目标类数据
+    X_target = X_train[y_train == target_class]
+    if len(X_target) == 0:
+        print("警告: 目标类样本数为0，无法进行cWGAN-GP采样。")
         return X_train, y_train
 
     data_dim = X_train.shape[1]
-    num_minority = len(X_minority)
-    num_majority = len(y_train) - num_minority
-    num_to_generate = num_majority - num_minority  # 目标是平衡
+    num_unique_classes = len(np.unique(y_train))
+    num_target = len(X_target)
+    num_other = len(y_train) - num_target
+    num_to_generate = num_other - num_target  # 目标是平衡
 
     if num_to_generate <= 0:
-        print("警告: 少数类样本数已大于等于多数类，无需过采样。")
+        print("警告: 目标类样本数已大于等于其他类，无需过采样。")
         return X_train, y_train
 
-    print(f"当前少数类样本数: {num_minority}, 多数类样本数: {num_majority}")
-    print(f"计划生成 {num_to_generate} 个少数类样本...")
+    print(f"当前目标类样本数: {num_target}, 其他类样本数: {num_other}")
+    print(f"计划生成 {num_to_generate} 个目标类样本...")
 
     # 转换为 Tensor
-    X_minority_tensor = torch.tensor(X_minority, dtype=torch.float32).to(device)
+    X_target_tensor = torch.tensor(X_target, dtype=torch.float32).to(device)
+    y_target_tensor = torch.full((len(X_target),), target_class, dtype=torch.long).to(device)
 
     # 2. 初始化网络
-    generator = Generator(latent_dim, data_dim).to(device)
-    critic = Critic(data_dim).to(device)  # 使用 Critic
+    generator = ConditionalGenerator(latent_dim, data_dim, num_unique_classes).to(device)
+    critic = ConditionalCritic(data_dim, num_unique_classes).to(device)
 
-    # 3. 优化器 (通常使用 Adam)
+    # 3. 优化器
     optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.9))
     optimizer_C = optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
 
@@ -248,34 +210,31 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     generator.train()
     critic.train()
 
-    batches_done = 0
     for epoch in range(epochs):
 
         # ---------------------
         #  训练 Critic (n_critic 次)
         # ---------------------
         for _ in range(n_critic):
-            # Configure input
-            idx = np.random.choice(len(X_minority_tensor), size=batch_size,
-                                   replace=False if len(X_minority_tensor) >= batch_size else True)
-            real_data = X_minority_tensor[idx]
-
-            # -----------------
-            # Train Critic
-            # -----------------
+            idx = np.random.choice(len(X_target_tensor), size=batch_size,
+                                   replace=False if len(X_target_tensor) >= batch_size else True)
+            real_data = X_target_tensor[idx]
+            real_labels = y_target_tensor[idx]
 
             optimizer_C.zero_grad()
 
-            # Sample noise as generator input
+            # Sample noise and generate fake samples conditioned on the target class
             z = torch.randn(batch_size, latent_dim, device=device)
+            # 生成器和判别器都使用相同的标签（这里是目标类）
+            fake_labels = torch.full((batch_size,), target_class, dtype=torch.long, device=device)
+            fake_data = generator(z, fake_labels).detach()
 
-            # Generate a batch of new data
-            fake_data = generator(z).detach()
             # Adversarial loss (Wasserstein loss)
-            loss_critic = -torch.mean(critic(real_data)) + torch.mean(critic(fake_data))
+            loss_critic = -torch.mean(critic(real_data, real_labels)) + torch.mean(critic(fake_data, fake_labels))
 
             # Calculate gradient penalty
-            gradient_penalty = compute_gradient_penalty(critic, real_data.data, fake_data.data, device)
+            gradient_penalty = compute_gradient_penalty_conditional(critic, real_data.data, fake_data.data, real_labels,
+                                                                    device)
 
             # Total loss
             c_loss = loss_critic + lambda_gp * gradient_penalty
@@ -290,9 +249,10 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
         optimizer_G.zero_grad()
 
         # Generate a batch of data
-        gen_data = generator(torch.randn(batch_size, latent_dim, device=device))
+        gen_labels = torch.full((batch_size,), target_class, dtype=torch.long, device=device)
+        gen_data = generator(torch.randn(batch_size, latent_dim, device=device), gen_labels)
         # Adversarial loss
-        g_loss = -torch.mean(critic(gen_data))
+        g_loss = -torch.mean(critic(gen_data, gen_labels))
 
         g_loss.backward()
         optimizer_G.step()
@@ -300,71 +260,31 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
         # Print losses occasionally
         if (epoch + 1) % 100 == 0 or epoch == 0:
             print(
-                f"Epoch [{epoch + 1}/{epochs}], C Loss: {loss_critic.item():.4f}, "
+                f"[Epoch {epoch + 1}/{epochs}] C Loss: {loss_critic.item():.4f}, "
                 f"GP: {gradient_penalty.item():.4f}, G Loss: {g_loss.item():.4f}"
             )
 
-    # 5. 分批生成新样本
-    print(f"开始分 {num_generation_batches} 批生成 {num_to_generate} 个新样本...")
+    # 5. 生成新样本
     generator.eval()
-    all_generated_data = []
-
-    # 计算每批生成的数量
-    batch_size_gen = int(np.ceil(num_to_generate / num_generation_batches))
-
     with torch.no_grad():
-        samples_generated = 0
-        for batch_idx in range(num_generation_batches):
-            # 确定这一批要生成的数量，避免超过总数
-            current_batch_size = min(batch_size_gen, num_to_generate - samples_generated)
-            if current_batch_size <= 0:
-                break
-
-            # 生成噪声
-            z_new = torch.randn(current_batch_size, latent_dim, device=device)
-            # 生成新样本
-            generated_batch = generator(z_new).cpu().numpy()
-            all_generated_data.append(generated_batch)
-
-            # --- 渐进式控制：将新生成的样本加入训练集 ---
-            # 将新生成的样本转换为Tensor并加入到现有的少数类样本Tensor中
-            new_minority_tensor = torch.tensor(generated_batch, dtype=torch.float32).to(device)
-            X_minority_tensor = torch.cat([X_minority_tensor, new_minority_tensor], dim=0)
-
-            samples_generated += current_batch_size
-            print(
-                f"  批次 {batch_idx + 1}/{num_generation_batches} 完成，生成 {current_batch_size} 个样本。累计生成 {samples_generated}/{num_to_generate}")
-
-    if not all_generated_data:
-        print("警告: 未生成任何新样本。")
-        return X_train, y_train
-
-    # 合并所有批次生成的数据
-    generated_data = np.vstack(all_generated_data)
+        z_new = torch.randn(num_to_generate, latent_dim, device=device)
+        new_labels = torch.full((num_to_generate,), target_class, dtype=torch.long, device=device)
+        generated_data = generator(z_new, new_labels).cpu().numpy()
 
     # 6. 合并新旧数据
     resampled_X = np.vstack([X_train, generated_data])
-    new_labels = np.full(len(generated_data), minority_class)
-    resampled_y = np.hstack([y_train, new_labels])
+    new_labels_np = np.full(num_to_generate, target_class)
+    resampled_y = np.hstack([y_train, new_labels_np])
 
-    print(f"WGAN-GP(含自注意力)渐进式过采样完成。新样本数: {len(generated_data)}")
+    print(f"cWGAN-GP过采样完成。新样本数: {num_to_generate}")
     print(f"采样后训练集分布: {dict(zip(*np.unique(resampled_y, return_counts=True)))}")
     return resampled_X, resampled_y
 
 
 if __name__ == "__main__":
-
     print("=" * 60)
-    print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力, 渐进式分批) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
-    print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
-    print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
-    print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP (含自注意力)")
-    print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
-    print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
-    print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP 生成样本采用渐进式控制，分5批生成")  # <-- 更新日志
+    print("开始训练：Variance Filter -> Balanced Random Forest -> cWGAN-GP -> XGBoost -> 级联 Logistic Regression")
+    print("-> 关键修改: 采样方法由 WGAN-GP 改为 条件WGAN-GP (conditional WGAN-GP)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -382,7 +302,7 @@ if __name__ == "__main__":
         sample_y = ((sample_X[:, 0] + sample_X[:, 1] - sample_X[:, 2]) > 0).astype(int)
         # 人为减少类别1的数量
         indices_class_1 = np.where(sample_y == 1)[0]
-        to_remove = int(0.8 * len(indices_class_1))  # 移除80%的类别1样本
+        to_remove = int(0.8 * len(indices_class_1))
         if to_remove > 0:
             remove_indices = np.random.choice(indices_class_1, size=to_remove, replace=False)
             sample_X = np.delete(sample_X, remove_indices, axis=0)
@@ -402,16 +322,16 @@ if __name__ == "__main__":
     num_features_to_select_brf = 90
     cv_folds_for_rfe = 3
 
-    # WGAN-GP 配置 (含自注意力)
-    wgangp_config = {
+    # cWGAN-GP 配置
+    cwgangp_config = {
+        'target_class': 1,  # 默认对类别1进行过采样
         'latent_dim': 100,
-        'epochs': 300,  # 可根据需要调整
+        'epochs': 300,
         'batch_size': 64,
-        'lr': 0.0001,  # WGAN-GP 推荐较小的学习率
-        'lambda_gp': 10,  # 梯度惩罚系数
-        'n_critic': 5,  # 训练几次判别器才训练一次生成器
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_generation_batches': 5  # <-- 新增配置项
+        'lr': 0.0001,
+        'lambda_gp': 10,
+        'n_critic': 5,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
     # XGBoost 超参
@@ -450,7 +370,6 @@ if __name__ == "__main__":
         f"方差过滤后特征数: {X_var_filtered.shape[1]} (移除了 {len(initial_feature_names) - len(selected_feature_names_variance)} 个特征)")
 
     # ---- 3. 数据清洗与标准化 ----
-    # 使用 KNNImputer 替代 SimpleImputer
     imputer = KNNImputer(n_neighbors=5)
     X_imputed = imputer.fit_transform(X_var_filtered)
     scaler = StandardScaler()
@@ -472,7 +391,7 @@ if __name__ == "__main__":
 
     save_object(brf_selector, "./brf_feature_selector.pkl")
 
-    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation-----
+    # ----- 5. Tree-based 特征权重 -> 改为 RFE with Cross-Validation-----
     print("使用 RFE (LogisticRegression L2) 结合交叉验证获取特征排名并选择 Top 特征 ...")
     estimator_rfe = LogisticRegression(penalty='l2', C=0.1, solver='liblinear', random_state=random_state,
                                        max_iter=1000)
@@ -488,7 +407,6 @@ if __name__ == "__main__":
     selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
     selector_rfe.fit(X_brf_selected, y_all)
 
-    # --- 新增部分：在选定特征上进行交叉验证评分 ---
     selected_top_feature_indices = selector_rfe.support_
     X_rfe_selected = X_brf_selected[:, selected_top_feature_indices]
 
@@ -517,21 +435,18 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 7. 过采样 (使用 WGAN-GP (含自注意力) 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP (含自注意力) 过采样 ...")
-    # 检查类别分布
+    # ----- 7. 过采样 (使用 条件WGAN-GP 替换之前的WGAN-GP) -----
+    print(f"正在进行 条件WGAN-GP 过采样 ...")
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
-    print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
+    print(f"cWGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
 
-    # 应用 WGAN-GP (含自注意力) 采样
     try:
-        # 注意：这里传递的是 numpy arrays
-        X_resampled, y_resampled = wgangp_resample(X_train_full, y_train_full, **wgangp_config)
+        X_resampled, y_resampled = cwgangp_resample(X_train_full, y_train_full, **cwgangp_config)
     except Exception as e:
-        print(f"WGAN-GP(含自注意力)采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
+        print(f"cWGAN-GP采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
         X_resampled, y_resampled = X_train_full, y_train_full
 
-    # ----- 8. 训练基模型 (改为 XGBoost) -----
+    # ----- 8. 训练基模型 (XGBoost) -----
     print("训练 XGBoost 基模型 ...")
     dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
     dval = xgb.DMatrix(X_holdout, label=y_holdout)
@@ -582,10 +497,9 @@ if __name__ == "__main__":
         meta_clf.fit(X_hard, y_hard)
         print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}")
 
-        # --- 新增部分：也可以对元模型做个简单的CV评估---
         try:
             meta_cv_scores = cross_val_score(meta_clf, X_hard, y_hard, cv=min(3, len(X_hard) // 2),
-                                             scoring='f1')  # 至少两折
+                                             scoring='f1')
             meta_mean_cv_score = np.mean(meta_cv_scores)
             print(f"Meta-model CV F1 Score on hard examples: {meta_mean_cv_score:.4f}")
         except Exception as e:
@@ -597,7 +511,7 @@ if __name__ == "__main__":
         meta_clf.fit(X_resampled, y_resampled)
         print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)")
 
-    # ----- 10. 阈值选择（修改为 F1.2） -----
+    # ----- 10. 阈值选择（F1.2） -----
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
     best_thresh = f1_2_threshold(y_holdout, holdout_probas)
 
