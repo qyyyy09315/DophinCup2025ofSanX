@@ -94,7 +94,7 @@ class DeepFeatureSelector(nn.Module):
         return self.network(x)
 
 
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=256, lr=1e-3, device="cpu", patience=50):
+def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1500, batch_size=256, lr=1e-3, device="cpu", patience=50):
     """
     训练带有早停和学习率调度的深度特征选择器
 
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
     pos_resample_ratio = 1.8  # 正类采样比例
     neg_resample_ratio = 0.6  # 负类采样比例
-    num_features_to_select_brf = 80  # BRF选择的特征数
+    num_features_to_select_brf = 50  # BRF选择的特征数
 
     # 关键修改: 确定设备，优先使用 CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,7 +347,7 @@ if __name__ == "__main__":
     xgb_params = {
         'max_depth': 4,
         'learning_rate': 0.1,
-        'n_estimators': 300,
+        'n_estimators': 500,
         'objective': 'binary:logistic',
         'eval_metric': 'logloss',  # 用于早停
         'random_state': random_state,
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # ---- 4. 平衡随机森林特征选择 ----
     print(f"使用平衡随机森林进行特征选择，选择 {num_features_to_select_brf} 个特征...")
     # 使用带类权重的随机森林处理不平衡
-    brf = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=-1,
+    brf = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1,
                                  class_weight='balanced')
     # SelectFromModel 使用默认阈值（通常是特征重要性的中位数），但我们指定了 max_features
     brf_selector = SelectFromModel(brf, max_features=num_features_to_select_brf, threshold=-np.inf)
@@ -411,7 +411,7 @@ if __name__ == "__main__":
     feature_importance = train_dnn_feature_selector_torch(
         X_brf_selected, y_all,
         input_dim=X_brf_selected.shape[1],
-        epochs=1000,  # 设置为1000次迭代
+        epochs=1500,  # 设置为1000次迭代
         device=device  # 使用指定的设备
     )
     ranked_idx_by_importance = np.argsort(-feature_importance)
