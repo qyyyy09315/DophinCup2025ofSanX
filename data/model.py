@@ -142,6 +142,7 @@ if __name__ == "__main__":
     print("-> 已移除 SMOTEENN，使用自定义采样方法")
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 新增关键修改: 在BRF前加入基于互信息(Mutual Information)的特征过滤")
+    print("-> 关键修改: BRF特征选择使用动态的'median'策略")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -176,7 +177,7 @@ if __name__ == "__main__":
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
     pos_resample_ratio = 1.6  # 正类采样比例
     neg_resample_ratio = 0.6  # 负类采样比例
-    num_features_to_select_brf = 90  # BRF选择的特征数
+    # num_features_to_select_brf = 90  # 不再使用固定数量，改为使用median阈值
 
     # XGBoost 超参
     xgb_params = {
@@ -242,17 +243,17 @@ if __name__ == "__main__":
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")  # 保存方差过滤器
 
-    # ---- 5. 平衡随机森林特征选择 ----
-    print(f"使用平衡随机森林进行特征选择，最多选择 {num_features_to_select_brf} 个特征...")
+    # ---- 5. 平衡随机森林特征选择 (使用median策略) ----
+    print(f"使用平衡随机森林进行特征选择，使用动态的 'median' 阈值策略...")
     # 使用带类权重的随机森林处理不平衡
     brf = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1,
                                  class_weight='balanced')
-    # SelectFromModel 使用默认阈值（通常是特征重要性的中位数），但我们指定了 max_features
-    brf_selector = SelectFromModel(brf, max_features=num_features_to_select_brf, threshold=-np.inf)
+    # SelectFromModel 使用 median 阈值策略
+    brf_selector = SelectFromModel(brf, threshold='median') # 关键修改：使用median
     X_brf_selected = brf_selector.fit_transform(current_X, y_all)  # 使用 MI 过滤后的数据
     selected_feature_indices_brf = brf_selector.get_support(indices=True)
     selected_feature_names_brf = [current_feature_names[i] for i in selected_feature_indices_brf]  # 使用 MI 过滤后的特征名
-    print(f"平衡随机森林特征选择完成，剩余特征数: {X_brf_selected.shape[1]}")
+    print(f"平衡随机森林特征选择完成，剩余特征数: {X_brf_selected.shape[1]} (使用 'median' 阈值)")
 
     save_object(brf_selector, "./brf_feature_selector.pkl")
 
@@ -394,7 +395,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
 
 
 
