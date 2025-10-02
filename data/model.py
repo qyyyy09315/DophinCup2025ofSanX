@@ -71,17 +71,63 @@ def f1_2_threshold(y_true, probas):
     return best_t
 
 
-# --- WGAN-GP 相关定义 ---
+# --- WGAN-GP 相关定义 (含自注意力) ---
+
+class SelfAttention(nn.Module):
+    """自注意力模块"""
+
+    def __init__(self, in_dim, heads=8):
+        super(SelfAttention, self).__init__()
+        self.in_dim = in_dim
+        self.heads = heads
+        self.attention = nn.MultiheadAttention(embed_dim=in_dim, num_heads=heads, batch_first=True)
+        self.ln = nn.LayerNorm(in_dim)
+        # 可选：添加一个线性层来调整输出维度（如果需要）
+        # self.proj = nn.Linear(in_dim, in_dim)
+
+    def forward(self, x):
+        # x shape: (batch_size, data_dim)
+        # MultiheadAttention 需要 (batch_size, seq_len, feature_dim)
+        # 我们将 data_dim 视为 seq_len=1, feature_dim=data_dim
+        # 或者将每个特征视为一个序列元素，即 seq_len=data_dim, feature_dim=1
+        # 第二种解释更符合直觉：特征之间的自注意力
+        b, d = x.shape
+        # Reshape to (batch, seq_len, feature_dim) -> (b, d, 1)
+        x_in = x.unsqueeze(-1)  # (b, d, 1)
+        # Permute to (batch, seq_len, feature_dim) -> (b, 1, d)
+        x_in = x_in.permute(0, 2, 1)  # (b, 1, d)
+
+        # Apply attention
+        attn_out, _ = self.attention(x_in, x_in, x_in)  # (b, 1, d)
+
+        # Reshape back to (b, d)
+        attn_out = attn_out.squeeze(1)  # (b, d)
+
+        # Add & Norm
+        out = self.ln(x + attn_out)  # (b, d)
+        return out
+
 
 class Generator(nn.Module):
     def __init__(self, latent_dim, data_dim):
         super(Generator, self).__init__()
-        self.model = nn.Sequential(
+        self.data_dim = data_dim
+        self.latent_dim = latent_dim
+
+        # 使用 Sequential 构建基础网络
+        self.pre_attn = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(128, 256),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2, inplace=True),
+        )
+
+        # 自注意力层
+        self.self_attn = SelfAttention(256)
+
+        # 注意力后的处理层
+        self.post_attn = nn.Sequential(
             nn.Linear(256, 512),
             nn.BatchNorm1d(512),
             nn.LeakyReLU(0.2, inplace=True),
@@ -90,25 +136,43 @@ class Generator(nn.Module):
         )
 
     def forward(self, z):
-        return self.model(z)
+        # 输入噪声 z: (batch_size, latent_dim)
+        out = self.pre_attn(z)  # (batch_size, 256)
+        out = self.self_attn(out)  # (batch_size, 256)
+        out = self.post_attn(out)  # (batch_size, data_dim)
+        return out
 
 
 class Critic(nn.Module):  # 判别器更名为Critic
     def __init__(self, data_dim):
         super(Critic, self).__init__()
-        self.model = nn.Sequential(
+        self.data_dim = data_dim
+
+        # 使用 Sequential 构建基础网络
+        self.pre_attn = nn.Sequential(
             nn.Linear(data_dim, 512),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
             nn.Linear(512, 256),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
+        )
+
+        # 自注意力层
+        self.self_attn = SelfAttention(256)
+
+        # 注意力后的处理层
+        self.post_attn = nn.Sequential(
             nn.Linear(256, 1),
             # 注意：WGAN 中 Critic 最后一层没有激活函数 Sigmoid
         )
 
     def forward(self, data):
-        return self.model(data)
+        # 输入数据 data: (batch_size, data_dim)
+        out = self.pre_attn(data)  # (batch_size, 256)
+        out = self.self_attn(out)  # (batch_size, 256)
+        out = self.post_attn(out)  # (batch_size, 1)
+        return out
 
 
 def compute_gradient_penalty(critic, real_samples, fake_samples, device):
@@ -149,7 +213,7 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     :param lambda_gp: 梯度惩罚系数
     :return: resampled_X, resampled_y (numpy arrays)
     """
-    print("开始 WGAN-GP 过采样...")
+    print("开始 WGAN-GP (含自注意力) 过采样...")
     # 1. 准备少数类数据
     X_minority = X_train[y_train == minority_class]
     if len(X_minority) == 0:
@@ -250,7 +314,7 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     new_labels = np.full(num_to_generate, minority_class)
     resampled_y = np.hstack([y_train, new_labels])
 
-    print(f"WGAN-GP过采样完成。新样本数: {num_to_generate}")
+    print(f"WGAN-GP(含自注意力)过采样完成。新样本数: {num_to_generate}")
     print(f"采样后训练集分布: {dict(zip(*np.unique(resampled_y, return_counts=True)))}")
     return resampled_X, resampled_y
 
@@ -259,11 +323,11 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
     print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP")  # <-- 更新日志
+    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP (含自注意力)")  # <-- 更新日志
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
@@ -304,7 +368,7 @@ if __name__ == "__main__":
     num_features_to_select_brf = 90
     cv_folds_for_rfe = 3
 
-    # WGAN-GP 配置
+    # WGAN-GP 配置 (含自注意力)
     wgangp_config = {
         'latent_dim': 100,
         'epochs': 300,  # 可根据需要调整
@@ -418,18 +482,18 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP 过采样 ...")
+    # ----- 7. 过采样 (使用 WGAN-GP (含自注意力) 替换 ADASYN/GAN) -----
+    print(f"正在进行 WGAN-GP (含自注意力) 过采样 ...")
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
     print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
 
-    # 应用 WGAN-GP 采样
+    # 应用 WGAN-GP (含自注意力) 采样
     try:
         # 注意：这里传递的是 numpy arrays
         X_resampled, y_resampled = wgangp_resample(X_train_full, y_train_full, **wgangp_config)
     except Exception as e:
-        print(f"WGAN-GP采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
+        print(f"WGAN-GP(含自注意力)采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
         X_resampled, y_resampled = X_train_full, y_train_full
 
     # ----- 8. 训练基模型 (改为 XGBoost) -----
@@ -529,7 +593,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
 
 
 
