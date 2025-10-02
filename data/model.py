@@ -71,7 +71,8 @@ def f1_2_threshold(y_true, probas):
     return best_t
 
 
-# --- GAN 相关定义 ---
+# --- WGAN-GP 相关定义 ---
+
 class Generator(nn.Module):
     def __init__(self, latent_dim, data_dim):
         super(Generator, self).__init__()
@@ -85,18 +86,16 @@ class Generator(nn.Module):
             nn.BatchNorm1d(512),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(512, data_dim),
-            # 如果数据范围是 [-1, 1]，可以使用 Tanh；如果是 [0, 1]，可以考虑 Sigmoid
-            # 由于 StandardScaler 后的数据通常不是严格 [0,1] 或 [-1,1]，这里可以省略激活或使用线性输出
-            # nn.Tanh() # 或者不加激活函数，直接输出
+            # 线性输出，因为数据经过StandardScaler后范围不定
         )
 
     def forward(self, z):
         return self.model(z)
 
 
-class Discriminator(nn.Module):
+class Critic(nn.Module):  # 判别器更名为Critic
     def __init__(self, data_dim):
-        super(Discriminator, self).__init__()
+        super(Critic, self).__init__()
         self.model = nn.Sequential(
             nn.Linear(data_dim, 512),
             nn.LeakyReLU(0.2, inplace=True),
@@ -105,16 +104,39 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Dropout(0.3),
             nn.Linear(256, 1),
-            nn.Sigmoid()
+            # 注意：WGAN 中 Critic 最后一层没有激活函数 Sigmoid
         )
 
     def forward(self, data):
         return self.model(data)
 
 
-def gan_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0002, device='cpu'):
+def compute_gradient_penalty(critic, real_samples, fake_samples, device):
+    """Calculates the gradient penalty loss for WGAN GP"""
+    # Random weight term for interpolation between real and fake samples
+    alpha = torch.rand((real_samples.size(0), 1), device=device)
+    # Get random interpolation between real and fake samples
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    d_interpolates = critic(interpolates)
+    fake = torch.ones((real_samples.shape[0], 1), device=device, requires_grad=False)
+    # Get gradient w.r.t. interpolates
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
+def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
+                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10):
     """
-    使用 GAN 对少数类样本进行过采样。
+    使用 WGAN-GP 对少数类样本进行过采样。
     :param X_train: 训练特征 (numpy array)
     :param y_train: 训练标签 (numpy array)
     :param minority_class: 少数类的标签
@@ -123,13 +145,15 @@ def gan_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300,
     :param batch_size: 批次大小
     :param lr: 学习率
     :param device: 'cpu' 或 'cuda'
+    :param n_critic: 训练几次判别器才训练一次生成器
+    :param lambda_gp: 梯度惩罚系数
     :return: resampled_X, resampled_y (numpy arrays)
     """
-    print("开始 GAN 过采样...")
+    print("开始 WGAN-GP 过采样...")
     # 1. 准备少数类数据
     X_minority = X_train[y_train == minority_class]
     if len(X_minority) == 0:
-        print("警告: 少数类样本数为0，无法进行GAN采样。")
+        print("警告: 少数类样本数为0，无法进行WGAN-GP采样。")
         return X_train, y_train
 
     data_dim = X_train.shape[1]
@@ -149,58 +173,71 @@ def gan_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300,
 
     # 2. 初始化网络
     generator = Generator(latent_dim, data_dim).to(device)
-    discriminator = Discriminator(data_dim).to(device)
+    critic = Critic(data_dim).to(device)  # 使用 Critic
 
-    # 3. 损失函数和优化器
-    criterion = nn.BCELoss()
-    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    # 3. 优化器 (通常使用 Adam)
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.9))
+    optimizer_C = optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
 
     # 4. 训练循环
     generator.train()
-    discriminator.train()
+    critic.train()
+
+    batches_done = 0
     for epoch in range(epochs):
-        for i in range(0, len(X_minority_tensor), batch_size):
-            # 真实数据批次
-            real_data = X_minority_tensor[i:i + batch_size]
-            batch_size_current = real_data.size(0)
-            # 真实标签和虚假标签
-            real_labels = torch.ones(batch_size_current, 1, device=device)
-            fake_labels = torch.zeros(batch_size_current, 1, device=device)
 
-            # ---------------------
-            #  训练判别器 (Discriminator)
-            # ---------------------
-            optimizer_D.zero_grad()
-
-            # 真实数据损失
-            real_output = discriminator(real_data)
-            d_loss_real = criterion(real_output, real_labels)
-
-            # 虚假数据损失
-            z = torch.randn(batch_size_current, latent_dim, device=device)
-            fake_data = generator(z)
-            fake_output = discriminator(fake_data.detach())
-            d_loss_fake = criterion(fake_output, fake_labels)
-
-            # 总的判别器损失
-            d_loss = (d_loss_real + d_loss_fake) / 2
-            d_loss.backward()
-            optimizer_D.step()
+        # ---------------------
+        #  训练 Critic (n_critic 次)
+        # ---------------------
+        for _ in range(n_critic):
+            # Configure input
+            idx = np.random.choice(len(X_minority_tensor), size=batch_size,
+                                   replace=False if len(X_minority_tensor) >= batch_size else True)
+            real_data = X_minority_tensor[idx]
 
             # -----------------
-            #  训练生成器 (Generator)
+            # Train Critic
             # -----------------
-            optimizer_G.zero_grad()
-            # 生成器希望判别器将虚假数据判断为真
-            fake_output_for_g = discriminator(fake_data)
-            g_loss = criterion(fake_output_for_g, real_labels) # 欺骗判别器
-            g_loss.backward()
-            optimizer_G.step()
 
-        # 打印损失（可选）
+            optimizer_C.zero_grad()
+
+            # Sample noise as generator input
+            z = torch.randn(batch_size, latent_dim, device=device)
+
+            # Generate a batch of new data
+            fake_data = generator(z).detach()
+            # Adversarial loss (Wasserstein loss)
+            loss_critic = -torch.mean(critic(real_data)) + torch.mean(critic(fake_data))
+
+            # Calculate gradient penalty
+            gradient_penalty = compute_gradient_penalty(critic, real_data.data, fake_data.data, device)
+
+            # Total loss
+            c_loss = loss_critic + lambda_gp * gradient_penalty
+
+            c_loss.backward()
+            optimizer_C.step()
+
+        # -----------------
+        #  训练 Generator
+        # -----------------
+
+        optimizer_G.zero_grad()
+
+        # Generate a batch of data
+        gen_data = generator(torch.randn(batch_size, latent_dim, device=device))
+        # Adversarial loss
+        g_loss = -torch.mean(critic(gen_data))
+
+        g_loss.backward()
+        optimizer_G.step()
+
+        # Print losses occasionally
         if (epoch + 1) % 100 == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], D Loss: {d_loss.item():.4f}, G Loss: {g_loss.item():.4f}")
+            print(
+                f"Epoch [{epoch + 1}/{epochs}], C Loss: {loss_critic.item():.4f}, "
+                f"GP: {gradient_penalty.item():.4f}, G Loss: {g_loss.item():.4f}"
+            )
 
     # 5. 生成新样本
     generator.eval()
@@ -213,7 +250,7 @@ def gan_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300,
     new_labels = np.full(num_to_generate, minority_class)
     resampled_y = np.hstack([y_train, new_labels])
 
-    print(f"GAN过采样完成。新样本数: {num_to_generate}")
+    print(f"WGAN-GP过采样完成。新样本数: {num_to_generate}")
     print(f"采样后训练集分布: {dict(zip(*np.unique(resampled_y, return_counts=True)))}")
     return resampled_X, resampled_y
 
@@ -222,11 +259,11 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> GAN -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
     print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 关键修改: 采样方法由 ADASYN 改为 GAN")  # <-- 更新日志
+    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP")  # <-- 更新日志
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
@@ -247,7 +284,7 @@ if __name__ == "__main__":
         sample_y = ((sample_X[:, 0] + sample_X[:, 1] - sample_X[:, 2]) > 0).astype(int)
         # 人为减少类别1的数量
         indices_class_1 = np.where(sample_y == 1)[0]
-        to_remove = int(0.8 * len(indices_class_1)) # 移除80%的类别1样本
+        to_remove = int(0.8 * len(indices_class_1))  # 移除80%的类别1样本
         if to_remove > 0:
             remove_indices = np.random.choice(indices_class_1, size=to_remove, replace=False)
             sample_X = np.delete(sample_X, remove_indices, axis=0)
@@ -264,17 +301,17 @@ if __name__ == "__main__":
     random_state = 42
     variance_threshold_value = 0.0
     top_percentile_to_select = 0.9
-    # pos_resample_ratio = 1.6 # <-- 移除旧配置
-    # neg_resample_ratio = 0.6  # <-- 移除旧配置
     num_features_to_select_brf = 90
     cv_folds_for_rfe = 3
 
-    # GAN 配置
-    gan_config = {
+    # WGAN-GP 配置
+    wgangp_config = {
         'latent_dim': 100,
-        'epochs': 300, # 可根据需要调整
+        'epochs': 300,  # 可根据需要调整
         'batch_size': 64,
-        'lr': 0.0002,
+        'lr': 0.0001,  # WGAN-GP 推荐较小的学习率
+        'lambda_gp': 10,  # 梯度惩罚系数
+        'n_critic': 5,  # 训练几次判别器才训练一次生成器
         'device': 'cuda' if torch.cuda.is_available() else 'cpu'
     }
 
@@ -381,18 +418,18 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 7. 过采样 (使用 GAN 替换 ADASYN) -----
-    print(f"正在进行 GAN 过采样 ...")
+    # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
+    print(f"正在进行 WGAN-GP 过采样 ...")
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
-    print(f"GAN前训练集分布: {dict(zip(unique_classes, class_counts))}")
+    print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
 
-    # 应用 GAN 采样
+    # 应用 WGAN-GP 采样
     try:
         # 注意：这里传递的是 numpy arrays
-        X_resampled, y_resampled = gan_resample(X_train_full, y_train_full, **gan_config)
+        X_resampled, y_resampled = wgangp_resample(X_train_full, y_train_full, **wgangp_config)
     except Exception as e:
-        print(f"GAN采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
+        print(f"WGAN-GP采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
         X_resampled, y_resampled = X_train_full, y_train_full
 
     # ----- 8. 训练基模型 (改为 XGBoost) -----
@@ -492,3 +529,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
+
+
+
