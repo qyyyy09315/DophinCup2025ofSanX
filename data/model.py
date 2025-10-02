@@ -345,7 +345,7 @@ if __name__ == "__main__":
     random_state = 42
     variance_threshold_value = 0.0  # 设置方差阈值
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
-    pos_resample_ratio = 1.4  # 正类采样比例
+    pos_resample_ratio = 1.8  # 正类采样比例
     neg_resample_ratio = 0.6  # 负类采样比例
 
     # 关键修改: 确定设备，优先使用 CUDA
