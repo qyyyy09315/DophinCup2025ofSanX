@@ -198,22 +198,23 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, device):
 
 
 def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
-                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10):
+                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, num_generation_batches=5):
     """
-    使用 WGAN-GP 对少数类样本进行过采样。
+    使用 WGAN-GP 对少数类样本进行过采样，分批生成新样本。
     :param X_train: 训练特征 (numpy array)
     :param y_train: 训练标签 (numpy array)
     :param minority_class: 少数类的标签
     :param latent_dim: 生成器输入的潜在空间维度
     :param epochs: GAN 训练轮数
-    :param batch_size: 批次大小
+    :param batch_size: 批次大小 (用于训练)
     :param lr: 学习率
     :param device: 'cpu' 或 'cuda'
     :param n_critic: 训练几次判别器才训练一次生成器
     :param lambda_gp: 梯度惩罚系数
+    :param num_generation_batches: 生成新样本时分多少批进行
     :return: resampled_X, resampled_y (numpy arrays)
     """
-    print("开始 WGAN-GP (含自注意力) 过采样...")
+    print("开始 WGAN-GP (含自注意力) 过采样 (渐进式分批生成)...")
     # 1. 准备少数类数据
     X_minority = X_train[y_train == minority_class]
     if len(X_minority) == 0:
@@ -303,18 +304,50 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
                 f"GP: {gradient_penalty.item():.4f}, G Loss: {g_loss.item():.4f}"
             )
 
-    # 5. 生成新样本
+    # 5. 分批生成新样本
+    print(f"开始分 {num_generation_batches} 批生成 {num_to_generate} 个新样本...")
     generator.eval()
+    all_generated_data = []
+
+    # 计算每批生成的数量
+    batch_size_gen = int(np.ceil(num_to_generate / num_generation_batches))
+
     with torch.no_grad():
-        z_new = torch.randn(num_to_generate, latent_dim, device=device)
-        generated_data = generator(z_new).cpu().numpy()
+        samples_generated = 0
+        for batch_idx in range(num_generation_batches):
+            # 确定这一批要生成的数量，避免超过总数
+            current_batch_size = min(batch_size_gen, num_to_generate - samples_generated)
+            if current_batch_size <= 0:
+                break
+
+            # 生成噪声
+            z_new = torch.randn(current_batch_size, latent_dim, device=device)
+            # 生成新样本
+            generated_batch = generator(z_new).cpu().numpy()
+            all_generated_data.append(generated_batch)
+
+            # --- 渐进式控制：将新生成的样本加入训练集 ---
+            # 将新生成的样本转换为Tensor并加入到现有的少数类样本Tensor中
+            new_minority_tensor = torch.tensor(generated_batch, dtype=torch.float32).to(device)
+            X_minority_tensor = torch.cat([X_minority_tensor, new_minority_tensor], dim=0)
+
+            samples_generated += current_batch_size
+            print(
+                f"  批次 {batch_idx + 1}/{num_generation_batches} 完成，生成 {current_batch_size} 个样本。累计生成 {samples_generated}/{num_to_generate}")
+
+    if not all_generated_data:
+        print("警告: 未生成任何新样本。")
+        return X_train, y_train
+
+    # 合并所有批次生成的数据
+    generated_data = np.vstack(all_generated_data)
 
     # 6. 合并新旧数据
     resampled_X = np.vstack([X_train, generated_data])
-    new_labels = np.full(num_to_generate, minority_class)
+    new_labels = np.full(len(generated_data), minority_class)
     resampled_y = np.hstack([y_train, new_labels])
 
-    print(f"WGAN-GP(含自注意力)过采样完成。新样本数: {num_to_generate}")
+    print(f"WGAN-GP(含自注意力)渐进式过采样完成。新样本数: {len(generated_data)}")
     print(f"采样后训练集分布: {dict(zip(*np.unique(resampled_y, return_counts=True)))}")
     return resampled_X, resampled_y
 
@@ -323,14 +356,15 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力, 渐进式分批) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
     print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP (含自注意力)")  # <-- 更新日志
+    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP (含自注意力)")
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
+    print("-> 新增功能: WGAN-GP 生成样本采用渐进式控制，分5批生成")  # <-- 更新日志
     print("=" * 60)
 
     # ----- 配置 -----
@@ -376,7 +410,8 @@ if __name__ == "__main__":
         'lr': 0.0001,  # WGAN-GP 推荐较小的学习率
         'lambda_gp': 10,  # 梯度惩罚系数
         'n_critic': 5,  # 训练几次判别器才训练一次生成器
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'num_generation_batches': 5  # <-- 新增配置项
     }
 
     # XGBoost 超参
@@ -593,6 +628,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
 
 
 
