@@ -5,13 +5,13 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from sklearn.feature_selection import VarianceThreshold, SelectFromModel
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel, mutual_info_classif
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression  # 导入逻辑回归
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier # 导入 ExtraTreesClassifier
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier  # 导入 ExtraTreesClassifier
 import xgboost as xgb
 
 import torch
@@ -52,7 +52,6 @@ def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
         preds[uncertain_mask] = meta_preds
 
     return preds, probas_base
-
 
 
 def f1_2_threshold(y_true, probas):
@@ -136,12 +135,13 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")  # 修改打印信息
+        "开始训练：Variance Filter -> Mutual Info Filter -> Balanced Random Forest (Select Features) -> Custom Resample (Pos 1.6x, Neg 0.6x) -> XGBoost -> Cascade Logistic Regression")
     print("-> 已将 DNN 特征加权替换为 ExtraTreesClassifier 特征重要性")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
     print("-> 已移除 SMOTEENN，使用自定义采样方法")
-    print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")  # 修改打印信息
+    print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
+    print("-> 新增关键修改: 在BRF前加入基于互信息(Mutual Information)的特征过滤")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -172,10 +172,11 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0  # 设置方差阈值
+    mi_percentile_to_keep = 0.85  # 关键新增：保留前85%互信息得分的特征
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
-    pos_resample_ratio = 1.8  # 正类采样比例
+    pos_resample_ratio = 1.6  # 正类采样比例
     neg_resample_ratio = 0.6  # 负类采样比例
-    num_features_to_select_brf = 50  # BRF选择的特征数
+    num_features_to_select_brf = 90  # BRF选择的特征数
 
     # XGBoost 超参
     xgb_params = {
@@ -219,27 +220,43 @@ if __name__ == "__main__":
     imputer = SimpleImputer(strategy="mean")
     X_imputed = imputer.fit_transform(X_var_filtered)
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed)
+    X_scaled_temp = scaler.fit_transform(X_imputed)  # 临时标准化用于MI计算
+
+    # ---- 关键新增步骤 4: 互信息特征过滤 ----
+    print(f"计算互信息并保留 Top {mi_percentile_to_keep * 100}% 的特征...")
+    mi_scores = mutual_info_classif(X_scaled_temp, y_all, random_state=random_state)
+    mi_threshold_index = int(len(mi_scores) * mi_percentile_to_keep)
+    sorted_mi_indices = np.argsort(-mi_scores)  # 降序排列
+    selected_mi_indices = sorted_mi_indices[:mi_threshold_index]
+
+    X_mi_filtered = X_scaled_temp[:, selected_mi_indices]
+    selected_feature_names_mi = [selected_feature_names_variance[i] for i in selected_mi_indices]
+    print(
+        f"互信息过滤后特征数: {X_mi_filtered.shape[1]} (移除了 {len(selected_feature_names_variance) - len(selected_feature_names_mi)} 个特征)")
+
+    # 更新后续使用的变量
+    current_X = X_mi_filtered
+    current_feature_names = selected_feature_names_mi
 
     save_object(imputer, "./imputer.pkl")
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")  # 保存方差过滤器
 
-    # ---- 4. 平衡随机森林特征选择 ----
-    print(f"使用平衡随机森林进行特征选择，选择 {num_features_to_select_brf} 个特征...")
+    # ---- 5. 平衡随机森林特征选择 ----
+    print(f"使用平衡随机森林进行特征选择，最多选择 {num_features_to_select_brf} 个特征...")
     # 使用带类权重的随机森林处理不平衡
     brf = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1,
                                  class_weight='balanced')
     # SelectFromModel 使用默认阈值（通常是特征重要性的中位数），但我们指定了 max_features
     brf_selector = SelectFromModel(brf, max_features=num_features_to_select_brf, threshold=-np.inf)
-    X_brf_selected = brf_selector.fit_transform(X_scaled, y_all)
+    X_brf_selected = brf_selector.fit_transform(current_X, y_all)  # 使用 MI 过滤后的数据
     selected_feature_indices_brf = brf_selector.get_support(indices=True)
-    selected_feature_names_brf = [selected_feature_names_variance[i] for i in selected_feature_indices_brf]
+    selected_feature_names_brf = [current_feature_names[i] for i in selected_feature_indices_brf]  # 使用 MI 过滤后的特征名
     print(f"平衡随机森林特征选择完成，剩余特征数: {X_brf_selected.shape[1]}")
 
     save_object(brf_selector, "./brf_feature_selector.pkl")
 
-    # ----- 5. Tree-based 特征权重 (替代DNN) -----
+    # ----- 6. Tree-based 特征权重 (替代DNN) -----
     print("使用 ExtraTreesClassifier 训练获取特征权重 ...")
     # 关键修改: 替换为 ExtraTreesClassifier
     et = ExtraTreesClassifier(n_estimators=300,
@@ -263,22 +280,22 @@ if __name__ == "__main__":
     print(
         f"ExtraTrees 特征加权完成，并选择了 Top {top_percentile_to_select * 100}% ({num_top_features}/{len(feature_importance)}) 的特征.")
 
-    save_object(ranked_idx_by_importance, "./tree_feature_ranking.pkl") # 保存排名
+    save_object(ranked_idx_by_importance, "./tree_feature_ranking.pkl")  # 保存排名
 
-    # ----- 6. 划分训练/验证集 -----
+    # ----- 7. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
         X_selected, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 7. 自定义重采样 (替换 SMOTEENN) -----
+    # ----- 8. 自定义重采样 (替换 SMOTEENN) -----
     print(f"正在进行自定义重采样 (正类x{pos_resample_ratio}, 负类x{neg_resample_ratio}) ...")
     X_resampled, y_resampled = custom_resample(X_train_full, y_train_full,
                                                pos_ratio=pos_resample_ratio,
                                                neg_ratio=neg_resample_ratio,
                                                random_state=random_state)
 
-    # ----- 8. 训练基模型 (改为 XGBoost) -----
+    # ----- 9. 训练基模型 (改为 XGBoost) -----
     print("训练 XGBoost 基模型 ...")
     # 准备 XGBoost 数据集以便使用早停功能（可选）
     dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
@@ -319,8 +336,8 @@ if __name__ == "__main__":
     save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
     print("已训练基模型：XGBoost")
 
-    # ----- 9. 训练级联修正器 -----
-    print("识别基模型误分类样本，训练级联修正器 (使用带 L2 正则化的 Logistic Regression)...")  # 修改打印信息
+    # ----- 10. 训练级联修正器 -----
+    print("识别基模型误分类样本，训练级联修正器 (使用带 L2 正则化的 Logistic Regression)...")
     # 使用新的预测方法，传入None作为meta_model
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
@@ -333,16 +350,16 @@ if __name__ == "__main__":
         meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state,
                                       max_iter=1000)  # 使用 L2 正则化
         meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}")  # 修改打印信息
+        print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}")
     else:
         # 如果没有误分类样本或困难样本只属于一个类别，则使用全部重采样后的数据训练
         # meta_clf = GaussianNB()
         meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state,
                                       max_iter=1000)  # 使用 L2 正则化
         meta_clf.fit(X_resampled, y_resampled)
-        print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)")  # 修改打印信息
+        print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)")
 
-    # ----- 10. 阈值选择（修改为 F1.2） -----
+    # ----- 11. 阈值选择（修改为 F1.2） -----
     # 使用新的预测函数
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
     # 关键修改: 使用 F1.2 阈值选择函数
@@ -361,7 +378,7 @@ if __name__ == "__main__":
     print(f"最佳阈值 (基于 F1.2)={best_thresh:.4f}, F1={f1:.4f}, F1.2={f1_2_final:.4f}")
     print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
 
-    # ----- 11. 保存完整模型 -----
+    # ----- 12. 保存完整模型 -----
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
@@ -377,3 +394,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
+
+
+
