@@ -4,22 +4,15 @@ import warnings
 
 import numpy as np
 import pandas as pd
-# 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
-from sklearn.feature_selection import VarianceThreshold
+
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
-
-# 导入 XGBoost
-try:
-    import xgboost as xgb
-
-    XGB_AVAILABLE = True
-except ImportError:
-    print("警告: 未找到 xgboost 库。请运行 'pip install xgboost' 进行安装。")
-    XGB_AVAILABLE = False
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 
 import torch
 import torch.nn as nn
@@ -119,7 +112,7 @@ def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=25
         lr : float, optional (default=1e-3)
             初始学习率.
         device : str or torch.device, optional (default="cpu")
-            训算设备 ("cpu" 或 "cuda").
+            计算设备 ("cpu" 或 "cuda").
         patience : int, optional (default=20)
             早停耐心值.
 
@@ -303,13 +296,10 @@ def custom_resample(X, y, pos_ratio=1.4, neg_ratio=0.6, random_state=None):
 
 
 if __name__ == "__main__":
-    if not XGB_AVAILABLE:
-        print("错误: 缺少必要依赖库 xgboost。程序退出。")
-        exit(1)
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
     print("-> DNN 不含自注意力机制，并利用 GPU (如果可用)，新增早停、学习率调度和进度条")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
@@ -347,6 +337,7 @@ if __name__ == "__main__":
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
     pos_resample_ratio = 1.8  # 正类采样比例
     neg_resample_ratio = 0.6  # 负类采样比例
+    num_features_to_select_brf = 80  # BRF选择的特征数
 
     # 关键修改: 确定设备，优先使用 CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -354,9 +345,9 @@ if __name__ == "__main__":
 
     # XGBoost 超参
     xgb_params = {
-        'max_depth': 6,
+        'max_depth': 4,
         'learning_rate': 0.1,
-        'n_estimators': 200,
+        'n_estimators': 300,
         'objective': 'binary:logistic',
         'eval_metric': 'logloss',  # 用于早停
         'random_state': random_state,
@@ -400,12 +391,26 @@ if __name__ == "__main__":
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")  # 保存方差过滤器
 
-    # ----- 4. DNN 特征权重 -----
+    # ---- 4. 平衡随机森林特征选择 ----
+    print(f"使用平衡随机森林进行特征选择，选择 {num_features_to_select_brf} 个特征...")
+    # 使用带类权重的随机森林处理不平衡
+    brf = RandomForestClassifier(n_estimators=100, random_state=random_state, n_jobs=-1,
+                                 class_weight='balanced')
+    # SelectFromModel 使用默认阈值（通常是特征重要性的中位数），但我们指定了 max_features
+    brf_selector = SelectFromModel(brf, max_features=num_features_to_select_brf, threshold=-np.inf)
+    X_brf_selected = brf_selector.fit_transform(X_scaled, y_all)
+    selected_feature_indices_brf = brf_selector.get_support(indices=True)
+    selected_feature_names_brf = [selected_feature_names_variance[i] for i in selected_feature_indices_brf]
+    print(f"平衡随机森林特征选择完成，剩余特征数: {X_brf_selected.shape[1]}")
+
+    save_object(brf_selector, "./brf_feature_selector.pkl")
+
+    # ----- 5. DNN 特征权重 -----
     print("使用 Torch DNN (不含自注意力机制) 训练获取特征权重 ...")
     # 关键修改: 将设备传递给训练函数，并增加迭代次数
     feature_importance = train_dnn_feature_selector_torch(
-        X_scaled, y_all,
-        input_dim=X_scaled.shape[1],
+        X_brf_selected, y_all,
+        input_dim=X_brf_selected.shape[1],
         epochs=1000,  # 设置为1000次迭代
         device=device  # 使用指定的设备
     )
@@ -417,27 +422,27 @@ if __name__ == "__main__":
         num_top_features = 1
     selected_top_feature_indices = ranked_idx_by_importance[:num_top_features]
 
-    X_selected = X_scaled[:, selected_top_feature_indices]
-    selected_feature_names_final = [selected_feature_names_variance[i] for i in selected_top_feature_indices]
+    X_selected = X_brf_selected[:, selected_top_feature_indices]
+    selected_feature_names_final = [selected_feature_names_brf[i] for i in selected_top_feature_indices]
     print(
         f"Torch DNN 特征加权完成，并选择了 Top {top_percentile_to_select * 100}% ({num_top_features}/{len(feature_importance)}) 的特征.")
 
     save_object(ranked_idx_by_importance, "./dnn_feature_ranking.pkl")
 
-    # ----- 5. 划分训练/验证集 -----
+    # ----- 6. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
         X_selected, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 6. 自定义重采样 (替换 SMOTEENN) -----
+    # ----- 7. 自定义重采样 (替换 SMOTEENN) -----
     print(f"正在进行自定义重采样 (正类x{pos_resample_ratio}, 负类x{neg_resample_ratio}) ...")
     X_resampled, y_resampled = custom_resample(X_train_full, y_train_full,
                                                pos_ratio=pos_resample_ratio,
                                                neg_ratio=neg_resample_ratio,
                                                random_state=random_state)
 
-    # ----- 7. 训练基模型 (改为 XGBoost) -----
+    # ----- 8. 训练基模型 (改为 XGBoost) -----
     print("训练 XGBoost 基模型 ...")
     # 准备 XGBoost 数据集以便使用早停功能（可选）
     dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
@@ -478,7 +483,7 @@ if __name__ == "__main__":
     save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
     print("已训练基模型：XGBoost")
 
-    # ----- 8. 训练级联修正器 -----
+    # ----- 9. 训练级联修正器 -----
     print("识别基模型误分类样本，训练级联修正器...")
     # 使用新的预测方法，传入None作为meta_model
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
@@ -497,7 +502,7 @@ if __name__ == "__main__":
         meta_clf.fit(X_resampled, y_resampled)
         print("未发现足够的误分类样本，使用全部重采样数据训练修正器")
 
-    # ----- 9. 阈值选择（修改为 F1.2） -----
+    # ----- 10. 阈值选择（修改为 F1.2） -----
     # 使用新的预测函数
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
     # 关键修改: 使用 F1.2 阈值选择函数
@@ -516,11 +521,12 @@ if __name__ == "__main__":
     print(f"最佳阈值 (基于 F1.2)={best_thresh:.4f}, F1={f1:.4f}, F1.2={f1_2_final:.4f}")
     print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
 
-    # ----- 10. 保存完整模型 -----
+    # ----- 11. 保存完整模型 -----
     model_dict = {
         "imputer": imputer,
         "scaler": scaler,
         "variance_selector": selector_variance,  # 保存方差过滤器
+        "brf_feature_selector": brf_selector,  # 保存BRF特征选择器
         "dnn_feature_ranking": ranked_idx_by_importance,  # 保存原始排名索引
         "selected_feature_names": selected_feature_names_final,  # 保存最终选择的特征名称
         "base_models": wrapped_xgb_model,  # 单一模型
@@ -531,3 +537,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
+
+
