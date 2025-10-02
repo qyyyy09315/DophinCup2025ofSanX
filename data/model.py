@@ -4,11 +4,10 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from imblearn.combine import SMOTEENN
 # 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix
+from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.preprocessing import StandardScaler
@@ -24,7 +23,6 @@ except ImportError:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F # For Focal Loss
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm  # 引入进度条库
@@ -63,144 +61,49 @@ def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
     return preds, probas_base
 
 
-# --- Focal Loss 定义 ---
-class FocalLoss(nn.Module):
-    """
-    Focal Loss, 用于解决类别不平衡和易分样本主导问题。
-    FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
-    """
-    def __init__(self, alpha=0.8, gamma=1.5, reduction='mean'):
-        """
-        Args:
-            alpha (float): 平衡因子，用于正负样本权重。这里设为正样本权重。
-            gamma (float): 聚焦参数，用于减少易分样本的损失贡献。
-            reduction (str): 指定应用于输出的规约方式：'none' | 'mean' | 'sum'。
-        """
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        """
-        Args:
-            inputs (Tensor): 模型输出的 logits (未经过 sigmoid)。
-                             Shape: (N, *) 其中 N 是样本数。
-            targets (Tensor): 真实标签。必须是 float 类型，与 inputs 同形状。
-                             Shape: (N, *)
-        Returns:
-            Tensor: 计算得到的 Focal Loss。
-        """
-        # 计算 BCE Loss
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        # 计算 p_t
-        pt = torch.exp(-BCE_loss)
-        # 计算 Focal Loss
-        # 对于正样本，权重为 alpha；对于负样本，权重为 (1 - alpha)
-        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-        F_loss = alpha_t * (1-pt)**self.gamma * BCE_loss
-
-        if self.reduction == 'mean':
-            return torch.mean(F_loss)
-        elif self.reduction == 'sum':
-            return torch.sum(F_loss)
-        else:
-            return F_loss
-
-
-# --- 带 KL 散度正则化的深度特征选择器 ---
-class DeepFeatureSelectorWithKL(nn.Module):
-    """更深的全连接网络，不含自注意力机制，并包含 KL 散度正则化"""
+class DeepFeatureSelector(nn.Module):
+    """更深的全连接网络，不含自注意力机制"""
 
     def __init__(self, input_dim):
         super().__init__()
-        # 定义网络结构
-        self.input_dim = input_dim
-        self.fc1 = nn.Linear(input_dim, 1024)
-        self.bn1 = nn.BatchNorm1d(1024)
-        self.dropout1 = nn.Dropout(0.3)
+        # 使用线性层构建网络，修改为1024-512-256-128-64结构
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
 
-        self.fc2 = nn.Linear(1024, 512)
-        self.bn2 = nn.BatchNorm1d(512)
-        self.dropout2 = nn.Dropout(0.2)
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
 
-        self.fc3 = nn.Linear(512, 256)
-        self.bn3 = nn.BatchNorm1d(256)
-        self.dropout3 = nn.Dropout(0.1)
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
 
-        self.fc4 = nn.Linear(256, 128)
-        self.bn4 = nn.BatchNorm1d(128)
-        self.dropout4 = nn.Dropout(0.1)
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
 
-        self.fc5 = nn.Linear(128, 64)
-        self.bn5 = nn.BatchNorm1d(64)
-        self.dropout5 = nn.Dropout(0.05)
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.05),
 
-        self.fc_out = nn.Linear(64, 1)
-
-        # 用于 KL 散度计算的先验分布参数 (标准正态分布)
-        self.prior_mu = 0.0
-        self.prior_sigma = 1.0
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout1(x)
-
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = self.dropout2(x)
-
-        x = F.relu(self.bn3(self.fc3(x)))
-        x = self.dropout3(x)
-
-        x = F.relu(self.bn4(self.fc4(x)))
-        x = self.dropout4(x)
-
-        x = F.relu(self.bn5(self.fc5(x)))
-        x = self.dropout5(x)
-
-        output = torch.sigmoid(self.fc_out(x))
-        return output
-
-    def kl_divergence_loss(self):
-        """
-        计算模型所有可学习参数相对于标准正态先验的 KL 散度之和。
-        这里简化处理，将所有参数视为独立的高斯分布，均值为其参数值，方差设为一个固定小值或根据参数学习。
-        为了简化，我们直接将参数视为从 N(0, 1) 中采样，计算其与 N(0, 1) 的 KL 散度。
-        注意：这在实际贝叶斯神经网络中是不准确的，通常我们会为权重和偏置分别建模并学习其分布参数。
-        此处为简化实现，仅对所有参数计算与标准正态的差异。
-        """
-        kl_loss = 0
-        # 遍历所有参数
-        for param in self.parameters():
-            # 假设参数的后验分布是 N(param.data, sigma^2)，其中 sigma 是一个很小的固定值或可学习的
-            # 这里我们简化地计算 (param - 0)^2 / (2 * 1^2) = param^2 / 2
-            # 实际 KL(p||q) = 0.5 * (log(sigma2^2/sigma1^2) + (sigma1^2 + (mu1-mu2)^2)/sigma2^2 - 1)
-            # 其中 p=N(mu1, sigma1^2), q=N(mu2, sigma2^2)
-            # 设 p=N(param, small_sigma^2), q=N(0, 1)
-            # KL = 0.5 * (log(1/small_sigma^2) + (small_sigma^2 + param^2)/1 - 1)
-            # 为了进一步简化，我们忽略 log 项和 small_sigma^2 项，近似为 0.5 * param^2
-            # 或者更简单地，直接使用参数的 L2 范数平方作为正则化项，这与权重衰减类似。
-            # PyTorch 的 weight_decay 参数在 AdamW 中已经实现了 L2 正则化。
-            # 因此，如果使用了 weight_decay，这里可以不加额外的 KL 惩罚，或者 KL 惩罚非常小。
-            # 这里我们实现一个更标准的 KL 计算，假设参数分布是 N(param, sigma^2_fixed)
-            # 并且我们希望它接近 N(0, 1)。
-            # 我们可以为每个参数层添加可学习的 log_sigma 参数，但这会使模型复杂化。
-            # 因此，我们将使用一种启发式方法，将参数偏离 0 的程度作为 KL 的代理。
-            # 一个简单的近似是 KL ≈ 0.5 * (param^2 - 1 - log(param^2 + eps))，但这对单个参数不稳定。
-            # 最简单的近似是 KL ≈ 0.5 * param^2，这等价于 L2 正则化。
-            # 为了体现 KL 的思想，我们计算参数与 N(0,1) 的平方差之和。
-            # 但这与 weight_decay 冲突。因此，我们只在没有使用 weight_decay 或需要额外约束时使用。
-            # 本实现中，我们将 KL 损失定义为参数平方和的一半，模拟标准正态先验下的 KL 散度。
-            kl_loss += torch.sum(0.5 * param ** 2) # 简化版 KL 散度
-        return kl_loss
+        return self.network(x)
 
 
-def train_dnn_feature_selector_torch_with_focal_kl(
-    X, y, input_dim, epochs=1000, batch_size=256, lr=1e-3, device="cpu", patience=50,
-    focal_alpha=0.8, focal_gamma=1.5, kl_beta=0.01
-):
+def train_dnn_feature_selector_torch(X, y, input_dim, epochs=1000, batch_size=256, lr=1e-3, device="cpu", patience=50):
     """
-    使用 Focal Loss 和 KL 散度正则化训练深度特征选择器
+    训练带有早停和学习率调度的深度特征选择器
 
     参数:
         X : array-like, shape (n_samples, n_features)
@@ -216,135 +119,187 @@ def train_dnn_feature_selector_torch_with_focal_kl(
         lr : float, optional (default=1e-3)
             初始学习率.
         device : str or torch.device, optional (default="cpu")
-            计算设备 ("cpu" 或 "cuda").
+            训算设备 ("cpu" 或 "cuda").
         patience : int, optional (default=20)
             早停耐心值.
-        focal_alpha : float, optional (default=0.8)
-            Focal Loss 的 alpha 参数 (正样本权重).
-        focal_gamma : float, optional (default=1.5)
-            Focal Loss 的 gamma 参数 (聚焦参数).
-        kl_beta : float, optional (default=0.01)
-            KL 散度正则化的强度.
 
     返回:
         feature_importance : ndarray, shape (input_dim,)
             特征重要性分数.
     """
-    # 初始化模型、损失函数和优化器
-    model = DeepFeatureSelectorWithKL(input_dim).to(device)
-    focal_criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5) # weight_decay 作为基础 L2 正则
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=patience // 2)
+    # 确保模型在指定设备上
+    model = DeepFeatureSelector(input_dim).to(device)
+    criterion = nn.BCELoss()
 
-    # 准备数据加载器
+    # 使用 AdamW 优化器，通常比 Adam 更好
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    # 添加学习率调度器，在验证损失停滞时降低学习率
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=patience // 2
+                                                     )
+
+    # 将数据也移动到指定设备
     dataset = TensorDataset(
         torch.tensor(X, dtype=torch.float32).to(device),
-        torch.tensor(y, dtype=torch.float32).to(device) # BCE/Focal Loss 需要 FloatTensor
+        torch.tensor(y, dtype=torch.float32).to(device)
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # 早停初始化
+    # 初始化早停相关变量
     best_loss = float('inf')
     trigger_times = 0
     early_stop = False
 
     model.train()
-    pbar = tqdm(range(epochs), desc="Training DNN Feature Selector (Focal+KL)")
+
+    # 使用tqdm显示训练进度条
+    pbar = tqdm(range(epochs), desc="Training DNN Feature Selector")
 
     for epoch in pbar:
         total_loss = 0.0
-        total_focal_loss = 0.0
-        total_kl_loss = 0.0
         num_batches = 0
 
         for xb, yb in loader:
-            yb = yb.unsqueeze(1) # 调整标签形状为 (batch_size, 1)
+            yb = yb.unsqueeze(1)  # 调整标签形状
             optimizer.zero_grad()
 
-            outputs = model(xb) # outputs shape: (batch_size, 1)
+            outputs = model(xb)
+            loss = criterion(outputs, yb)
 
-            # 计算 Focal Loss
-            focal_loss = focal_criterion(outputs, yb)
-
-            # 计算 KL 散度损失
-            kl_loss = model.kl_divergence_loss()
-
-            # 总损失 = Focal Loss + β * KL Loss
-            total_batch_loss = focal_loss + kl_beta * kl_loss
-
-            total_batch_loss.backward()
+            loss.backward()
+            # 添加梯度裁剪防止爆炸梯度
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
-            total_loss += total_batch_loss.item()
-            total_focal_loss += focal_loss.item()
-            total_kl_loss += (kl_beta * kl_loss).item() # 记录实际加到 loss 上的 KL 部分
+            total_loss += loss.item()
             num_batches += 1
 
         avg_loss = total_loss / num_batches
-        avg_focal_loss = total_focal_loss / num_batches
-        avg_kl_loss = total_kl_loss / num_batches
 
+        # 更新学习率调度器
         scheduler.step(avg_loss)
 
+        # 更新进度条信息
         current_lr = optimizer.param_groups[0]['lr']
-        pbar.set_postfix({
-            'Avg Loss': f'{avg_loss:.4f}',
-            'Focal': f'{avg_focal_loss:.4f}',
-            'KL': f'{avg_kl_loss:.4f}',
-            'LR': f'{current_lr:.2e}'
-        })
+        pbar.set_postfix({'Avg Loss': f'{avg_loss:.4f}', 'LR': f'{current_lr:.2e}'})
 
         # --- Early Stopping Logic ---
         if avg_loss < best_loss:
             best_loss = avg_loss
             trigger_times = 0
+            # 在这里可以保存最佳模型状态字典，但因为我们只需要最终权重来计算特征重要性，
+            # 并且不会恢复到这个检查点，所以省略了保存步骤。
         else:
             trigger_times += 1
             if trigger_times >= patience:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs.")
                 break
 
+    # 训练结束后关闭进度条
     pbar.close()
 
     # 提取第一层权重以计算特征重要性
-    first_linear_layer = model.fc1 # 直接访问第一层 Linear 层
+    first_linear_layer = None
+    if hasattr(model, 'network') and len(list(model.network)) > 0:
+        # 获取第一个 Linear 层
+        for layer in model.network:
+            if isinstance(layer, nn.Linear):
+                first_linear_layer = layer
+                break
+    else:
+        # 如果直接是 Sequential 或者其他情况，尝试查找第一个 nn.Linear 层
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                first_linear_layer = module
+                break
+
     if first_linear_layer is not None:
-        weights = first_linear_layer.weight.detach().cpu().numpy() # shape=(output_dim_of_first_layer, input_dim)
+        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(output_dim_of_first_layer, input_dim)
         feature_importance = np.mean(np.abs(weights), axis=0)
     else:
+        # 如果找不到线性层，则返回零重要性（理论上不应发生）
         print("警告：无法找到第一层线性层以计算特征重要性。")
         feature_importance = np.zeros(input_dim)
 
     return feature_importance
 
 
-def youden_threshold(y_true, probas):
+def f1_2_threshold(y_true, probas):
+    """
+    基于 F1.2 分数寻找最优阈值。
+    F1.2 更重视召回率 (Recall)。
+    """
     thresholds = np.linspace(0, 1, 101)
-    best_t, best_j = 0.5, -1
+    best_t, best_f1_2 = 0.5, -1
+    beta = 1.2  # F1.2 的 beta 值
+
     for t in thresholds:
         preds = (probas >= t).astype(int)
-        # 处理只有一个类别的情况
-        cm = confusion_matrix(y_true, preds, labels=[0, 1])
-        if cm.size == 4:
-            tn, fp, fn, tp = cm.ravel()
-        elif cm.size == 1:
-            # 所有预测都是同一类
-            if y_true[0] == 0:
-                tn, fp, fn, tp = cm[0, 0], 0, 0, 0  # All predicted negative
-            else:
-                tn, fp, fn, tp = 0, 0, 0, cm[0, 0]  # All predicted positive
-        else:
-            # 不规则矩阵，填充缺失项
-            padded_cm = np.pad(cm, ((0, 2 - cm.shape[0]), (0, 2 - cm.shape[1])), mode='constant')
-            tn, fp, fn, tp = padded_cm.ravel()
+        # 计算 F1.2 分数
+        # 注意：fbeta_score 在某些极端情况下（如所有预测为一类）可能返回 0.0
+        # 我们接受这种行为，因为它反映了模型在该阈值下的性能不佳
+        try:
+            f1_2 = fbeta_score(y_true, preds, beta=beta, zero_division=0)
+        except ValueError:
+            # 如果 y_true 或 preds 只有一个类别，fbeta_score 会报错
+            # 在这种情况下，我们将其视为 F1.2 = 0
+            f1_2 = 0.0
 
-        sensitivity = tp / (tp + fn + 1e-8)
-        specificity = tn / (tn + fp + 1e-8)
-        J = sensitivity + specificity - 1
-        if J > best_j:
-            best_j, best_t = J, t
+        if f1_2 > best_f1_2:
+            best_f1_2, best_t = f1_2, t
     return best_t
+
+
+def custom_resample(X, y, pos_ratio=1.4, neg_ratio=0.6, random_state=None):
+    """
+    根据指定的比例对数据进行重采样。
+    pos_ratio: 正类相对于原始正类数量的倍数 (例如 1.4 表示变为140%)
+    neg_ratio: 负类相对于原始负类数量的倍数 (例如 0.6 表示变为60%)
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    unique_classes, class_counts = np.unique(y, return_counts=True)
+    if len(unique_classes) != 2:
+        raise ValueError("仅支持二分类问题")
+    neg_class, pos_class = unique_classes[0], unique_classes[1]
+    neg_count, pos_count = class_counts[0], class_counts[1]
+
+    print(f"原始数据分布: 负类({neg_class})={neg_count}, 正类({pos_class})={pos_count}")
+
+    neg_indices = np.where(y == neg_class)[0]
+    pos_indices = np.where(y == pos_class)[0]
+
+    target_neg_count = int(neg_count * neg_ratio)
+    target_pos_count = int(pos_count * pos_ratio)
+
+    print(f"目标采样后分布: 负类={target_neg_count}, 正类={target_pos_count}")
+
+    # 下采样负类
+    if target_neg_count < neg_count:
+        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=False)
+    else:  # 上采样负类
+        sampled_neg_indices = np.random.choice(neg_indices, size=target_neg_count, replace=True)
+
+    # 上采样正类
+    if target_pos_count < pos_count:
+        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=False)
+    else:  # 上采样正类
+        sampled_pos_indices = np.random.choice(pos_indices, size=target_pos_count, replace=True)
+
+    # 合并并打乱
+    combined_indices = np.concatenate([sampled_neg_indices, sampled_pos_indices])
+    np.random.shuffle(combined_indices)
+
+    X_resampled = X[combined_indices]
+    y_resampled = y[combined_indices]
+
+    resampled_neg_count = np.sum(y_resampled == neg_class)
+    resampled_pos_count = np.sum(y_resampled == pos_class)
+    print(f"重采样后实际分布: 负类={resampled_neg_count}, 正类={resampled_pos_count}")
+
+    return X_resampled, y_resampled
 
 
 if __name__ == "__main__":
@@ -353,10 +308,12 @@ if __name__ == "__main__":
         exit(1)
 
     print("=" * 60)
-    print("开始训练：Variance Filter -> SMOTEENN -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
+    print(
+        "开始训练：Variance Filter -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
     print("-> DNN 不含自注意力机制，并利用 GPU (如果可用)，新增早停、学习率调度和进度条")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
-    print("-> 改造损失函数：引入 Focal Loss 和 KL 散度正则化")
+    print("-> 阈值调优方法已修改为 F1.2")
+    print("-> 已移除 SMOTEENN，使用自定义采样方法")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -388,11 +345,8 @@ if __name__ == "__main__":
     random_state = 42
     variance_threshold_value = 0.0  # 设置方差阈值
     top_percentile_to_select = 0.9  # 保留前90%重要的特征
-
-    # Focal Loss 和 KL 散度参数
-    focal_alpha = 0.8
-    focal_gamma = 1.5
-    kl_beta = 0.01
+    pos_resample_ratio = 1.4  # 正类采样比例
+    neg_resample_ratio = 0.6  # 负类采样比例
 
     # 关键修改: 确定设备，优先使用 CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -446,17 +400,14 @@ if __name__ == "__main__":
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")  # 保存方差过滤器
 
-    # ----- 4. DNN 特征权重 (使用改造后的损失函数) -----
-    print("使用 Torch DNN (Focal Loss + KL Reg) 训练获取特征权重 ...")
-    # 关键修改: 将设备和新参数传递给训练函数，并增加迭代次数
-    feature_importance = train_dnn_feature_selector_torch_with_focal_kl(
+    # ----- 4. DNN 特征权重 -----
+    print("使用 Torch DNN (不含自注意力机制) 训练获取特征权重 ...")
+    # 关键修改: 将设备传递给训练函数，并增加迭代次数
+    feature_importance = train_dnn_feature_selector_torch(
         X_scaled, y_all,
         input_dim=X_scaled.shape[1],
         epochs=1000,  # 设置为1000次迭代
-        device=device,  # 使用指定的设备
-        focal_alpha=focal_alpha,
-        focal_gamma=focal_gamma,
-        kl_beta=kl_beta
+        device=device  # 使用指定的设备
     )
     ranked_idx_by_importance = np.argsort(-feature_importance)
 
@@ -479,11 +430,12 @@ if __name__ == "__main__":
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 6. SMOTEENN 重采样 -----
-    print("正在进行 SMOTEENN 重采样 ...")
-    smoteenn = SMOTEENN(random_state=random_state)
-    X_resampled, y_resampled = smoteenn.fit_resample(X_train_full, y_train_full)
-    print(f"重采样后: X={X_resampled.shape}, 正类={y_resampled.sum()}, 负类={(y_resampled == 0).sum()}")
+    # ----- 6. 自定义重采样 (替换 SMOTEENN) -----
+    print(f"正在进行自定义重采样 (正类x{pos_resample_ratio}, 负类x{neg_resample_ratio}) ...")
+    X_resampled, y_resampled = custom_resample(X_train_full, y_train_full,
+                                               pos_ratio=pos_resample_ratio,
+                                               neg_ratio=neg_resample_ratio,
+                                               random_state=random_state)
 
     # ----- 7. 训练基模型 (改为 XGBoost) -----
     print("训练 XGBoost 基模型 ...")
@@ -545,20 +497,23 @@ if __name__ == "__main__":
         meta_clf.fit(X_resampled, y_resampled)
         print("未发现足够的误分类样本，使用全部重采样数据训练修正器")
 
-    # ----- 9. 阈值选择（Youden's J） -----
+    # ----- 9. 阈值选择（修改为 F1.2） -----
     # 使用新的预测函数
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
-    best_thresh = youden_threshold(y_holdout, holdout_probas)
+    # 关键修改: 使用 F1.2 阈值选择函数
+    best_thresh = f1_2_threshold(y_holdout, holdout_probas)
 
     y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
     recall = recall_score(y_holdout, y_pred_holdout, zero_division=0)
     auc = roc_auc_score(y_holdout, holdout_probas)
     precision = precision_score(y_holdout, y_pred_holdout, zero_division=0)
     f1 = f1_score(y_holdout, y_pred_holdout, zero_division=0)
+    # 计算最终的 F1.2 分数
+    f1_2_final = fbeta_score(y_holdout, y_pred_holdout, beta=1.2, zero_division=0)
     # 自定义评分公式 (注意：原注释中的系数总和不是100%，这里保持原样)
     final_score = 30 * recall + 50 * auc + 20 * precision
 
-    print(f"最佳阈值={best_thresh:.4f}, F1={f1:.4f}")
+    print(f"最佳阈值 (基于 F1.2)={best_thresh:.4f}, F1={f1:.4f}, F1.2={f1_2_final:.4f}")
     print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
 
     # ----- 10. 保存完整模型 -----
@@ -572,15 +527,7 @@ if __name__ == "__main__":
         "base_types": ["XGBoost"],  # 类型列表
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
-        # 保存 Focal Loss 和 KL 参数
-        "focal_alpha": focal_alpha,
-        "focal_gamma": focal_gamma,
-        "kl_beta": kl_beta,
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
-
