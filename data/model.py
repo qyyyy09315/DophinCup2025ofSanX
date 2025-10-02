@@ -9,7 +9,7 @@ from sklearn.feature_selection import VarianceThreshold, SelectFromModel
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression # 导入逻辑回归
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
@@ -299,11 +299,12 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 GaussianNB (Torch DNN 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> Custom Resample (Pos 1.4x, Neg 0.6x) -> XGBoost -> 级联 Logistic Regression (Torch DNN 特征权重)") # 修改打印信息
     print("-> DNN 不含自注意力机制，并利用 GPU (如果可用)，新增早停、学习率调度和进度条")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
     print("-> 已移除 SMOTEENN，使用自定义采样方法")
+    print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression") # 修改打印信息
     print("=" * 60)
 
     # ----- 配置 -----
@@ -484,7 +485,7 @@ if __name__ == "__main__":
     print("已训练基模型：XGBoost")
 
     # ----- 9. 训练级联修正器 -----
-    print("识别基模型误分类样本，训练级联修正器...")
+    print("识别基模型误分类样本，训练级联修正器 (使用带 L2 正则化的 Logistic Regression)...") # 修改打印信息
     # 使用新的预测方法，传入None作为meta_model
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
@@ -492,15 +493,18 @@ if __name__ == "__main__":
     misclassified_mask = (base_train_preds != y_resampled)
     X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
 
+    # 关键修改: 替换 GaussianNB 为 LogisticRegression
     if len(X_hard) > 0 and len(np.unique(y_hard)) > 1:  # 确保困难样本集中至少有两个类别
-        meta_clf = GaussianNB()
+        # meta_clf = GaussianNB()
+        meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state, max_iter=1000) # 使用 L2 正则化
         meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器训练完成，困难样本数={len(X_hard)}")
+        print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}") # 修改打印信息
     else:
         # 如果没有误分类样本或困难样本只属于一个类别，则使用全部重采样后的数据训练
-        meta_clf = GaussianNB()
+        # meta_clf = GaussianNB()
+        meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state, max_iter=1000) # 使用 L2 正则化
         meta_clf.fit(X_resampled, y_resampled)
-        print("未发现足够的误分类样本，使用全部重采样数据训练修正器")
+        print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)") # 修改打印信息
 
     # ----- 10. 阈值选择（修改为 F1.2） -----
     # 使用新的预测函数
@@ -531,12 +535,9 @@ if __name__ == "__main__":
         "selected_feature_names": selected_feature_names_final,  # 保存最终选择的特征名称
         "base_models": wrapped_xgb_model,  # 单一模型
         "base_types": ["XGBoost"],  # 类型列表
-        "meta_nb": meta_clf,
+        "meta_nb": meta_clf, # 键名保持不变，但内容已经是 LogisticRegression
         "threshold": float(best_thresh),
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
