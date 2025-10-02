@@ -143,6 +143,7 @@ if __name__ == "__main__":
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 新增关键修改: 在BRF前加入基于互信息(Mutual Information)的特征过滤")
     print("-> 关键修改: BRF特征选择使用动态的'median'策略")
+    print("-> 关键修改: XGBoost 使用 scale_pos_weight 处理样本不平衡")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -191,6 +192,7 @@ if __name__ == "__main__":
         # 启用 GPU (如果可用且配置了 GPU 支持的 XGBoost)
         'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist',
         'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
+        # 注意：scale_pos_weight 将在获取 y_all 后动态计算并添加
     }
 
     # ----- 1. 读取并预处理数据 -----
@@ -207,6 +209,12 @@ if __name__ == "__main__":
     initial_feature_names = data.drop(columns=["target"]).columns.tolist()
     y_all = data["target"].values
     print(f"加载数据: X={X_all.shape}, y={y_all.shape}, positive={y_all.sum()}, negative={(y_all == 0).sum()}")
+
+    # ---- 关键修改：计算并设置 XGBoost 的 scale_pos_weight ----
+    # 添加正样本权重参数
+    scale_pos_weight = np.sum(y_all == 0) / np.sum(y_all == 1)
+    xgb_params.update({'scale_pos_weight': scale_pos_weight})
+    print(f"XGBoost 参数已更新: scale_pos_weight = {scale_pos_weight:.2f}")
 
     # ---- 2. 特征过滤：移除低方差特征 ----
     print(f"应用方差过滤器 (阈值={variance_threshold_value}) ...")
@@ -395,6 +403,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
 
 
 
