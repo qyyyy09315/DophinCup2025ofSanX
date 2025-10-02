@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 
 # 导入 KNNImputer
-from sklearn.impute import KNNImputer # <-- 修改点1: 导入KNNImputer
+from sklearn.impute import KNNImputer  # <-- 修改点1: 导入KNNImputer
 from sklearn.feature_selection import VarianceThreshold, SelectFromModel, RFE
+# 导入交叉验证相关的工具
+from sklearn.model_selection import StratifiedKFold, cross_val_score  # <-- 新增导入用于交叉验证
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
@@ -16,14 +18,17 @@ from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+
+# import torch.nn as nn
+# import torch.optim as optim
+# from torch.utils.data import DataLoader, TensorDataset
+# from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
-torch.manual_seed(42)
+
+
+# torch.manual_seed(42) # 如果不使用PyTorch模型，可以注释掉
 
 
 def save_object(obj, filepath):
@@ -118,7 +123,8 @@ if __name__ == "__main__":
     print("-> 阈值调优方法已修改为 F1.2")
     print("-> 已移除 SMOTEENN，使用自定义采样方法")
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
-    print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)") # <-- 修改点2: 更新日志
+    print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")  # <-- 修改点2: 更新日志
+    print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")  # <-- 新增日志项
     print("=" * 60)
 
     # ----- 配置 -----
@@ -147,6 +153,7 @@ if __name__ == "__main__":
     pos_resample_ratio = 1.6
     neg_resample_ratio = 0.6
     num_features_to_select_brf = 90
+    cv_folds_for_rfe = 3  # <-- 新增配置项：用于RFE的交叉验证折数
 
     # XGBoost 超参
     xgb_params = {
@@ -157,8 +164,10 @@ if __name__ == "__main__":
         'eval_metric': 'logloss',
         'random_state': random_state,
         'n_jobs': -1,
-        'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist',
-        'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
+        # 'tree_method': 'gpu_hist' if torch.cuda.is_available() else 'hist', # 移除GPU依赖以简化示例
+        # 'predictor': 'gpu_predictor' if torch.cuda.is_available() else 'cpu_predictor'
+        'tree_method': 'hist',  # 默认CPU hist方法
+        'predictor': 'cpu_predictor'
     }
 
     # ----- 1. 读取并预处理数据 -----
@@ -186,7 +195,7 @@ if __name__ == "__main__":
     # ---- 3. 数据清洗与标准化 ----
     # 使用 KNNImputer 替代 SimpleImputer
     # imputer = SimpleImputer(strategy="mean") # <-- 修改点3a: 注释掉旧的均值填充
-    imputer = KNNImputer(n_neighbors=5) # <-- 修改点3b: 使用KNN填充
+    imputer = KNNImputer(n_neighbors=5)  # <-- 修改点3b: 使用KNN填充
     X_imputed = imputer.fit_transform(X_var_filtered)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_imputed)
@@ -207,26 +216,60 @@ if __name__ == "__main__":
 
     save_object(brf_selector, "./brf_feature_selector.pkl")
 
-    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE -----
-    print("使用 RFE (LogisticRegression L2) 获取特征排名并选择 Top 特征 ...")
+    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation-----
+    print("使用 RFE (LogisticRegression L2) 结合交叉验证获取特征排名并选择 Top 特征 ...")
     estimator_rfe = LogisticRegression(penalty='l2', C=0.1, solver='liblinear', random_state=random_state,
                                        max_iter=1000)
+
+    # 创建StratifiedKFold对象用于交叉验证
+    skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
+
+    # 初始化RFE对象（注意：这里我们暂时不确定最终要选多少特征，
+    # 因此先用一个较大的数字或默认行为，然后通过手动循环和CV分数决定）
+    # 或者我们可以直接指定最终想要的特征数量，并让RFE执行CV
+
+    # 方法一：如果想在RFE过程中就做CV筛选最优特征数（sklearn内置有限制），一种常见做法是：
+    # 先确定候选的特征数列表，然后对每个候选数跑一次RFE+CV，比较得分。
+    # 这里为了演示，在RFE设定好固定的目标特征数后进行CV评估其稳定性。
+
     rfe_num_features_to_select = int(top_percentile_to_select * X_brf_selected.shape[1])
     if rfe_num_features_to_select <= 0:
         rfe_num_features_to_select = 1
 
+    print(f"目标选定特征数: {rfe_num_features_to_select}")
+
+    # 直接运行带有固定步长和特征数的RFE
     selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
     selector_rfe.fit(X_brf_selected, y_all)
+
+    # --- 新增部分：在选定特征上进行交叉验证评分 ---
+    # 获取被选中的特征索引
+    selected_top_feature_indices = selector_rfe.support_
+    X_rfe_selected = X_brf_selected[:, selected_top_feature_indices]
+
+    # 对选出的特征子集做一个简单的交叉验证评分（例如AUC）
+    cv_scores = cross_val_score(estimator_rfe, X_rfe_selected, y_all, cv=skf_cv, scoring='roc_auc')
+    mean_cv_score = np.mean(cv_scores)
+    std_cv_score = np.std(cv_scores)
+    print(
+        f"RFE所选特征 ({rfe_num_features_to_select}个) 的交叉验证平均 AUC 得分: {mean_cv_score:.4f} (+/- {std_cv_score * 2:.4f})")
 
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
-    selected_top_feature_indices = np.where(feature_ranking == 1)[0]
+    # selected_top_feature_indices 已经从selector_rfe.support_获得
+    # selected_top_feature_indices = np.where(feature_ranking == 1)[0]
 
     X_selected = X_brf_selected[:, selected_top_feature_indices]
-    selected_feature_names_final = [selected_feature_names_brf[i] for i in selected_top_feature_indices]
+    selected_feature_names_final = [selected_feature_names_brf[i] for i in np.where(selected_top_feature_indices)[0]]
+    # 注意上面这行需要调整，因为selected_top_feature_indices现在是一个布尔数组
+    # 正确方式应该是找出True的位置对应的原始BRF特征索引
+    original_brf_indices_of_selected = np.where(selected_top_feature_indices)[0]  # BRFSelcted空间里的index
+    selected_feature_names_final = [selected_feature_names_brf[i] for i in original_brf_indices_of_selected]
+
     print(
-        f"RFE 特征加权完成，并选择了 Top {top_percentile_to_select * 100}% ({len(selected_top_feature_indices)}/{X_brf_selected.shape[1]}) 的特征.")
+        f"RFE 特征加权完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_brf_indices_of_selected)}/{X_brf_selected.shape[1]}) 的特征.")
+    print(f"这些特征在交叉验证(AUC)下的表现约为: {mean_cv_score:.4f}")
 
     save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
 
@@ -293,6 +336,16 @@ if __name__ == "__main__":
                                       max_iter=1000)
         meta_clf.fit(X_hard, y_hard)
         print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}")
+
+        # --- 新增部分：也可以对元模型做个简单的CV评估---
+        try:
+            meta_cv_scores = cross_val_score(meta_clf, X_hard, y_hard, cv=min(3, len(X_hard) // 2),
+                                             scoring='f1')  # 至少两折
+            meta_mean_cv_score = np.mean(meta_cv_scores)
+            print(f"Meta-model CV F1 Score on hard examples: {meta_mean_cv_score:.4f}")
+        except Exception as e:
+            print(f"无法计算 Meta-model 的 CV 分数: {e}")
+
     else:
         meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state,
                                       max_iter=1000)
@@ -330,7 +383,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
 
 
 
