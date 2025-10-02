@@ -71,51 +71,59 @@ def f1_2_threshold(y_true, probas):
     return best_t
 
 
-# --- WGAN-GP 相关定义 (含自适应注意力机制) ---
+# --- WGAN-GP 相关定义 (含自注意力机制) ---
 
-class AdaptiveAttention(nn.Module):
-    """自适应注意力模块"""
+class SelfAttention(nn.Module):
+    """自注意力模块"""
 
     def __init__(self, data_dim):
-        super(AdaptiveAttention, self).__init__()
+        super(SelfAttention, self).__init__()
         self.data_dim = data_dim
-        # 查询、键、值的线性变换
-        self.query = nn.Linear(data_dim, data_dim)
-        self.key = nn.Linear(data_dim, data_dim)
-        self.value = nn.Linear(data_dim, data_dim)
+        # 将每个特征维度视为长度为1的向量，方便计算注意力
+        self.feature_dim = 1
+        # 查询、键、值的线性变换 (这里可以扩展 feature_dim)
+        self.query = nn.Linear(self.feature_dim, self.feature_dim)
+        self.key = nn.Linear(self.feature_dim, self.feature_dim)
+        self.value = nn.Linear(self.feature_dim, self.feature_dim)
         # 缩放因子
-        self.scale = torch.sqrt(torch.FloatTensor([data_dim])).to(
+        self.scale = torch.sqrt(torch.FloatTensor([self.feature_dim])).to(
             torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        # 输出投影层 (可选，用于增加模型表达能力)
+        self.out_proj = nn.Linear(data_dim, data_dim)
+        # Layer Normalization
+        self.layer_norm = nn.LayerNorm(data_dim)
 
     def forward(self, x):
         # x shape: (batch_size, data_dim)
-        # Q, K, V shape: (batch_size, data_dim)
-        Q = self.query(x)
-        K = self.key(x)
-        V = self.value(x)
+        batch_size = x.size(0)
 
-        # 计算注意力分数 (batch_size, data_dim) x (data_dim, batch_size) -> (batch_size, batch_size)
-        # 为了简化，我们计算每个样本对自身的注意力，然后广播到所有特征
-        # 更标准的做法是处理序列数据，这里我们将其视为单步序列
-        # 我们将输入x扩展为(batch_size, 1, data_dim) 来模拟序列
-        x_seq = x.unsqueeze(1)  # (batch_size, 1, data_dim)
-        Q_seq = Q.unsqueeze(1)  # (batch_size, 1, data_dim)
-        K_seq = K.unsqueeze(1)  # (batch_size, 1, data_dim)
-        V_seq = V.unsqueeze(1)  # (batch_size, 1, data_dim)
+        # Reshape for attention: (batch_size, seq_len=data_dim, feat_dim=1)
+        x_reshaped = x.unsqueeze(-1)  # (batch_size, data_dim, 1)
 
-        # 注意力权重 (batch_size, 1, 1)
-        # 简化处理：计算整个样本的全局注意力权重
-        attention_weights = torch.matmul(Q_seq, K_seq.transpose(-2, -1)) / self.scale  # (batch_size, 1, 1)
-        attention_weights = torch.softmax(attention_weights, dim=-1)  # (batch_size, 1, 1)
+        # Linear transformations
+        Q = self.query(x_reshaped)  # (batch_size, data_dim, 1)
+        K = self.key(x_reshaped)  # (batch_size, data_dim, 1)
+        V = self.value(x_reshaped)  # (batch_size, data_dim, 1)
 
-        # 应用注意力权重到值 (batch_size, 1, data_dim)
-        attended_values = torch.matmul(attention_weights, V_seq)  # (batch_size, 1, data_dim)
+        # 计算注意力分数 (Q @ K^T) / sqrt(d_k)
+        # (batch_size, data_dim, 1) @ (batch_size, 1, data_dim) -> (batch_size, data_dim, data_dim)
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
-        # 压缩回 (batch_size, data_dim)
-        attended_values = attended_values.squeeze(1)  # (batch_size, data_dim)
+        # Softmax to get attention weights
+        attention_weights = torch.softmax(attention_scores, dim=-1)  # (batch_size, data_dim, data_dim)
 
-        # 残差连接和层归一化 (简化版，无层归一化)
-        out = x + attended_values
+        # Apply attention weights to values
+        # (batch_size, data_dim, data_dim) @ (batch_size, data_dim, 1) -> (batch_size, data_dim, 1)
+        attended_values = torch.matmul(attention_weights, V)
+
+        # Squeeze back to (batch_size, data_dim)
+        attended_values = attended_values.squeeze(-1)  # (batch_size, data_dim)
+
+        # Optional: Output projection
+        attended_values = self.out_proj(attended_values)
+
+        # 残差连接和层归一化
+        out = self.layer_norm(x + attended_values)
         return out
 
 
@@ -124,7 +132,7 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
         self.data_dim = data_dim
         # 注意力模块
-        self.attention = AdaptiveAttention(data_dim)
+        self.attention = SelfAttention(data_dim)
 
         self.model = nn.Sequential(
             nn.Linear(latent_dim, 128),
@@ -141,7 +149,7 @@ class Generator(nn.Module):
 
     def forward(self, z):
         raw_output = self.model(z)
-        # 应用自适应注意力
+        # 应用自注意力
         attended_output = self.attention(raw_output)
         return attended_output
 
@@ -151,7 +159,7 @@ class Critic(nn.Module):  # 判别器更名为Critic
         super(Critic, self).__init__()
         self.data_dim = data_dim
         # 注意力模块
-        self.attention = AdaptiveAttention(data_dim)
+        self.attention = SelfAttention(data_dim)
 
         self.model = nn.Sequential(
             nn.Linear(data_dim, 512),
@@ -165,7 +173,7 @@ class Critic(nn.Module):  # 判别器更名为Critic
         )
 
     def forward(self, data):
-        # 应用自适应注意力
+        # 应用自注意力
         attended_data = self.attention(data)
         output = self.model(attended_data)
         return output
@@ -304,15 +312,15 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
 
         # Print losses occasionally
         if (epoch + 1) % 100 == 0 or epoch == 0:
-             current_lr_g = optimizer_G.param_groups[0]['lr']
-             current_lr_c = optimizer_C.param_groups[0]['lr']
-             print(
-                 f"Epoch [{epoch + 1}/{epochs}], "
-                 f"C Loss: {loss_critic.item():.4f}, "
-                 f"GP: {gradient_penalty.item():.4f}, "
-                 f"G Loss: {g_loss.item():.4f}, "
-                 f"LR_G: {current_lr_g:.6f}, LR_C: {current_lr_c:.6f}"
-             )
+            current_lr_g = optimizer_G.param_groups[0]['lr']
+            current_lr_c = optimizer_C.param_groups[0]['lr']
+            print(
+                f"Epoch [{epoch + 1}/{epochs}], "
+                f"C Loss: {loss_critic.item():.4f}, "
+                f"GP: {gradient_penalty.item():.4f}, "
+                f"G Loss: {g_loss.item():.4f}, "
+                f"LR_G: {current_lr_g:.6f}, LR_C: {current_lr_c:.6f}"
+            )
 
     # 6. 生成新样本
     generator.eval()
@@ -334,7 +342,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自适应注意力+动态学习率) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
+        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
     print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
     print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
     print("-> 阈值调优方法已修改为 F1.2")
@@ -342,7 +350,8 @@ if __name__ == "__main__":
     print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)") # <-- 新增日志
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)")  # <-- 新增日志
+    print("-> 修改: AdaptiveAttention 改为 SelfAttention")  # <-- 新增日志
     print("=" * 60)
 
     # ----- 配置 -----
@@ -389,7 +398,7 @@ if __name__ == "__main__":
         'lambda_gp': 10,  # 梯度惩罚系数
         'n_critic': 5,  # 训练几次判别器才训练一次生成器
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'lr_decay_rate': 0.99 # 新增配置项
+        'lr_decay_rate': 0.99  # 新增配置项
     }
 
     # XGBoost 超参
@@ -496,7 +505,7 @@ if __name__ == "__main__":
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
     # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP (含自适应注意力+动态学习率) 过采样 ...")
+    print(f"正在进行 WGAN-GP (含自注意力+动态学习率) 过采样 ...")
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
     print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
@@ -606,7 +615,3 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
-
