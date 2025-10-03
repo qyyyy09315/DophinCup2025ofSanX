@@ -14,7 +14,8 @@ from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_sco
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import GradientBoostingClassifier # 导入 GBM
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.svm import SVC
 import xgboost as xgb
 
 import torch
@@ -102,7 +103,7 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
     # --- 修改结束 ---
 
     best_t, best_score = 0.5, -np.inf  # 初始值设为0.5，但最终会被搜索范围内的值覆盖
-    best_metrics = (0.0, 0.0, 0.0) # (recall, precision, specificity)
+    best_metrics = (0.0, 0.0, 0.0)  # (recall, precision, specificity)
 
     for t in thresholds:
         preds = (probas >= t).astype(int)
@@ -114,13 +115,13 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
             cm = confusion_matrix(y_true, preds)
             tn, fp, fn, tp = cm.ravel()
 
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0 # TPR, Sensitivity
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0  # TPR, Sensitivity
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0 # TNR
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0  # TNR
 
         except Exception as e:
-             print(f"警告: 计算指标时出错 (阈值={t}): {e}")
-             recall, precision, specificity = 0.0, 0.0, 0.0
+            print(f"警告: 计算指标时出错 (阈值={t}): {e}")
+            recall, precision, specificity = 0.0, 0.0, 0.0
 
         # 计算加权分数
         # 目标是最大化 Recall 和 Precision，最小化 (1 - Specificity) 即最大化 Specificity
@@ -131,7 +132,8 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
             best_metrics = (recall, precision, specificity)
 
     print(f"优化阈值搜索完成。最佳阈值: {best_t:.4f}, 最佳加权分数: {best_score:.4f}")
-    print(f"  对应指标: Recall={best_metrics[0]:.4f}, Precision={best_metrics[1]:.4f}, Specificity={best_metrics[2]:.4f}")
+    print(
+        f"  对应指标: Recall={best_metrics[0]:.4f}, Precision={best_metrics[1]:.4f}, Specificity={best_metrics[2]:.4f}")
     return best_t, best_score, best_metrics
 
 
@@ -461,6 +463,90 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     return resampled_X, resampled_y
 
 
+# ======== 异构修整器池 ========
+def evaluate_and_select_meta_models(X_hard, y_hard, X_holdout, y_holdout, base_model_probs_on_holdout):
+    """
+    训练多种类型的分类器作为元模型候选人，
+    并根据它们与基模型组合后的 F1.2 分数进行排序和筛选，
+    返回一个按性能排序的元模型列表。
+    """
+    print("\n--- 开始构建异构修整器池 ---")
+    candidates = []
+
+    # 候选模型定义
+    models_to_try = [
+        ("GBM", GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=43)),
+        ("RF", RandomForestClassifier(n_estimators=100, max_depth=5, random_state=43, n_jobs=-1)),
+        ("SVM", SVC(probability=True, kernel='rbf', C=1.0, gamma='scale', random_state=43)),
+        ("LogReg", LogisticRegression(penalty='l2', solver='liblinear', max_iter=1000, random_state=43))
+    ]
+
+    trained_models_info = []
+
+    for name, model in models_to_try:
+        try:
+            # 训练模型
+            model.fit(X_hard, y_hard)
+
+            # 在困难样本上做交叉验证评估其鲁棒性 (至少两折)
+            try:
+                cv_f1_macro = cross_val_score(model, X_hard, y_hard, cv=min(3, len(X_hard) // 2),
+                                              scoring='f1_macro').mean()
+            except:
+                cv_f1_macro = 0.5  # 默认值
+
+            # 在 Holdout 上评估其修正效果
+            # Cascade prediction logic applied manually here for evaluation purposes
+            corrected_probs = np.copy(base_model_probs_on_holdout)
+            mask_uncertain = (corrected_probs > 0.3) & (corrected_probs < 0.7)
+
+            if mask_uncertain.sum() > 0 and len(np.unique(y_hard)) > 1:
+                try:
+                    meta_probs = model.predict_proba(X_holdout[mask_uncertain])[:, 1]
+                    corrected_probs[mask_uncertain] = meta_probs
+
+                    # Find optimal threshold based on weighted metric using default weights for selection phase
+                    opt_thresh, _, _ = cost_sensitive_threshold(y_holdout, corrected_probs,
+                                                                recall_weight=1.0,
+                                                                precision_weight=1.0,
+                                                                specificity_weight=0.0)
+
+                    preds_opt_thresh = (corrected_probs >= opt_thresh).astype(int)
+                    f1_2 = fbeta_score(y_holdout, preds_opt_thresh, beta=1.2, zero_division=0)
+
+                    info_entry = {
+                        'name': name,
+                        'model_obj': model,
+                        'cv_f1_macro_on_hard': cv_f1_macro,
+                        'holdout_f1_2_after_correction': f1_2,
+                        'optimal_threshold_found': opt_thresh
+                    }
+                    trained_models_info.append(info_entry)
+                    print(
+                        f"{name}: Hard-sample CV F1 Macro={cv_f1_macro:.4f}, Holdout F1.2 after correction={f1_2:.4f}")
+
+                except Exception as inner_e:
+                    print(f"Error evaluating {name} during cascade simulation: {inner_e}")
+                    continue  # Skip this model if error occurs during holdout eval
+            else:
+                print(f"No sufficient hard examples or single class found; skipping full evaluation for {name}.")
+
+        except Exception as outer_e:
+            print(f"Failed to train or evaluate {name}: {outer_e}")
+
+    # Sort by descending order of holdout F1.2 performance
+    sorted_models = sorted(trained_models_info, key=lambda item: item['holdout_f1_2_after_correction'], reverse=True)
+
+    print("--- 异构修整器池构建完毕 ---")
+    if sorted_models:
+        top_performer_name = sorted_models[0]['name']
+        top_performance = sorted_models[0]['holdout_f1_2_after_correction']
+        print(
+            f"\nTop performing meta-model selected: '{top_performer_name}' with Holdout F1.2 Score = {top_performance:.4f}\n")
+
+    return sorted_models
+
+
 # ======== 以下为主程序入口及其它辅助函数，保持不变 ========
 # ===================================================================
 
@@ -473,14 +559,15 @@ if __name__ == "__main__":
     print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)") # <-- Updated log message
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)")  # <-- Updated log message
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")
     print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
     print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
-    print("-> 修改: 阈值选择改为优化正类权重的搜索") # <-- Updated log message
+    print("-> 修改: 阈值选择改为优化正类权重的搜索")  # <-- Updated log message
     print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
+    print("-> ***新增重大变更***: 构建异构修整器池，在其中挑选最适合的分类器")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -545,17 +632,17 @@ if __name__ == "__main__":
     # Meta Model (Cascade Corrector) GradientBoostingClassifier 超参
     # 使用 Sklearn 默认参数为基础，稍作调整
     meta_gbm_params = {
-        'n_estimators': 100,       # 较少迭代次数
+        'n_estimators': 100,  # 较少迭代次数
         'learning_rate': 0.1,
-        'max_depth': 3,           # 较浅防止过拟合
-        'subsample': 1.0,         # 不进行子采样
+        'max_depth': 3,  # 较浅防止过拟合
+        'subsample': 1.0,  # 不进行子采样
         'criterion': 'friedman_mse',
         'min_samples_split': 2,
         'min_samples_leaf': 1,
         'min_impurity_decrease': 0.0,
         'init': None,
-        'random_state': random_state + 1, # Different seed
-        'max_features': None,     # 使用所有特征
+        'random_state': random_state + 1,  # Different seed
+        'max_features': None,  # 使用所有特征
         'verbose': 0,
         'max_leaf_nodes': None,
         'warm_start': False,
@@ -565,13 +652,12 @@ if __name__ == "__main__":
         'ccp_alpha': 0.0
     }
 
-
     # 阈值搜索权重配置 (优化正类权重)
     # 示例：给 Recall 和 Precision 更高权重，给 Specificity 负权重（即惩罚高假阳性率）
     threshold_weights = {
-        'recall_weight': 2.0,       # 高权重：最大化正类召回率
-        'precision_weight': 1.5,    # 中等权重：提高正类预测准确率
-        'specificity_weight': 0.5   # 低权重：轻微惩罚负类误报（或设为0完全不考虑）
+        'recall_weight': 2.0,  # 高权重：最大化正类召回率
+        'precision_weight': 1.5,  # 中等权重：提高正类预测准确率
+        'specificity_weight': 0.5  # 低权重：轻微惩罚负类误报（或设为0完全不考虑）
     }
 
     # ----- 1. 读取并预处理数据 -----
@@ -696,7 +782,7 @@ if __name__ == "__main__":
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
     # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP (含自注意力+余弦退火学习率) 过采样 ...") # <-- Updated log message
+    print(f"正在进行 WGAN-GP (含自注意力+余弦退火学习率) 过采样 ...")  # <-- Updated log message
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
     print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
@@ -749,44 +835,56 @@ if __name__ == "__main__":
     print("已训练基模型：XGBoost")
 
     # ----- 9. 训练级联修正器 (现在也使用 GradientBoostingClassifier) -----
-    print("识别基模型误分类样本，训练级联修正器 (使用 GradientBoostingClassifier)...")
+    print("识别基模型误分类样本，准备训练异构修整器池...")
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
 
     misclassified_mask = (base_train_preds != y_resampled)
     X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
 
+    # Also get baseline predictions on holdout set before any meta-correction
+    _, holdout_probas_baseline = cascade_predict_single_model(wrapped_xgb_model, None, X_holdout, threshold=0.5)
+
+    pool_of_meta_models = []
+
     if len(X_hard) > 0 and len(np.unique(y_hard)) > 1:
 
-        # 使用 GradientBoostingClassifier 作为元模型
-        meta_clf = GradientBoostingClassifier(**meta_gbm_params)
-        meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器 (GradientBoostingClassifier) 训练完成，困难样本数={len(X_hard)}")
+        # Build heterogeneous pool
+        pool_of_meta_models = evaluate_and_select_meta_models(X_hard, y_hard, X_holdout, y_holdout,
+                                                              holdout_probas_baseline)
 
-        # --- 新增部分：也可以对元模型做个简单的CV评估---
-        try:
-            meta_cv_scores = cross_val_score(meta_clf, X_hard, y_hard, cv=min(3, len(X_hard) // 2),
-                                             scoring='f1')  # 至少两折
-            meta_mean_cv_score = np.mean(meta_cv_scores)
-            print(f"Meta-model CV F1 Score on hard examples: {meta_mean_cv_score:.4f}")
-        except Exception as e:
-            print(f"无法计算 Meta-model 的 CV 分数: {e}")
+        # Select best performer from the pool as the main one used later
+        if pool_of_meta_models:
+            best_meta_info = pool_of_meta_models[0]
+            meta_clf_chosen = best_meta_info['model_obj']
+
+            print(f"[INFO] Selected Top Performer Meta Model Type: {type(meta_clf_chosen).__name__}")
+        else:
+            # If no suitable meta model was built successfully, fall back to default behavior
+            print("[WARNING] No valid meta models were constructed properly.")
+            print("Falling back to training a simple GBM on all difficult cases.")
+            meta_clf_chosen = GradientBoostingClassifier(**meta_gbm_params)
+            meta_clf_chosen.fit(X_hard, y_hard)
 
     else:
         # 如果没有足够的困难样本，仍初始化一个默认的 GradientBoostingClassifier 模型以防万一
         print("未发现足够的误分类样本，但仍初始化默认的 GradientBoostingClassifier 修正器。")
-        meta_clf = GradientBoostingClassifier(**meta_gbm_params)
-        meta_clf.fit(X_resampled, y_resampled)  # Fit on all data
+        meta_clf_chosen = GradientBoostingClassifier(**meta_gbm_params)
+        meta_clf_chosen.fit(X_resampled, y_resampled)
 
-    # Save the meta model object directly instead of its internal booster
-    save_object(meta_clf, "./meta_model_gbm.pkl") # 保存路径也做了相应更改
+        # Save both individual chosen meta model AND entire pool metadata objects separately instead of its internal booster
+    save_object(meta_clf_chosen, "./meta_model_chosen.pkl")
+    save_object(pool_of_meta_models, "./heterogeneous_correctors_pool.pkl")  # Saving whole evaluated pool
+
+    print("已完成异构修整器池的选择过程。")
 
     # ----- 10. 阈值选择（修改为优化正类权重） -----
-    _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
+    _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf_chosen, X_holdout, threshold=0.5)
     # 使用修改后的阈值搜索函数
     # best_thresh = cost_sensitive_threshold(y_holdout, holdout_probas, **threshold_weights)
     # 修复：函数现在返回三个值
-    best_thresh, best_score, best_metrics_at_thresh = cost_sensitive_threshold(y_holdout, holdout_probas, **threshold_weights)
+    best_thresh, best_score, best_metrics_at_thresh = cost_sensitive_threshold(y_holdout, holdout_probas,
+                                                                               **threshold_weights)
     recall_at_best, precision_at_best, specificity_at_best = best_metrics_at_thresh
 
     y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
@@ -817,15 +915,13 @@ if __name__ == "__main__":
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
         "base_types": ["XGBoost"],
-        "meta_nb": meta_clf,  # Now stores an GradientBoostingClassifier instance
+        "meta_nb": meta_clf_chosen,
+        # Now stores an GradientBoostingClassifier instance OR other types depending on choice made above!
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
-        "threshold_weights": threshold_weights  # 保存阈值权重配置
+        "threshold_weights": threshold_weights,  # 保存阈值权重配置,
+        "pool_of_meta_models_metadata": pool_of_meta_models  # Store extra info about alternative correctors too!
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
-
