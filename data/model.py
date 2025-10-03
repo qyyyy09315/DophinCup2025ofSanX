@@ -13,8 +13,8 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.ensemble import GradientBoostingClassifier  # 导入 GBM
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier # 导入 GBM
 import xgboost as xgb
 
 import torch
@@ -330,10 +330,11 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, device):
     return gradient_penalty
 
 
+# === 主要修改点：在此处更新了学习率调度器 ===
 def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
-                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, lr_decay_rate=0.99):
+                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, T_max=None):
     """
-    使用 WGAN-GP 对少数类样本进行过采样，并加入动态学习率调度。
+    使用 WGAN-GP 对少数类样本进行过采样，并加入动态学习率调度 (余弦退火)。
     :param X_train: 训练特征 (numpy array)
     :param y_train: 训练标签 (numpy array)
     :param minority_class: 少数类的标签
@@ -344,10 +345,10 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     :param device: 'cpu' 或 'cuda'
     :param n_critic: 训练几次判别器才训练一次生成器
     :param lambda_gp: 梯度惩罚系数
-    :param lr_decay_rate: 学习率衰减率 (例如 0.99 表示每轮衰减1%)
+    :param T_max: CosineAnnealingLR 的周期参数 (默认为 epochs)
     :return: resampled_X, resampled_y (numpy arrays)
     """
-    print("开始 WGAN-GP 过采样...")
+    print("开始 WGAN-GP 过采样 (使用余弦退火学习率调度)...")
     # 1. 准备少数类数据
     X_minority = X_train[y_train == minority_class]
     if len(X_minority) == 0:
@@ -377,10 +378,12 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.9))
     optimizer_C = optim.Adam(critic.parameters(), lr=lr, betas=(0.5, 0.9))
 
-    # 4. 添加学习率调度器
-    scheduler_G = optim.lr_scheduler.ExponentialLR(optimizer_G, gamma=lr_decay_rate)
-    scheduler_C = optim.lr_scheduler.ExponentialLR(optimizer_C, gamma=lr_decay_rate)
-    print(f"启用 ExponentialLR 调度器, gamma={lr_decay_rate}")
+    # 4. 添加学习率调度器 (余弦退火)
+    if T_max is None:
+        T_max = epochs
+    scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=T_max, eta_min=1e-6)
+    scheduler_C = optim.lr_scheduler.CosineAnnealingLR(optimizer_C, T_max=T_max, eta_min=1e-6)
+    print(f"启用 CosineAnnealingLR 调度器, T_max={T_max}")
 
     # 5. 训练循环
     generator.train()
@@ -467,16 +470,19 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     return resampled_X, resampled_y
 
 
+# ======== 以下为主程序入口及其它辅助函数，保持不变 ========
+# ===================================================================
+
 if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Feature Interaction (Poly Features) -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 GradientBoostingClassifier")
+        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+余弦退火学习率) -> XGBoost -> 级联 GradientBoostingClassifier (原为 Logistic Regression)")
     print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
     print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)")
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)") # <-- Updated log message
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")
     print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
     print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
@@ -484,7 +490,6 @@ if __name__ == "__main__":
     print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
-    print("-> 新增关键步骤: 加入多项式特征交互 (degree=2)，然后应用特征选择保留最有价值组合")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -520,13 +525,8 @@ if __name__ == "__main__":
     variance_threshold_value = 0.0
     cv_folds_for_rfe = 3
     use_rfa = True  # <--- 新增配置项：是否使用 RFA
-    add_poly_features = True  # <--- 新增配置项：是否添加多项式特征
 
-    # Poly features config
-    poly_degree = 2
-    interaction_only = False  # 是否仅保留交互项而不包括平方项
-
-    # WGAN-GP 配置
+    # WGAN-GP 配置 (注意：lr_decay_rate 被移除，新增 T_max)
     wgangp_config = {
         'latent_dim': 100,
         'epochs': 300,  # 可根据需要调整
@@ -535,7 +535,7 @@ if __name__ == "__main__":
         'lambda_gp': 10,  # 梯度惩罚系数
         'n_critic': 5,  # 训练几次判别器才训练一次生成器
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'lr_decay_rate': 0.99  # 新增配置项
+        'T_max': None  # 默认为 epochs # <-- Changed parameter name and default value
     }
 
     # XGBoost 超参 (用于最终模型和RFE)
@@ -554,17 +554,17 @@ if __name__ == "__main__":
     # Meta Model (Cascade Corrector) GradientBoostingClassifier 超参
     # 使用 Sklearn 默认参数为基础，稍作调整
     meta_gbm_params = {
-        'n_estimators': 100,  # 较少迭代次数
+        'n_estimators': 100,       # 较少迭代次数
         'learning_rate': 0.1,
-        'max_depth': 3,  # 较浅防止过拟合
-        'subsample': 1.0,  # 不进行子采样
+        'max_depth': 3,           # 较浅防止过拟合
+        'subsample': 1.0,         # 不进行子采样
         'criterion': 'friedman_mse',
         'min_samples_split': 2,
         'min_samples_leaf': 1,
         'min_impurity_decrease': 0.0,
         'init': None,
-        'random_state': random_state + 1,  # Different seed
-        'max_features': None,  # 使用所有特征
+        'random_state': random_state + 1, # Different seed
+        'max_features': None,     # 使用所有特征
         'verbose': 0,
         'max_leaf_nodes': None,
         'warm_start': False,
@@ -573,6 +573,7 @@ if __name__ == "__main__":
         'tol': 1e-4,
         'ccp_alpha': 0.0
     }
+
 
     # 阈值搜索权重配置
     threshold_weights = {
@@ -607,60 +608,14 @@ if __name__ == "__main__":
     # 使用 KNNImputer 替代 SimpleImputer
     imputer = KNNImputer(n_neighbors=5)
     X_imputed = imputer.fit_transform(X_var_filtered)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_imputed)
 
-    # ---- 4. 特征工程：添加多项式特征交互 (新增步骤!) ----
-    if add_poly_features:
-        print(f"正在添加多项式特征交互 (Degree={poly_degree}, Interaction Only={interaction_only})...")
-
-        # 重要提示：必须在此处标准化后再进行多项式转换！否则会导致数值不稳定甚至溢出。
-        scaler_before_poly = StandardScaler()
-        X_scaled_for_poly = scaler_before_poly.fit_transform(X_imputed)
-
-        # 生成多项式特征
-        poly = PolynomialFeatures(degree=poly_degree, include_bias=False, interaction_only=interaction_only)
-        X_poly = poly.fit_transform(X_scaled_for_poly)
-
-        # 获取新的特征名称
-        original_feature_names_cleaned = [name.replace('[', '_').replace(']', '_').replace('<', '_').replace('>', '_')
-                                          for name in selected_feature_names_variance]
-        try:
-            poly_feature_names = poly.get_feature_names_out(input_features=original_feature_names_cleaned)
-        except AttributeError:
-            # For older versions of scikit-learn (< 1.0)
-            poly_feature_names = poly.get_feature_names(input_features=original_feature_names_cleaned)
-
-        print(f"添加多项式特征前维度: {X_scaled_for_poly.shape}, 添加后维度: {X_poly.shape}")
-
-        # 更新变量供后续步骤使用
-        X_ready_for_selection = X_poly
-        feature_names_after_poly = poly_feature_names
-
-        # 由于添加了大量特征，再次应用方差过滤是一个好主意
-        print("重新应用方差过滤器去除因多项式产生的常量特征...")
-        selector_variance_post_poly = VarianceThreshold(threshold=variance_threshold_value)
-        X_ready_for_selection = selector_variance_post_poly.fit_transform(X_ready_for_selection)
-        selected_indices_post_poly = selector_variance_post_poly.get_support(indices=True)
-        feature_names_after_poly_and_variance = [feature_names_after_poly[i] for i in selected_indices_post_poly]
-        print(f"二次方差过滤后特征数: {X_ready_for_selection.shape[1]}")
-
-    else:
-        # 如果不添加多项式特征，则跳过这一步
-        X_ready_for_selection = X_imputed
-        feature_names_after_poly_and_variance = selected_feature_names_variance
-
-    # ---- 5. 最终标准化 ----
-    scaler_final = StandardScaler()
-    X_scaled_final = scaler_final.fit_transform(X_ready_for_selection)
-
-    # 保存对象
     save_object(imputer, "./imputer.pkl")
-    save_object(scaler_final, "./scaler.pkl")
-    save_object(selector_variance, "./variance_selector_pre_poly.pkl")
-    if add_poly_features:
-        save_object(poly, "./poly_features.pkl")
-        save_object(selector_variance_post_poly, "./variance_selector_post_poly.pkl")
+    save_object(scaler, "./scaler.pkl")
+    save_object(selector_variance, "./variance_selector.pkl")
 
-    # ---- 6. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
+    # ---- 4. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
     print("使用 RFECV (XGBoost) 结合交叉验证自动选择最优特征数 ...")
 
     # 定义用于RFE的XGBoost估计器
@@ -671,19 +626,20 @@ if __name__ == "__main__":
 
     # 使用RFECV自动选择特征数
     selector_rfe = RFECV(estimator_rfe, step=5, cv=skf_cv, scoring='roc_auc', min_features_to_select=5)
-    selector_rfe.fit(X_scaled_final, y_all)
+    selector_rfe.fit(X_scaled, y_all)
 
     # --- 获取选定特征 ---
     selected_top_feature_indices = selector_rfe.support_
-    X_selected_after_rfe = X_scaled_final[:, selected_top_feature_indices]
+    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
 
     # --- 获取特征排名信息 ---
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
     # --- 准备最终使用的特征矩阵和名称 (RFE后) ---
+    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
     original_indices_of_selected = np.where(selected_top_feature_indices)[0]
-    selected_feature_names_final = [feature_names_after_poly_and_variance[i] for i in original_indices_of_selected]
+    selected_feature_names_final = [selected_feature_names_variance[i] for i in original_indices_of_selected]
 
     print(
         f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
@@ -741,14 +697,14 @@ if __name__ == "__main__":
 
     print(f"最终特征选择阶段完成，剩余特征数: {X_selected.shape[1]}")
 
-    # ----- 7. 划分训练/验证集 -----
+    # ----- 6. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
         X_selected, y_all, test_size=test_size, stratify=y_all, random_state=random_state
     )
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
-    # ----- 8. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP (含自注意力+动态学习率) 过采样 ...")
+    # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
+    print(f"正在进行 WGAN-GP (含自注意力+余弦退火学习率) 过采样 ...") # <-- Updated log message
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
     print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
@@ -761,7 +717,7 @@ if __name__ == "__main__":
         print(f"WGAN-GP采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
         X_resampled, y_resampled = X_train_full, y_train_full
 
-    # ----- 9. 训练基模型 (改为 XGBoost) -----
+    # ----- 8. 训练基模型 (改为 XGBoost) -----
     print("训练 XGBoost 基模型 ...")
     dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
     dval = xgb.DMatrix(X_holdout, label=y_holdout)
@@ -800,7 +756,7 @@ if __name__ == "__main__":
     save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
     print("已训练基模型：XGBoost")
 
-    # ----- 10. 训练级联修正器 (现在也使用 GradientBoostingClassifier) -----
+    # ----- 9. 训练级联修正器 (现在也使用 GradientBoostingClassifier) -----
     print("识别基模型误分类样本，训练级联修正器 (使用 GradientBoostingClassifier)...")
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
@@ -831,9 +787,9 @@ if __name__ == "__main__":
         meta_clf.fit(X_resampled, y_resampled)  # Fit on all data
 
     # Save the meta model object directly instead of its internal booster
-    save_object(meta_clf, "./meta_model_gbm.pkl")  # 保存路径也做了相应更改
+    save_object(meta_clf, "./meta_model_gbm.pkl") # 保存路径也做了相应更改
 
-    # ----- 11. 阈值选择（修改为代价敏感） -----
+    # ----- 10. 阈值选择（修改为代价敏感） -----
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
     # 使用修改后的阈值搜索函数
     best_thresh = cost_sensitive_threshold(y_holdout, holdout_probas, **threshold_weights)
@@ -858,14 +814,11 @@ if __name__ == "__main__":
     print(
         f"  最终加权分数 (Recall*{threshold_weights['recall_weight']} + AUC*{threshold_weights['auc_weight']} + Precision*{threshold_weights['precision_weight']}) = {final_score:.5f}")
 
-    # ----- 12. 保存完整模型 -----
+    # ----- 11. 保存完整模型 -----
     model_dict = {
         "imputer": imputer,
-        "scaler": scaler_final,  # 保存最后一步的标准化器
-        "variance_selector_pre_poly": selector_variance,  # 保存第一个方差筛选器
-        "add_poly_features": add_poly_features,  # 保存配置
-        "poly_features": poly if add_poly_features else None,  # 有条件地保存poly transformer
-        "variance_selector_post_poly": selector_variance_post_poly if add_poly_features else None,  # 有条件地保存第二个方差筛选器
+        "scaler": scaler,
+        "variance_selector": selector_variance,
         "tree_feature_ranking": ranked_idx_by_importance,  # 保留 RFE 排名
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
