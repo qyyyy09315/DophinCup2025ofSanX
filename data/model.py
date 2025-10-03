@@ -7,7 +7,7 @@ import pandas as pd
 
 # 导入 KNNImputer 和 特征选择工具
 from sklearn.impute import KNNImputer
-from sklearn.feature_selection import VarianceThreshold, RFE
+from sklearn.feature_selection import VarianceThreshold, RFECV
 # 导入交叉验证相关的工具
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
@@ -119,27 +119,20 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=30, auc_weight=50, pr
 
 
 # --- RFA (Recursive Feature Addition) 实现 ---
-def recursive_feature_addition(estimator, X, y, n_features_to_select=None, step=1, cv=None, scoring='roc_auc'):
+def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_features=5):
     """
-    递归特征添加 (RFA) 算法。
+    递归特征添加 (RFA) 算法，自动确定最优特征数量。
 
     :param estimator: 用于评估特征子集的 scikit-learn 估计器。
     :param X: 特征矩阵 (numpy array or pandas DataFrame)。
     :param y: 目标向量 (numpy array)。
-    :param n_features_to_select: 最终要选择的特征数量。如果为 None，则选择所有特征。
-    :param step: 每次迭代添加的特征数量。
     :param cv: 交叉验证策略 (例如 StratifiedKFold 对象)。
     :param scoring: 用于评估的指标 (例如 'roc_auc', 'f1')。
+    :param min_features: 最小特征数量。
     :return: selected_indices (被选中的特征索引), scores_history (每步的得分历史).
     """
     print("开始执行递归特征添加 (RFA)...")
     n_features = X.shape[1]
-
-    if n_features_to_select is None:
-        n_features_to_select = n_features
-    elif n_features_to_select > n_features:
-        raise ValueError(
-            f"n_features_to_select ({n_features_to_select}) cannot be larger than number of features ({n_features}).")
 
     if cv is None:
         cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
@@ -148,40 +141,34 @@ def recursive_feature_addition(estimator, X, y, n_features_to_select=None, step=
     remaining_indices = list(range(n_features))
     scores_history = []
 
-    # 初始得分 (没有特征时)
-    # 注意：大多数模型不能在没有特征的情况下训练，所以我们跳过初始得分计算
-    # 或者可以使用一个常数预测器来获得基线得分，这里简化处理
-
-    while len(selected_indices) < n_features_to_select:
+    while len(selected_indices) < n_features and len(selected_indices) < 50:  # 限制最大特征数
         scores_with_candidates = []
-        step_size = min(step, n_features_to_select - len(selected_indices))
 
-        if step_size == 1:
-            # 单步添加：评估每个候选特征
-            for i in remaining_indices:
-                candidate_indices = selected_indices + [i]
-                try:
-                    score = cross_val_score(estimator, X[:, candidate_indices], y, cv=cv, scoring=scoring).mean()
-                    scores_with_candidates.append((score, i))
-                except Exception as e:
-                    print(f"警告: 评估特征 {i} 时出错: {e}")
-                    scores_with_candidates.append((-np.inf, i))  # 给出极差得分
+        # 单步添加：评估每个候选特征
+        for i in remaining_indices:
+            candidate_indices = selected_indices + [i]
+            try:
+                score = cross_val_score(estimator, X[:, candidate_indices], y, cv=cv, scoring=scoring).mean()
+                scores_with_candidates.append((score, i))
+            except Exception as e:
+                print(f"警告: 评估特征 {i} 时出错: {e}")
+                scores_with_candidates.append((-np.inf, i))  # 给出极差得分
 
-            if not scores_with_candidates:
-                break
+        if not scores_with_candidates:
+            break
 
-            scores_with_candidates.sort(reverse=True)  # 降序排列
-            best_score, best_idx = scores_with_candidates[0]
-            selected_indices.append(best_idx)
-            remaining_indices.remove(best_idx)
-            scores_history.append(best_score)
-            print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
+        scores_with_candidates.sort(reverse=True)  # 降序排列
+        best_score, best_idx = scores_with_candidates[0]
 
-        else:
-            # 批量添加：评估所有可能的组合 (计算量大，不推荐用于大特征集)
-            # 这里简化处理，仅评估单个特征的增量
-            print("警告: RFA 批量添加 (step > 1) 当前未实现，将按 step=1 处理。")
-            continue
+        # 检查是否应该停止添加特征（基于性能改善）
+        if len(scores_history) > 0 and best_score <= max(scores_history) and len(selected_indices) >= min_features:
+            print(f"  性能不再提升，停止特征添加。最优特征数: {len(selected_indices)}")
+            break
+
+        selected_indices.append(best_idx)
+        remaining_indices.remove(best_idx)
+        scores_history.append(best_score)
+        print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
 
     print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
     return np.array(selected_indices), scores_history
@@ -501,10 +488,8 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0
-    top_percentile_to_select = 0.9  # 用于 RFE 选择 Top 90%
     cv_folds_for_rfe = 3
     use_rfa = True  # <--- 新增配置项：是否使用 RFA
-    num_features_to_select_rfa = 20  # <--- 新增配置项：RFA 选择的特征数
 
     # WGAN-GP 配置
     wgangp_config = {
@@ -572,7 +557,7 @@ if __name__ == "__main__":
     save_object(selector_variance, "./variance_selector.pkl")
 
     # ---- 4. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
-    print("使用 RFE (XGBoost) 结合交叉验证获取特征排名并选择 Top 特征 ...")
+    print("使用 RFECV (XGBoost) 结合交叉验证自动选择最优特征数 ...")
 
     # 定义用于RFE的XGBoost估计器
     estimator_rfe = xgb.XGBClassifier(**{k: v for k, v in xgb_params.items() if k != 'n_estimators'})
@@ -580,27 +565,13 @@ if __name__ == "__main__":
 
     skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
 
-    rfe_num_features_to_select = int(top_percentile_to_select * X_scaled.shape[1])
-    if rfe_num_features_to_select <= 0:
-        rfe_num_features_to_select = 1
-
-    print(f"目标选定特征数 (RFE): {rfe_num_features_to_select}")
-
-    selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
+    # 使用RFECV自动选择特征数
+    selector_rfe = RFECV(estimator_rfe, step=5, cv=skf_cv, scoring='roc_auc', min_features_to_select=5)
     selector_rfe.fit(X_scaled, y_all)
 
     # --- 获取选定特征 ---
     selected_top_feature_indices = selector_rfe.support_
     X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
-
-    # --- 在选定特征上进行交叉验证评分 ---
-    # 我们再次使用带有固定迭代次数的XGBoost来进行CV评估
-    temp_xgb_for_cv = xgb.XGBClassifier(**xgb_params)
-    cv_scores = cross_val_score(temp_xgb_for_cv, X_selected_after_rfe, y_all, cv=skf_cv, scoring='roc_auc')
-    mean_cv_score = np.mean(cv_scores)
-    std_cv_score = np.std(cv_scores)
-    print(
-        f"RFE所选特征 ({rfe_num_features_to_select}个) 的交叉验证平均 AUC 得分: {mean_cv_score:.4f} (+/- {std_cv_score * 2:.4f})")
 
     # --- 获取特征排名信息 ---
     feature_ranking = selector_rfe.ranking_
@@ -612,14 +583,15 @@ if __name__ == "__main__":
     selected_feature_names_final = [selected_feature_names_variance[i] for i in original_indices_of_selected]
 
     print(
-        f"RFE (XGBoost) 特征选择完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_indices_of_selected)}/{X_scaled.shape[1]}) 的特征.")
-    print(f"这些特征在交叉验证(AUC)下的表现约为: {mean_cv_score:.4f}")
+        f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
+    print(
+        f"这些特征在交叉验证(AUC)下的表现约为: {selector_rfe.cv_results_['mean_test_score'][selector_rfe.n_features_ - 1]:.4f}")
 
     save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
 
     # --- 新增: 递归特征添加 (RFA) ---
     if use_rfa:
-        print(f"启动 RFA 阶段，目标选择 {num_features_to_select_rfa} 个特征...")
+        print(f"启动 RFA 阶段，自动确定最优特征数...")
 
         # 使用 RFE 选出的特征作为 RFA 的输入
         X_input_for_rfa = X_selected_after_rfe
@@ -632,8 +604,6 @@ if __name__ == "__main__":
         try:
             selected_indices_rfa, rfa_scores_history = recursive_feature_addition(
                 estimator_rfa, X_input_for_rfa, y_all,
-                n_features_to_select=num_features_to_select_rfa,
-                step=1,
                 cv=StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state),
                 scoring='roc_auc'
             )
@@ -764,7 +734,8 @@ if __name__ == "__main__":
     print(f"使用该阈值的性能指标:")
     print(f"  Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}")
     print(f"  F1={f1:.4f}, F1.2={f1_2_final:.4f}")
-    print(f"  最终加权分数 (Recall*{threshold_weights['recall_weight']} + AUC*{threshold_weights['auc_weight']} + Precision*{threshold_weights['precision_weight']}) = {final_score:.5f}")
+    print(
+        f"  最终加权分数 (Recall*{threshold_weights['recall_weight']} + AUC*{threshold_weights['auc_weight']} + Precision*{threshold_weights['precision_weight']}) = {final_score:.5f}")
 
     # ----- 11. 保存完整模型 -----
     model_dict = {
@@ -778,13 +749,8 @@ if __name__ == "__main__":
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
-        "rfa_num_features": num_features_to_select_rfa if use_rfa else None,  # 保存配置
         "threshold_weights": threshold_weights  # 保存阈值权重配置
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
-
