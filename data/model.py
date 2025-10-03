@@ -7,14 +7,13 @@ import pandas as pd
 
 # 导入 KNNImputer 和 特征选择工具
 from sklearn.impute import KNNImputer
-from sklearn.feature_selection import VarianceThreshold, SelectFromModel, RFE
+from sklearn.feature_selection import VarianceThreshold, RFE
 # 导入交叉验证相关的工具
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
 import torch
@@ -69,6 +68,75 @@ def f1_2_threshold(y_true, probas):
         if f1_2 > best_f1_2:
             best_f1_2, best_t = f1_2, t
     return best_t
+
+
+# --- RFA (Recursive Feature Addition) 实现 ---
+def recursive_feature_addition(estimator, X, y, n_features_to_select=None, step=1, cv=None, scoring='roc_auc'):
+    """
+    递归特征添加 (RFA) 算法。
+
+    :param estimator: 用于评估特征子集的 scikit-learn 估计器。
+    :param X: 特征矩阵 (numpy array or pandas DataFrame)。
+    :param y: 目标向量 (numpy array)。
+    :param n_features_to_select: 最终要选择的特征数量。如果为 None，则选择所有特征。
+    :param step: 每次迭代添加的特征数量。
+    :param cv: 交叉验证策略 (例如 StratifiedKFold 对象)。
+    :param scoring: 用于评估的指标 (例如 'roc_auc', 'f1')。
+    :return: selected_indices (被选中的特征索引), scores_history (每步的得分历史).
+    """
+    print("开始执行递归特征添加 (RFA)...")
+    n_features = X.shape[1]
+
+    if n_features_to_select is None:
+        n_features_to_select = n_features
+    elif n_features_to_select > n_features:
+        raise ValueError(
+            f"n_features_to_select ({n_features_to_select}) cannot be larger than number of features ({n_features}).")
+
+    if cv is None:
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    selected_indices = []
+    remaining_indices = list(range(n_features))
+    scores_history = []
+
+    # 初始得分 (没有特征时)
+    # 注意：大多数模型不能在没有特征的情况下训练，所以我们跳过初始得分计算
+    # 或者可以使用一个常数预测器来获得基线得分，这里简化处理
+
+    while len(selected_indices) < n_features_to_select:
+        scores_with_candidates = []
+        step_size = min(step, n_features_to_select - len(selected_indices))
+
+        if step_size == 1:
+            # 单步添加：评估每个候选特征
+            for i in remaining_indices:
+                candidate_indices = selected_indices + [i]
+                try:
+                    score = cross_val_score(estimator, X[:, candidate_indices], y, cv=cv, scoring=scoring).mean()
+                    scores_with_candidates.append((score, i))
+                except Exception as e:
+                    print(f"警告: 评估特征 {i} 时出错: {e}")
+                    scores_with_candidates.append((-np.inf, i))  # 给出极差得分
+
+            if not scores_with_candidates:
+                break
+
+            scores_with_candidates.sort(reverse=True)  # 降序排列
+            best_score, best_idx = scores_with_candidates[0]
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+            scores_history.append(best_score)
+            print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
+
+        else:
+            # 批量添加：评估所有可能的组合 (计算量大，不推荐用于大特征集)
+            # 这里简化处理，仅评估单个特征的增量
+            print("警告: RFA 批量添加 (step > 1) 当前未实现，将按 step=1 处理。")
+            continue
+
+    print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
+    return np.array(selected_indices), scores_history
 
 
 # --- WGAN-GP 相关定义 (含自注意力机制) ---
@@ -342,17 +410,15 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> Balanced Random Forest (Select 80 features) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 Logistic Regression (Tree-based 特征权重)")
-    print("-> 已将 DNN 特征加权替换为 RFE (LogisticRegression L2)")
-    print("-> 新增按特征重要性排序后选取 Top 90% 的特征")
-    print("-> 阈值调优方法已修改为 F1.2")
-    print("-> 关键修改: 采样方法由 ADASYN 改为 WGAN-GP")  # <-- 更新日志
-    print("-> 关键修改: 级联修正器由 GaussianNB 改为带 L2 正则化的 LogisticRegression")
+        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 Logistic Regression")
+    print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
+    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)")  # <-- 新增日志
-    print("-> 修改: AdaptiveAttention 改为 SelfAttention")  # <-- 新增日志
-    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")  # <-- 新增/关键修改日志
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)")
+    print("-> 修改: AdaptiveAttention 改为 SelfAttention")
+    print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
+    print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -386,9 +452,10 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0
-    top_percentile_to_select = 0.9
-    num_features_to_select_brf = 90
+    top_percentile_to_select = 0.9  # 用于 RFE 选择 Top 90%
     cv_folds_for_rfe = 3
+    use_rfa = True  # <--- 新增配置项：是否使用 RFA
+    num_features_to_select_rfa = 20  # <--- 新增配置项：RFA 选择的特征数
 
     # WGAN-GP 配置
     wgangp_config = {
@@ -448,19 +515,7 @@ if __name__ == "__main__":
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")
 
-    # ---- 4. 平衡随机森林特征选择 ----
-    print(f"使用平衡随机森林进行特征选择，选择 {num_features_to_select_brf} 个特征...")
-    brf = RandomForestClassifier(n_estimators=300, random_state=random_state, n_jobs=-1,
-                                 class_weight='balanced')
-    brf_selector = SelectFromModel(brf, max_features=num_features_to_select_brf, threshold=-np.inf)
-    X_brf_selected = brf_selector.fit_transform(X_scaled, y_all)
-    selected_feature_indices_brf = brf_selector.get_support(indices=True)
-    selected_feature_names_brf = [selected_feature_names_variance[i] for i in selected_feature_indices_brf]
-    print(f"平衡随机森林特征选择完成，剩余特征数: {X_brf_selected.shape[1]}")
-
-    save_object(brf_selector, "./brf_feature_selector.pkl")
-
-    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
+    # ---- 4. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
     print("使用 RFE (XGBoost) 结合交叉验证获取特征排名并选择 Top 特征 ...")
 
     # 定义用于RFE的XGBoost估计器
@@ -469,23 +524,23 @@ if __name__ == "__main__":
 
     skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
 
-    rfe_num_features_to_select = int(top_percentile_to_select * X_brf_selected.shape[1])
+    rfe_num_features_to_select = int(top_percentile_to_select * X_scaled.shape[1])
     if rfe_num_features_to_select <= 0:
         rfe_num_features_to_select = 1
 
-    print(f"目标选定特征数: {rfe_num_features_to_select}")
+    print(f"目标选定特征数 (RFE): {rfe_num_features_to_select}")
 
     selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
-    selector_rfe.fit(X_brf_selected, y_all)
+    selector_rfe.fit(X_scaled, y_all)
 
     # --- 获取选定特征 ---
     selected_top_feature_indices = selector_rfe.support_
-    X_rfe_selected = X_brf_selected[:, selected_top_feature_indices]
+    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
 
     # --- 在选定特征上进行交叉验证评分 ---
     # 我们再次使用带有固定迭代次数的XGBoost来进行CV评估
     temp_xgb_for_cv = xgb.XGBClassifier(**xgb_params)
-    cv_scores = cross_val_score(temp_xgb_for_cv, X_rfe_selected, y_all, cv=skf_cv, scoring='roc_auc')
+    cv_scores = cross_val_score(temp_xgb_for_cv, X_selected_after_rfe, y_all, cv=skf_cv, scoring='roc_auc')
     mean_cv_score = np.mean(cv_scores)
     std_cv_score = np.std(cv_scores)
     print(
@@ -495,16 +550,55 @@ if __name__ == "__main__":
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
-    # --- 准备最终使用的特征矩阵和名称 ---
-    X_selected = X_brf_selected[:, selected_top_feature_indices]
-    original_brf_indices_of_selected = np.where(selected_top_feature_indices)[0]
-    selected_feature_names_final = [selected_feature_names_brf[i] for i in original_brf_indices_of_selected]
+    # --- 准备最终使用的特征矩阵和名称 (RFE后) ---
+    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
+    original_indices_of_selected = np.where(selected_top_feature_indices)[0]
+    selected_feature_names_final = [selected_feature_names_variance[i] for i in original_indices_of_selected]
 
     print(
-        f"RFE (XGBoost) 特征选择完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_brf_indices_of_selected)}/{X_brf_selected.shape[1]}) 的特征.")
+        f"RFE (XGBoost) 特征选择完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_indices_of_selected)}/{X_scaled.shape[1]}) 的特征.")
     print(f"这些特征在交叉验证(AUC)下的表现约为: {mean_cv_score:.4f}")
 
     save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
+
+    # --- 新增: 递归特征添加 (RFA) ---
+    if use_rfa:
+        print(f"启动 RFA 阶段，目标选择 {num_features_to_select_rfa} 个特征...")
+
+        # 使用 RFE 选出的特征作为 RFA 的输入
+        X_input_for_rfa = X_selected_after_rfe
+        feature_names_input_for_rfa = selected_feature_names_final
+
+        # 定义用于 RFA 的评估器 (可以与 RFE 不同)
+        estimator_rfa = xgb.XGBClassifier(**xgb_params)  # 使用相同的 XGBoost 参数
+
+        # 执行 RFA
+        try:
+            selected_indices_rfa, rfa_scores_history = recursive_feature_addition(
+                estimator_rfa, X_input_for_rfa, y_all,
+                n_features_to_select=num_features_to_select_rfa,
+                step=1,
+                cv=StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state),
+                scoring='roc_auc'
+            )
+
+            # 根据 RFA 结果更新最终特征
+            X_selected = X_input_for_rfa[:, selected_indices_rfa]
+            selected_feature_names_final = [feature_names_input_for_rfa[i] for i in selected_indices_rfa]
+
+            print(f"RFA 完成，最终选择了 {len(selected_feature_names_final)} 个特征。")
+            print("RFA 选择的特征列表:")
+            for name in selected_feature_names_final:
+                print(f"  - {name}")
+
+        except Exception as e:
+            print(f"RFA 过程中发生错误: {e}")
+            print("回退到 RFE 选择的特征。")
+            X_selected = X_selected_after_rfe  # 回退
+    else:
+        X_selected = X_selected_after_rfe
+
+    print(f"最终特征选择阶段完成，剩余特征数: {X_selected.shape[1]}")
 
     # ----- 6. 划分训练/验证集 -----
     X_train_full, X_holdout, y_train_full, y_holdout = train_test_split(
@@ -612,14 +706,19 @@ if __name__ == "__main__":
         "imputer": imputer,
         "scaler": scaler,
         "variance_selector": selector_variance,
-        "brf_feature_selector": brf_selector,
-        "tree_feature_ranking": ranked_idx_by_importance,
+        "tree_feature_ranking": ranked_idx_by_importance,  # 保留 RFE 排名
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
         "base_types": ["XGBoost"],
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
+        "use_rfa": use_rfa,  # 保存配置
+        "rfa_num_features": num_features_to_select_rfa if use_rfa else None  # 保存配置
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
+
+
+
