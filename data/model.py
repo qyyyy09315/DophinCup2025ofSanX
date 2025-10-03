@@ -7,7 +7,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+import xgboost as xgb
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.feature_selection import VarianceThreshold, RFECV
 # 导入 KNNImputer 和 特征选择工具
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression
@@ -26,17 +28,6 @@ try:
 except ImportError:
     print("Warning: gtda (giotto-tda) not found. Topological features will NOT be computed.")
     TOPOLOGY_AVAILABLE = False
-
-# --- 新增：尝试导入 imbalanced-learn ---
-try:
-    from imblearn.ensemble import BalancedRandomForestClassifier
-
-    IMBLEARN_AVAILABLE = True
-except ImportError:
-    print("Error: imblearn (imbalanced-learn) not found. BalancedRandomForestClassifier is required.")
-    IMBLEARN_AVAILABLE = False
-    # 如果没有这个库，脚本无法正常运行，提前退出是一个好主意
-    exit(1)
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -266,50 +257,25 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
         scores_with_candidates.sort(reverse=True)  # 降序排列
         best_score, best_idx = scores_with_candidates[0]
 
-        # === 加速 RFA 的关键修改点 ===
         # 检查是否应该停止添加特征（基于性能改善）
-        # 修改逻辑：即使没达到 min_features，只要连续两次没有提升就停止；或者达到 min_features 后不再提升也停止
-        improvement_found = False
-        if len(scores_history) > 0:
-            # 至少有一次记录才能比较
-            last_best_score = max(scores_history)
-            current_improvement = best_score - last_best_score
+        if len(scores_history) > 0 and best_score <= max(scores_history) and len(selected_indices) >= min_features:
+            print(f"  性能不再提升，停止特征添加。最优特征数: {len(selected_indices)}")
+            break
 
-            # 设定一个很小的 epsilon 作为改进阈值
-            epsilon = 1e-4
-            if current_improvement > epsilon:
-                improvement_found = True
+        selected_indices.append(best_idx)
+        remaining_indices.remove(best_idx)
+        scores_history.append(best_score)
+        print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
 
-        should_stop_early = False
-        if len(scores_history) >= 2:
-            # 检查最后两次是否有改进
-            prev_last_score = scores_history[-2]
-            last_score = scores_history[-1]
-            second_last_improvement = last_best_score - prev_last_score  # 上一轮的最佳相对于再上一轮
-            last_improvement = best_score - last_score  # 当前轮次的最佳相对于上一轮的实际选择结果
-
-            if second_last_improvement <= epsilon and last_improvement <= epsilon:
-                should_stop_early = True  # 连续两轮无显著改进
-
-    if (should_stop_early or (len(selected_indices) >= min_features and not improvement_found)):
-        print(f"  性能不再显著提升 (或满足早期停止条件)，停止特征添加。最优特征数: {len(selected_indices)}")
-        break
-    # === 修改结束 ===
-
-    selected_indices.append(best_idx)
-    remaining_indices.remove(best_idx)
-    scores_history.append(best_score)
-    print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
-
-
-print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
-return np.array(selected_indices), scores_history
+    print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
+    return np.array(selected_indices), scores_history
 
 
 # --- WGAN-GP 相关定义 (含自注意力机制) ---
 
 class SelfAttention(nn.Module):
     """自注意力模块"""
+
     def __init__(self, data_dim):
         super(SelfAttention, self).__init__()
         self.data_dim = data_dim
@@ -663,31 +629,24 @@ def evaluate_and_select_meta_models(X_hard, y_hard, X_holdout, y_holdout, base_m
 # ===================================================================
 
 if __name__ == "__main__":
-    # --- 新增检查 ---
-    if not IMBLEARN_AVAILABLE:
-        print("致命错误: 缺少必要的库 'imbalanced-learn'。请先安装它: pip install imbalanced-learn")
-        exit(1)
-    # --- 检查结束 ---
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> RFE (BalancedRandomForest) -> WGAN-GP (含自注意力+余弦退火学习率) -> BalancedRandomForest -> 级联 GradientBoostingClassifier")
+        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+余弦退火学习率) -> XGBoost -> 级联 GradientBoostingClassifier (原为 Logistic Regression)")
     print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
-    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 BalancedRandomForest")
+    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)")
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)")  # <-- Updated log message
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")
     print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
     print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
-    print("-> 修改: 阈值选择改为优化正类权重的搜索")
+    print("-> 修改: 阈值选择改为优化正类权重的搜索")  # <-- Updated log message
     print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
     print("-> ***新增重大变更***: 构建异构修整器池，在其中挑选最适合的分类器")
     print("-> ***新增重大变更***: 加入拓扑数据分析(TDA)特征提取模块")
-    print("-> ***核心变更***: 整个流程的核心模型全部替换为 BalancedRandomForest!")
-    print("-> ***性能优化***: 加速 RFA 过程 (减少CV折数和放宽停止条件)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -721,8 +680,7 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0
-    # === 核心修改点1: 加速 RFA ===
-    cv_folds_for_rfe = 2  # <--- 减少交叉验证折数以加速 RFA 和 RFE
+    cv_folds_for_rfe = 3
     use_rfa = True  # <--- 新增配置项：是否使用 RFA
     add_topological_features = True  # <--- 新增配置项：是否添加拓扑特征
 
@@ -741,16 +699,17 @@ if __name__ == "__main__":
         'T_max': None  # 默认为 epochs # <-- Changed parameter name and default value
     }
 
-    # === 核心修改点2: BRF 超参 (用于最终模型和RFE/RFA) ===
-    brf_params = {
-        'n_estimators': 100,
-        'max_depth': 5,
-        'min_samples_split': 2,
-        'min_samples_leaf': 1,
-        'sampling_strategy': 'auto',  # Handle imbalance internally
-        'replacement': False,
+    # XGBoost 超参 (用于最终模型和RFE)
+    xgb_params = {
+        'max_depth': 4,
+        'learning_rate': 0.1,
+        'n_estimators': 500,
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
         'random_state': random_state,
-        'n_jobs': -1
+        'n_jobs': -1,
+        'tree_method': 'hist',
+        'predictor': 'cpu_predictor'
     }
 
     # Meta Model (Cascade Corrector) GradientBoostingClassifier 超参
@@ -851,11 +810,12 @@ if __name__ == "__main__":
     # Update feature names list
     updated_feature_names = selected_feature_names_variance + topo_feature_names
 
-    # ---- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using BalancedRandomForest -----
-    print("使用 RFECV (BalancedRandomForest) 结合交叉验证自动选择最优特征数 ...")
+    # ---- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
+    print("使用 RFECV (XGBoost) 结合交叉验证自动选择最优特征数 ...")
 
-    # === 核心修改点3: 使用 BRF 作为 RFE 的估计器 ===
-    estimator_rfe = BalancedRandomForestClassifier(**brf_params)
+    # 定义用于RFE的XGBoost估计器
+    estimator_rfe = xgb.XGBClassifier(**{k: v for k, v in xgb_params.items() if k != 'n_estimators'})
+    # 注意：为了兼容RFE接口，我们不传入'n_estimators'到构造函数
 
     skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
 
@@ -876,7 +836,7 @@ if __name__ == "__main__":
     selected_feature_names_final = [updated_feature_names[i] for i in original_indices_of_selected]
 
     print(
-        f"RFE (BalancedRandomForest) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
+        f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
 
     # 修复索引错误：安全地访问cv_results_
     n_features_selected = selector_rfe.n_features_
@@ -902,8 +862,8 @@ if __name__ == "__main__":
         X_input_for_rfa = X_selected_after_rfe
         feature_names_input_for_rfa = selected_feature_names_final
 
-        # === 核心修改点4: 使用 BRF 作为 RFA 的评估器 ===
-        estimator_rfa = BalancedRandomForestClassifier(**brf_params)
+        # 定义用于 RFA 的评估器 (可以与 RFE 不同)
+        estimator_rfa = xgb.XGBClassifier(**xgb_params)  # 使用相同的 XGBoost 参数
 
         # 执行 RFA
         try:
@@ -938,7 +898,7 @@ if __name__ == "__main__":
     print(f"训练集: {X_train_full.shape}, 验证集: {X_holdout.shape}")
 
     # ----- 7. 过采样 (使用 WGAN-GP 替换 ADASYN/GAN) -----
-    print(f"正在进行 WGAN-GP (含自注意力+余弦退火学习率) 过采样 ...")
+    print(f"正在进行 WGAN-GP (含自注意力+余弦退火学习率) 过采样 ...")  # <-- Updated log message
     # 检查类别分布
     unique_classes, class_counts = np.unique(y_train_full, return_counts=True)
     print(f"WGAN-GP前训练集分布: {dict(zip(unique_classes, class_counts))}")
@@ -951,29 +911,55 @@ if __name__ == "__main__":
         print(f"WGAN-GP采样失败: {e}. 尝试使用原始不平衡数据继续训练。")
         X_resampled, y_resampled = X_train_full, y_train_full
 
-    # ----- 8. 训练基模型 (改为 BalancedRandomForest) -----
-    print("训练 BalancedRandomForest 基模型 ...")
+    # ----- 8. 训练基模型 (改为 XGBoost) -----
+    print("训练 XGBoost 基模型 ...")
+    dtrain_full = xgb.DMatrix(X_resampled, label=y_resampled)
+    dval = xgb.DMatrix(X_holdout, label=y_holdout)
 
-    # === 核心修改点5: 使用 BRF 作为最终模型 ===
-    brf_model = BalancedRandomForestClassifier(**brf_params)
-    brf_model.fit(X_resampled, y_resampled)
+    evals_result = {}
+    xgb_model = xgb.train(
+        xgb_params,
+        dtrain=dtrain_full,
+        num_boost_round=xgb_params['n_estimators'],
+        evals=[(dval, 'validation')],
+        early_stopping_rounds=50,
+        verbose_eval=False,
+        evals_result=evals_result
+    )
 
-    # === 核心修改点6: 包装 BRF 模型以适配现有接口 ===
-    # BRF 自带 predict_proba, 符合我们的预期
 
-    save_object(brf_model, "./base_model_brf.pkl")
-    print("已训练基模型：BalancedRandomForest")
+    class WrappedXGBModel:
+        def __init__(self, booster):
+            self.booster = booster
+
+        def predict_proba(self, X):
+            dmatrix = xgb.DMatrix(X)
+            probs = self.booster.predict(dmatrix)
+            # For binary classification, Booster returns probabilities for class 1.
+            # We need to stack them with 1-probs for class 0 to form [prob_0, prob_1].
+            return np.column_stack([1 - probs, probs])
+
+        def predict(self, X):
+            dmatrix = xgb.DMatrix(X)
+            probs = self.booster.predict(dmatrix)
+            return (probs > 0.5).astype(int)
+
+
+    wrapped_xgb_model = WrappedXGBModel(xgb_model)
+
+    save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
+    print("已训练基模型：XGBoost")
 
     # ----- 9. 训练级联修正器 (现在也使用 GradientBoostingClassifier) -----
     print("识别基模型误分类样本，准备训练异构修整器池...")
-    _, train_probas = cascade_predict_single_model(brf_model, None, X_resampled, threshold=0.5)
+    _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
 
     misclassified_mask = (base_train_preds != y_resampled)
     X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
 
     # Also get baseline predictions on holdout set before any meta-correction
-    _, holdout_probas_baseline = cascade_predict_single_model(brf_model, None, X_holdout, threshold=0.5)
+    _, holdout_probas_baseline = cascade_predict_single_model(wrapped_xgb_model, None, X_holdout, threshold=0.5)
 
     pool_of_meta_models = []
 
@@ -1009,7 +995,7 @@ if __name__ == "__main__":
     print("已完成异构修整器池的选择过程。")
 
     # ----- 10. 阈值选择（修改为优化正类权重） -----
-    _, holdout_probas = cascade_predict_single_model(brf_model, meta_clf_chosen, X_holdout, threshold=0.5)
+    _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf_chosen, X_holdout, threshold=0.5)
     # 使用修改后的阈值搜索函数
     # best_thresh = cost_sensitive_threshold(y_holdout, holdout_probas, **threshold_weights)
     # 修复：函数现在返回三个值
@@ -1043,8 +1029,8 @@ if __name__ == "__main__":
         "variance_selector": selector_variance,
         "tree_feature_ranking": ranked_idx_by_importance,  # 保留 RFE 排名
         "selected_feature_names": selected_feature_names_final,
-        "base_models": brf_model,  # <--- 存储 BRF 模型实例
-        "base_types": ["BalancedRandomForest"],  # <--- 更新类型标识
+        "base_models": wrapped_xgb_model,
+        "base_types": ["XGBoost"],
         "meta_nb": meta_clf_chosen,
         # Now stores an GradientBoostingClassifier instance OR other types depending on choice made above!
         "threshold": float(best_thresh),
