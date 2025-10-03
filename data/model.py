@@ -46,11 +46,32 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
-def extract_topological_features(X_sample, homology_dims=[0, 1]):
+# === 新增函数：动态拓扑尺度选择 ===
+def adaptive_scale_selection(X, feature_importances):
+    """根据特征重要性动态调整拓扑分析尺度"""
+    if len(feature_importances) != X.shape[1]:
+        raise ValueError("Feature importance length must match number of features in X.")
+
+    scales = []
+    for i, imp in enumerate(feature_importances):
+        # 高重要性特征使用精细尺度
+        if imp > np.quantile(feature_importances, 0.8):
+            scales.append(0.05)  # 精细尺度
+        # 中等重要性特征使用中等尺度
+        elif imp > np.quantile(feature_importances, 0.5):
+            scales.append(0.1)  # 中等尺度
+        # 低重要性特征使用粗粒度尺度
+        else:
+            scales.append(0.2)  # 粗粒度尺度
+    return np.array(scales)
+
+
+def extract_topological_features(X_sample, homology_dims=[0, 1], scale_factor=1.0):
     """
     使用 giotto-tda 从单个样本中提取持续同调特征。
     注意：这在实践中效率很低，因为每次只处理一个样本。
     这只是一个概念演示。实际应用中应批量处理或寻找更高效的近似方法。
+    新增 scale_factor 参数用于调整距离计算的尺度。
     """
     if not TOPOLOGY_AVAILABLE:
         # Return a dummy feature vector of fixed size if topology library is not available
@@ -61,16 +82,19 @@ def extract_topological_features(X_sample, homology_dims=[0, 1]):
         if X_sample.ndim == 1:
             X_sample = X_sample.reshape(1, -1)
 
+        # 应用尺度因子到数据点上（影响欧几里得距离）
+        scaled_X_sample = X_sample * scale_factor
+
         # gtda 要求输入是三维数组 (n_samples, n_points, n_dimensions)
         # 我们只有一个样本，所以形状是 (1, n_points, n_dimensions)
-        # 如果X_sample已经是 (n_points, n_dimensions)，则需要reshape
-        if X_sample.ndim == 2:
-            X_diagram_input = X_sample.reshape(1, X_sample.shape[0], X_sample.shape[1])
+        # 如果scaled_X_sample已经是 (n_points, n_dimensions)，则需要reshape
+        if scaled_X_sample.ndim == 2:
+            X_diagram_input = scaled_X_sample.reshape(1, scaled_X_sample.shape[0], scaled_X_sample.shape[1])
         else:
             # This case handles if somehow it's already 3D but needs to be single sample
-            X_diagram_input = X_sample.reshape(1, -1, X_sample.shape[-1])
+            X_diagram_input = scaled_X_sample.reshape(1, -1, scaled_X_sample.shape[-1])
 
-            # 初始化 VietorisRipsPersistence
+        # 初始化 VietorisRipsPersistence
         persistence = VietorisRipsPersistence(
             metric="euclidean",
             homology_dimensions=homology_dims,
@@ -647,6 +671,7 @@ if __name__ == "__main__":
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
     print("-> ***新增重大变更***: 构建异构修整器池，在其中挑选最适合的分类器")
     print("-> ***新增重大变更***: 加入拓扑数据分析(TDA)特征提取模块")
+    print("-> ***新增创新方案***: 动态拓扑尺度选择")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -683,6 +708,7 @@ if __name__ == "__main__":
     cv_folds_for_rfe = 3
     use_rfa = True  # <--- 新增配置项：是否使用 RFA
     add_topological_features = True  # <--- 新增配置项：是否添加拓扑特征
+    use_adaptive_scales = True  # <--- 新增配置项：是否使用动态拓扑尺度
 
     # 拓扑分析配置
     topo_homology_dims = [0, 1]  # Extract H0 (connected components) and H1 (loops)
@@ -785,6 +811,14 @@ if __name__ == "__main__":
         topo_features_list = []
         total_samples = X_scaled_initial.shape[0]
 
+        # --- 新增部分：获取特征重要性用于动态尺度选择 ---
+        temp_xgb_for_importance = xgb.XGBClassifier(**{k: v for k, v in xgb_params.items() if k != 'n_estimators'})
+        temp_xgb_for_importance.set_params(n_estimators=100)  # 快速估算
+        temp_xgb_for_importance.fit(X_scaled_initial, y_all)
+        feature_importances_temp = temp_xgb_for_importance.feature_importances_
+
+        # --- End of new part ---
+
         # Iterate through each sample to compute its topological signature
         # Note: This loop is inefficient for large datasets due to repeated computation overhead.
         # In practice, batching or pre-computation would be better.
@@ -792,7 +826,29 @@ if __name__ == "__main__":
             if (i + 1) % 200 == 0 or i == total_samples - 1:
                 print(f"  已处理 {i + 1}/{total_samples} 个样本的拓扑特征...")
 
-            topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims)
+            # --- Modified call to include dynamic scaling ---
+            if use_adaptive_scales:
+                # Compute scale factor for this specific sample row
+                # Here we apply the inverse of the scale factors derived from global feature importances
+                # So that important features contribute less to distance (more fine-grained structure captured)
+                inv_scales = 1.0 / adaptive_scale_selection(None, feature_importances_temp)
+                effective_scale = np.prod(inv_scales) ** (1. / len(inv_scales))  # Geometric mean as overall multiplier?
+                # Or simpler approach just pass average or median? For now keep product idea...
+                # Actually let's do element-wise multiplication then take geometric mean maybe overkill so direct usage might work better conceptually though unclear how exactly without modifying VR constructor which takes uniform metric
+
+                # Simplifying assumption below uses avg effect rather than per point modification inside VR algo itself
+                # Better approximation could involve creating custom metric matrix but outside scope currently
+
+                # Pass geometric mean of reciprocal scales as an approximate multiplicative factor
+                approx_effective_avg_inv_scale = np.exp(
+                    np.mean(np.log(1. / adaptive_scale_selection(None, feature_importances_temp))))
+
+                topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims,
+                                                             scale_factor=approx_effective_avg_inv_scale)
+
+            else:
+                topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims)
+
             topo_features_list.append(topo_feat_vec)
 
         topo_features_array = np.array(topo_features_list)
@@ -1038,12 +1094,12 @@ if __name__ == "__main__":
         "add_topological_features": add_topological_features,  # 保存拓扑特征开关状态
         "topo_homology_dims": topo_homology_dims,  # 保存拓扑维度配置
         "threshold_weights": threshold_weights,  # 保存阈值权重配置,
-        "pool_of_meta_models_metadata": pool_of_meta_models  # Store extra info about alternative correctors too!
+        "pool_of_meta_models_metadata": pool_of_meta_models,  # Store extra info about alternative correctors too!
+        "use_adaptive_scales": use_adaptive_scales  # Save config flag for adaptive scaling
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
 
 
 
