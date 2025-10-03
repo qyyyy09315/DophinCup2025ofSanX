@@ -41,22 +41,41 @@ def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
     try:
         probas_base = base_model.predict_proba(X)[:, 1]
     except Exception:
-        probas_base = base_model.predict(X).astype(float)
+        # 如果基模型不支持 predict_proba，则尝试直接预测概率形式（不太常见）
+        # 或者假设输出就是概率（对于某些模型包装器）
+        # 这里简化处理，假定返回的是决策函数或类似分数，并手动 sigmoid 化
+        # 但 safest way 是要求模型有 predict_proba 方法
+        # fallback to predict if necessary and treat as probability-like
+        pred_or_score = base_model.predict(X)
+        if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
+            probas_base = np.clip(pred_or_score.flatten(), 0, 1)
+        else:
+            probas_base = pred_or_score[:, 1]
 
     preds = (probas_base >= threshold).astype(int)
     uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
 
     if meta_model is not None and uncertain_mask.sum() > 0:
-        meta_preds = meta_model.predict(X[uncertain_mask])
-        preds[uncertain_mask] = meta_preds
+        # Check if meta_model has predict_proba method for consistency
+        if hasattr(meta_model, 'predict_proba'):
+            try:
+                meta_probas = meta_model.predict_proba(X[uncertain_mask])[:, 1]
+                meta_preds = (meta_probas >= 0.5).astype(int)
+            except:
+                meta_preds = meta_model.predict(X[uncertain_mask])
+        else:
+            meta_preds = meta_model.predict(X[uncertain_mask])
+
+        preds[uncertain_mask] = meta_preds.astype(int)  # Ensure type match
 
     return preds, probas_base
 
 
-# --- 修改后的阈值搜索函数 ---
+# --- 修改后的阈值搜索函数 (限制阈值范围) ---
 def cost_sensitive_threshold(y_true, probas, recall_weight=30, auc_weight=50, precision_weight=20):
     """
     使用自定义加权分数 (FinalScore = w1*Recall + w2*AUC + w3*Precision) 进行代价敏感阈值搜索。
+    阈值搜索范围被限制在 [0.2, 0.8]。
 
     注意: AUC 是一个全局指标，不依赖于单一阈值。为了使其适应阈值搜索，
     我们在这里计算的是使用当前阈值 `t` 得到的预测结果 `preds` 时的 AUC。
@@ -80,8 +99,14 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=30, auc_weight=50, pr
     Returns:
         best_t: 最佳阈值。
     """
-    print(f"开始代价敏感阈值搜索 (权重: Recall={recall_weight}, AUC={auc_weight}, Precision={precision_weight})...")
-    thresholds = np.linspace(0, 1, 101)
+    # --- 修改点：限制阈值搜索范围 ---
+    min_threshold = 0.2
+    max_threshold = 0.8
+    thresholds = np.linspace(min_threshold, max_threshold, 101)
+    print(
+        f"开始代价敏感阈值搜索 (范围: [{min_threshold}, {max_threshold}], 权重: Recall={recall_weight}, AUC={auc_weight}, Precision={precision_weight})...")
+    # --- 修改结束 ---
+
     # 预先计算全局 AUC，因为它不依赖于阈值
     try:
         global_auc = roc_auc_score(y_true, probas)
@@ -89,7 +114,7 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=30, auc_weight=50, pr
         print("警告: 无法计算全局 AUC，设置为 0.5")
         global_auc = 0.5
 
-    best_t, best_score = 0.5, -np.inf
+    best_t, best_score = 0.5, -np.inf  # 初始值设为0.5，但最终会被搜索范围内的值覆盖
 
     for t in thresholds:
         preds = (probas >= t).astype(int)
@@ -445,7 +470,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 Logistic Regression")
+        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 XGBoost (原为 Logistic Regression)")
     print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
     print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
@@ -455,6 +480,8 @@ if __name__ == "__main__":
     print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
     print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
     print("-> 修改: 阈值选择改为基于加权分数 (Recall, AUC, Precision) 的代价敏感搜索")
+    print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
+    print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -511,6 +538,19 @@ if __name__ == "__main__":
         'objective': 'binary:logistic',
         'eval_metric': 'logloss',
         'random_state': random_state,
+        'n_jobs': -1,
+        'tree_method': 'hist',
+        'predictor': 'cpu_predictor'
+    }
+
+    # Meta Model (Cascade Corrector) XGBoost 超参
+    meta_xgb_params = {
+        'max_depth': 3,  # 较浅防止过拟合
+        'learning_rate': 0.1,
+        'n_estimators': 100,  # 较少迭代次数
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
+        'random_state': random_state + 1,  # Different seed
         'n_jobs': -1,
         'tree_method': 'hist',
         'predictor': 'cpu_predictor'
@@ -682,7 +722,9 @@ if __name__ == "__main__":
         def predict_proba(self, X):
             dmatrix = xgb.DMatrix(X)
             probs = self.booster.predict(dmatrix)
-            return np.vstack([1 - probs, probs]).T
+            # For binary classification, Booster returns probabilities for class 1.
+            # We need to stack them with 1-probs for class 0 to form [prob_0, prob_1].
+            return np.column_stack([1 - probs, probs])
 
         def predict(self, X):
             dmatrix = xgb.DMatrix(X)
@@ -695,8 +737,8 @@ if __name__ == "__main__":
     save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
     print("已训练基模型：XGBoost")
 
-    # ----- 9. 训练级联修正器 -----
-    print("识别基模型误分类样本，训练级联修正器 (使用带 L2 正则化的 Logistic Regression)...")
+    # ----- 9. 训练级联修正器 (现在也使用 XGBoost) -----
+    print("识别基模型误分类样本，训练级联修正器 (使用 XGBoost)...")
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
 
@@ -704,10 +746,11 @@ if __name__ == "__main__":
     X_hard, y_hard = X_resampled[misclassified_mask], y_resampled[misclassified_mask]
 
     if len(X_hard) > 0 and len(np.unique(y_hard)) > 1:
-        meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state,
-                                      max_iter=1000)
+
+        # 使用 XGBoost 作为元模型
+        meta_clf = xgb.XGBClassifier(**meta_xgb_params)
         meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器 (Logistic Regression) 训练完成，困难样本数={len(X_hard)}")
+        print(f"级联修正器 (XGBoost) 训练完成，困难样本数={len(X_hard)}")
 
         # --- 新增部分：也可以对元模型做个简单的CV评估---
         try:
@@ -719,10 +762,13 @@ if __name__ == "__main__":
             print(f"无法计算 Meta-model 的 CV 分数: {e}")
 
     else:
-        meta_clf = LogisticRegression(penalty='l2', C=1.0, solver='liblinear', random_state=random_state,
-                                      max_iter=1000)
-        meta_clf.fit(X_resampled, y_resampled)
-        print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)")
+        # 如果没有足够的困难样本，仍初始化一个默认的 XGBoost 模型以防万一
+        print("未发现足够的误分类样本，但仍初始化默认的 XGBoost 修正器。")
+        meta_clf = xgb.XGBClassifier(**meta_xgb_params)
+        meta_clf.fit(X_resampled, y_resampled)  # Fit on all data
+
+    # Save the meta model object directly instead of its internal booster
+    save_object(meta_clf, "./meta_model_xgboost.pkl")
 
     # ----- 10. 阈值选择（修改为代价敏感） -----
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
@@ -758,7 +804,7 @@ if __name__ == "__main__":
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
         "base_types": ["XGBoost"],
-        "meta_nb": meta_clf,
+        "meta_nb": meta_clf,  # Now stores an XGBClassifier instance
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
         "threshold_weights": threshold_weights  # 保存阈值权重配置
@@ -766,6 +812,7 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
 
 
 
