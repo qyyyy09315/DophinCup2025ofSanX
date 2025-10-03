@@ -1,3 +1,4 @@
+from sklearn.feature_selection import VarianceThreshold
 import os
 import pickle
 import warnings
@@ -9,7 +10,6 @@ import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
-from sklearn.feature_selection import VarianceThreshold, RFECV
 # 导入 KNNImputer 和 特征选择工具
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression
@@ -46,10 +46,11 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
-# === 修改后的函数：动态拓扑尺度选择 ===
-def adaptive_scale_selection(feature_importances):
+# === 新增函数：动态拓扑尺度选择 ===
+def adaptive_scale_selection(X, feature_importances):
     """根据特征重要性动态调整拓扑分析尺度"""
-    # 移除了对 X 的依赖
+    if len(feature_importances) != X.shape[1]:
+        raise ValueError("Feature importance length must match number of features in X.")
 
     scales = []
     for i, imp in enumerate(feature_importances):
@@ -242,6 +243,7 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
 def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_features=5):
     """
     递归特征添加 (RFA) 算法，自动确定最优特征数量。
+    修改后：这是唯一的特征选择步骤。
 
     :param estimator: 用于评估特征子集的 scikit-learn 估计器。
     :param X: 特征矩阵 (numpy array or pandas DataFrame)。
@@ -250,6 +252,7 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
     :param scoring: 用于评估的指标 (例如 'roc_auc', 'f1')。
     :param min_features: 最小特征数量。
     :return: selected_indices (被选中的特征索引), scores_history (每步的得分历史).
+             返回所有原始特征的排名信息 ranking_info (numpy array where higher rank means less important).
     """
     print("开始执行递归特征添加 (RFA)...")
     n_features = X.shape[1]
@@ -260,6 +263,9 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
     selected_indices = []
     remaining_indices = list(range(n_features))
     scores_history = []
+
+    # Track rankings for all features
+    ranking_info = np.full(n_features, fill_value=n_features)  # Initialize with worst possible rank
 
     while len(selected_indices) < n_features and len(selected_indices) < 50:  # 限制最大特征数
         scores_with_candidates = []
@@ -287,11 +293,20 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
 
         selected_indices.append(best_idx)
         remaining_indices.remove(best_idx)
+
+        # Assign current rank to the newly added feature (lower rank = more important)
+        ranking_info[best_idx] = len(selected_indices)
+
         scores_history.append(best_score)
-        print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f})")
+        print(f"  添加特征索引 {best_idx} (得分: {best_score:.4f}), 当前排名: {ranking_info[best_idx]}")
+
+    # Remaining unselected features get assigned their relative ranks within themselves
+    remaining_rank_counter = len(selected_indices) + 1
+    for idx_in_remaining, original_idx in enumerate(sorted(remaining_indices)):
+        ranking_info[original_idx] = remaining_rank_counter + idx_in_remaining
 
     print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
-    return np.array(selected_indices), scores_history
+    return np.array(selected_indices), scores_history, ranking_info
 
 
 # --- WGAN-GP 相关定义 (含自注意力机制) ---
@@ -302,7 +317,7 @@ class SelfAttention(nn.Module):
     def __init__(self, data_dim):
         super(SelfAttention, self).__init__()
         self.data_dim = data_dim
-        # 将每个特征维度视为长度为1的向量，方便计算注意力
+        # 注意力模块
         self.feature_dim = 1
         # 查询、键、值的线性变换 (这里可以扩展 feature_dim)
         self.query = nn.Linear(self.feature_dim, self.feature_dim)
@@ -653,18 +668,16 @@ def evaluate_and_select_meta_models(X_hard, y_hard, X_holdout, y_holdout, base_m
 
 if __name__ == "__main__":
 
+    # ===================== 主要修改区域开始 =====================
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+余弦退火学习率) -> XGBoost -> 级联 GradientBoostingClassifier (原为 Logistic Regression)")
+        "开始训练：Variance Filter -> RFA (仅此一步, 自动确定特征数) -> WGAN-GP (含自注意力+余弦退火学习率) -> XGBoost -> 级联 GradientBoostingClassifier")
     print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
-    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
-    print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
-    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)")  # <-- Updated log message
+    print("-> 新增功能: WGAN-GP中加入动态学习率调度 (CosineAnnealingLR)")
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")
-    print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
-    print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
-    print("-> 修改: 阈值选择改为优化正类权重的搜索")  # <-- Updated log message
+    print("-> ***新增重大变更***: 移除 RFE 步骤，仅使用 RFA 作为唯一特征选择方式，并使其自动确定特征数")
+    print("-> 修改: 阈值选择改为优化正类权重的搜索")
     print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
@@ -672,6 +685,7 @@ if __name__ == "__main__":
     print("-> ***新增重大变更***: 加入拓扑数据分析(TDA)特征提取模块")
     print("-> ***新增创新方案***: 动态拓扑尺度选择")
     print("=" * 60)
+    # ===================== 主要修改区域结束 =====================
 
     # ----- 配置 -----
     data_path = "./clean.csv"
@@ -704,8 +718,8 @@ if __name__ == "__main__":
     test_size = 0.10
     random_state = 42
     variance_threshold_value = 0.0
-    cv_folds_for_rfe = 3
-    use_rfa = True  # <--- 新增配置项：是否使用 RFA
+    cv_folds_for_rfe = 3  # Note: still used by RFA internally even though named rfe
+    use_rfa = True  # <--- 新增配置项：是否使用 RFA (强制开启)
     add_topological_features = True  # <--- 新增配置项：是否添加拓扑特征
     use_adaptive_scales = True  # <--- 新增配置项：是否使用动态拓扑尺度
 
@@ -724,7 +738,7 @@ if __name__ == "__main__":
         'T_max': None  # 默认为 epochs # <-- Changed parameter name and default value
     }
 
-    # XGBoost 超参 (用于最终模型和RFE)
+    # XGBoost 超参 (用于最终模型和RFE/RFA)
     xgb_params = {
         'max_depth': 4,
         'learning_rate': 0.1,
@@ -830,11 +844,15 @@ if __name__ == "__main__":
                 # Compute scale factor for this specific sample row
                 # Here we apply the inverse of the scale factors derived from global feature importances
                 # So that important features contribute less to distance (more fine-grained structure captured)
+                # 修复：正确传递参数
+                inv_scales = 1.0 / adaptive_scale_selection(X_scaled_initial, feature_importances_temp)
+                effective_scale = np.prod(inv_scales) ** (1. / len(inv_scales))  # Geometric mean as overall multiplier?
+                # Or simpler approach just pass average or median? For now keep product idea...
+                # Actually let's do element-wise multiplication then take geometric mean maybe overkill so direct usage might work better conceptually though unclear how exactly without modifying VR constructor which takes uniform metric
 
                 # Pass geometric mean of reciprocal scales as an approximate multiplicative factor
-                # 正确调用了修改后的函数
                 approx_effective_avg_inv_scale = np.exp(
-                    np.mean(np.log(1. / adaptive_scale_selection(feature_importances_temp))))
+                    np.mean(np.log(1. / adaptive_scale_selection(X_scaled_initial, feature_importances_temp))))
 
                 topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims,
                                                              scale_factor=approx_effective_avg_inv_scale)
@@ -859,84 +877,43 @@ if __name__ == "__main__":
     # Update feature names list
     updated_feature_names = selected_feature_names_variance + topo_feature_names
 
-    # ---- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
-    print("使用 RFECV (XGBoost) 结合交叉验证自动选择最优特征数 ...")
+    # ---- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFA 自动选择特征数 -----
+    # ===================== 主要修改区域开始 =====================
+    print("使用 RFA (递归特征添加) 结合交叉验证自动选择最优特征数 ...")
 
-    # 定义用于RFE的XGBoost估计器
-    estimator_rfe = xgb.XGBClassifier(**{k: v for k, v in xgb_params.items() if k != 'n_estimators'})
-    # 注意：为了兼容RFE接口，我们不传入'n_estimators'到构造函数
+    # Define estimator for RFA
+    estimator_rfa = xgb.XGBClassifier(**xgb_params)
 
-    skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
+    # Execute RFA directly on data including potential topological features
+    # Pass X_with_topo instead of intermediate filtered version since there's no prior filtering step anymore
+    try:
+        selected_indices_rfa, rfa_scores_history, feature_rankings_from_rfa = recursive_feature_addition(
+            estimator_rfa, X_with_topo, y_all,
+            cv=StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state),
+            scoring='roc_auc'
+        )
 
-    # 使用RFECV自动选择特征数
-    selector_rfe = RFECV(estimator_rfe, step=5, cv=skf_cv, scoring='roc_auc', min_features_to_select=5)
-    selector_rfe.fit(X_with_topo, y_all)
+        # Based on RFA results update final features
+        X_selected = X_with_topo[:, selected_indices_rfa]
+        selected_feature_names_final = [updated_feature_names[i] for i in selected_indices_rfa]
 
-    # --- 获取选定特征 ---
-    selected_top_feature_indices = selector_rfe.support_
-    X_selected_after_rfe = X_with_topo[:, selected_top_feature_indices]
+        print(f"RFA 完成，最终选择了 {len(selected_feature_names_final)} 个特征。")
+        print("RFA 选择的特征列表:")
+        for name in selected_feature_names_final:
+            print(f"  - {name}")
 
-    # --- 获取特征排名信息 ---
-    feature_ranking = selector_rfe.ranking_
-    ranked_idx_by_importance = np.argsort(feature_ranking)
+    except Exception as e:
+        print(f"RFA 过程中发生错误: {e}")
+        print("回退到初始方差过滤后的全部特征。")
+        X_selected = X_with_topo  # Fall back to previous state before any explicit filtering beyond variance
+        selected_feature_names_final = updated_feature_names  # All passed-in features considered
 
-    # --- 准备最终使用的特征矩阵和名称 (RFE后) ---
-    original_indices_of_selected = np.where(selected_top_feature_indices)[0]
-    selected_feature_names_final = [updated_feature_names[i] for i in original_indices_of_selected]
+    ranked_idx_by_importance = feature_rankings_from_rfa  # Store the comprehensive ranking provided by modified RFA function
 
-    print(
-        f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
-
-    # 修复索引错误：安全地访问cv_results_
-    n_features_selected = selector_rfe.n_features_
-    cv_results_scores = selector_rfe.cv_results_['mean_test_score']
-
-    # 确保索引在有效范围内
-    if n_features_selected > 0 and len(cv_results_scores) >= n_features_selected:
-        score_index = n_features_selected - 1  # 0-based indexing
-        performance_score = cv_results_scores[score_index]
-        print(f"这些特征在交叉验证(AUC)下的表现约为: {performance_score:.4f}")
-    else:
-        # 如果索引仍然无效，使用最后一个可用的分数
-        performance_score = cv_results_scores[-1] if len(cv_results_scores) > 0 else 0.5
-        print(f"无法直接获取选定特征数的性能，使用最近可用的性能分数: {performance_score:.4f}")
-
-    save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
-
-    # --- 新增: 递归特征添加 (RFA) ---
-    if use_rfa:
-        print(f"启动 RFA 阶段，自动确定最优特征数...")
-
-        # 使用 RFE 选出的特征作为 RFA 的输入
-        X_input_for_rfa = X_selected_after_rfe
-        feature_names_input_for_rfa = selected_feature_names_final
-
-        # 定义用于 RFA 的评估器 (可以与 RFE 不同)
-        estimator_rfa = xgb.XGBClassifier(**xgb_params)  # 使用相同的 XGBoost 参数
-
-        # 执行 RFA
-        try:
-            selected_indices_rfa, rfa_scores_history = recursive_feature_addition(
-                estimator_rfa, X_input_for_rfa, y_all,
-                cv=StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state),
-                scoring='roc_auc'
-            )
-
-            # 根据 RFA 结果更新最终特征
-            X_selected = X_input_for_rfa[:, selected_indices_rfa]
-            selected_feature_names_final = [feature_names_input_for_rfa[i] for i in selected_indices_rfa]
-
-            print(f"RFA 完成，最终选择了 {len(selected_feature_names_final)} 个特征。")
-            print("RFA 选择的特征列表:")
-            for name in selected_feature_names_final:
-                print(f"  - {name}")
-
-        except Exception as e:
-            print(f"RFA 过程中发生错误: {e}")
-            print("回退到 RFE 选择的特征。")
-            X_selected = X_selected_after_rfe  # 回退
-    else:
-        X_selected = X_selected_after_rfe
+    # Save object containing detailed ranking information
+    save_object(ranked_idx_by_importance,
+                "./rfe_feature_ranking.pkl")  # Kept old filename convention temporarily although meaning changed slightly
+    # ===================== 主要修改区域结束 =====================
 
     print(f"最终特征选择阶段完成，剩余特征数: {X_selected.shape[1]}")
 
@@ -1076,7 +1053,7 @@ if __name__ == "__main__":
         "imputer": imputer,
         "scaler": scaler,
         "variance_selector": selector_variance,
-        "tree_feature_ranking": ranked_idx_by_importance,  # 保留 RFE 排名
+        "tree_feature_ranking": ranked_idx_by_importance,  # Stores complete ranking from modified RFA process
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
         "base_types": ["XGBoost"],
@@ -1093,6 +1070,3 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
