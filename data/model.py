@@ -4,23 +4,21 @@ import warnings
 
 import numpy as np
 import pandas as pd
-
-# 导入 KNNImputer 和 特征选择工具
-from sklearn.impute import KNNImputer
-from sklearn.feature_selection import VarianceThreshold, RFECV
-# 导入交叉验证相关的工具
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_score, confusion_matrix, fbeta_score
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.svm import SVC
-import xgboost as xgb
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import xgboost as xgb
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold, RFECV
+# 导入 KNNImputer 和 特征选择工具
+from sklearn.impute import KNNImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, fbeta_score
+# 导入交叉验证相关的工具
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
