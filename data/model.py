@@ -584,8 +584,20 @@ if __name__ == "__main__":
 
     print(
         f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
-    print(
-        f"这些特征在交叉验证(AUC)下的表现约为: {selector_rfe.cv_results_['mean_test_score'][selector_rfe.n_features_ - 1]:.4f}")
+
+    # 修复索引错误：安全地访问cv_results_
+    n_features_selected = selector_rfe.n_features_
+    cv_results_scores = selector_rfe.cv_results_['mean_test_score']
+
+    # 确保索引在有效范围内
+    if n_features_selected > 0 and len(cv_results_scores) >= n_features_selected:
+        score_index = n_features_selected - 1  # 0-based indexing
+        performance_score = cv_results_scores[score_index]
+        print(f"这些特征在交叉验证(AUC)下的表现约为: {performance_score:.4f}")
+    else:
+        # 如果索引仍然无效，使用最后一个可用的分数
+        performance_score = cv_results_scores[-1] if len(cv_results_scores) > 0 else 0.5
+        print(f"无法直接获取选定特征数的性能，使用最近可用的性能分数: {performance_score:.4f}")
 
     save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
 
@@ -754,3 +766,6 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
+
+
+
