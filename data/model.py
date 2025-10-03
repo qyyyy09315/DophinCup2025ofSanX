@@ -53,20 +53,68 @@ def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
     return preds, probas_base
 
 
-def f1_2_threshold(y_true, probas):
+# --- 修改后的阈值搜索函数 ---
+def cost_sensitive_threshold(y_true, probas, recall_weight=30, auc_weight=50, precision_weight=20):
+    """
+    使用自定义加权分数 (FinalScore = w1*Recall + w2*AUC + w3*Precision) 进行代价敏感阈值搜索。
+
+    注意: AUC 是一个全局指标，不依赖于单一阈值。为了使其适应阈值搜索，
+    我们在这里计算的是使用当前阈值 `t` 得到的预测结果 `preds` 时的 AUC。
+    这意味着 AUC 的计算是基于该特定阈值下的二分类结果与真实标签之间的关系。
+    如果 y_true 和 probas 是固定的，AUC 在不同阈值下计算的结果会是相同的。
+    因此，这里的 AUC 实际上是使用 probas 本身计算的，与阈值 t 无关。
+    更合理的做法可能是忽略 AUC 作为阈值依赖的指标，或者将其权重设为0，
+    或者寻找一个与阈值相关的替代指标（例如，将 AUC 拆解为 TPR 和 FPR 的函数）。
+    但为了遵循原始意图，我们仍然在计算中包含它，但需注意其含义。
+
+    更常见的做法是优化 F1, F-beta, 或 Recall-Precision 平衡。
+    这里我们按要求实现，但需明确 AUC 的处理方式。
+
+    Args:
+        y_true: 真实标签 (numpy array)。
+        probas: 预测为正类的概率 (numpy array)。
+        recall_weight: Recall 的权重。
+        auc_weight: AUC 的权重 (注意：AUC 全局固定)。
+        precision_weight: Precision 的权重。
+
+    Returns:
+        best_t: 最佳阈值。
+    """
+    print(f"开始代价敏感阈值搜索 (权重: Recall={recall_weight}, AUC={auc_weight}, Precision={precision_weight})...")
     thresholds = np.linspace(0, 1, 101)
-    best_t, best_f1_2 = 0.5, -1
-    beta = 1.2
+    # 预先计算全局 AUC，因为它不依赖于阈值
+    try:
+        global_auc = roc_auc_score(y_true, probas)
+    except Exception:
+        print("警告: 无法计算全局 AUC，设置为 0.5")
+        global_auc = 0.5
+
+    best_t, best_score = 0.5, -np.inf
 
     for t in thresholds:
         preds = (probas >= t).astype(int)
-        try:
-            f1_2 = fbeta_score(y_true, preds, beta=beta, zero_division=0)
-        except ValueError:
-            f1_2 = 0.0
 
-        if f1_2 > best_f1_2:
-            best_f1_2, best_t = f1_2, t
+        # 计算各项指标
+        try:
+            recall = recall_score(y_true, preds, zero_division=0)
+        except ValueError:
+            recall = 0.0
+
+        # AUC 使用全局值，因为它不是阈值的函数
+        auc = global_auc
+
+        try:
+            precision = precision_score(y_true, preds, zero_division=0)
+        except ValueError:
+            precision = 0.0
+
+        # 计算加权分数
+        final_score = recall_weight * recall + auc_weight * auc + precision_weight * precision
+
+        if final_score > best_score:
+            best_score, best_t = final_score, t
+
+    print(f"代价敏感阈值搜索完成。最佳阈值: {best_t:.4f}, 最佳加权分数: {best_score:.4f}")
     return best_t
 
 
@@ -419,6 +467,7 @@ if __name__ == "__main__":
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")
     print("-> 新增: 集成递归特征添加 (RFA) 作为特征选择的可选补充")
     print("-> 修改: 不再限定最终选择的特征数量，而是使用 RFE 的 top_percentile_to_select 参数")
+    print("-> 修改: 阈值选择改为基于加权分数 (Recall, AUC, Precision) 的代价敏感搜索")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -480,6 +529,13 @@ if __name__ == "__main__":
         'n_jobs': -1,
         'tree_method': 'hist',
         'predictor': 'cpu_predictor'
+    }
+
+    # 阈值搜索权重配置
+    threshold_weights = {
+        'recall_weight': 30,
+        'auc_weight': 50,
+        'precision_weight': 20
     }
 
     # ----- 1. 读取并预处理数据 -----
@@ -686,9 +742,10 @@ if __name__ == "__main__":
         meta_clf.fit(X_resampled, y_resampled)
         print("未发现足够的误分类样本，使用全部重采样数据训练修正器 (Logistic Regression)")
 
-    # ----- 10. 阈值选择（修改为 F1.2） -----
+    # ----- 10. 阈值选择（修改为代价敏感） -----
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
-    best_thresh = f1_2_threshold(y_holdout, holdout_probas)
+    # 使用修改后的阈值搜索函数
+    best_thresh = cost_sensitive_threshold(y_holdout, holdout_probas, **threshold_weights)
 
     y_pred_holdout = (holdout_probas >= best_thresh).astype(int)
     recall = recall_score(y_holdout, y_pred_holdout, zero_division=0)
@@ -696,10 +753,18 @@ if __name__ == "__main__":
     precision = precision_score(y_holdout, y_pred_holdout, zero_division=0)
     f1 = f1_score(y_holdout, y_pred_holdout, zero_division=0)
     f1_2_final = fbeta_score(y_holdout, y_pred_holdout, beta=1.2, zero_division=0)
-    final_score = 30 * recall + 50 * auc + 20 * precision
+    # 计算最终加权分数
+    final_score = (
+            threshold_weights['recall_weight'] * recall +
+            threshold_weights['auc_weight'] * auc +
+            threshold_weights['precision_weight'] * precision
+    )
 
-    print(f"最佳阈值 (基于 F1.2)={best_thresh:.4f}, F1={f1:.4f}, F1.2={f1_2_final:.4f}")
-    print(f"Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}, FinalScore={final_score:.5f}")
+    print(f"最佳阈值 (基于加权分数)={best_thresh:.4f}")
+    print(f"使用该阈值的性能指标:")
+    print(f"  Recall={recall:.5f}, AUC={auc:.5f}, Precision={precision:.5f}")
+    print(f"  F1={f1:.4f}, F1.2={f1_2_final:.4f}")
+    print(f"  最终加权分数 (Recall*{threshold_weights['recall_weight']} + AUC*{threshold_weights['auc_weight']} + Precision*{threshold_weights['precision_weight']}) = {final_score:.5f}")
 
     # ----- 11. 保存完整模型 -----
     model_dict = {
@@ -713,7 +778,8 @@ if __name__ == "__main__":
         "meta_nb": meta_clf,
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
-        "rfa_num_features": num_features_to_select_rfa if use_rfa else None  # 保存配置
+        "rfa_num_features": num_features_to_select_rfa if use_rfa else None,  # 保存配置
+        "threshold_weights": threshold_weights  # 保存阈值权重配置
     }
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
