@@ -20,6 +20,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+# giotto-tda 用于拓扑特征提取
+try:
+    from gtda.homology import VietorisRipsPersistence
+
+    TOPOLOGY_AVAILABLE = True
+except ImportError:
+    print("Warning: gtda (giotto-tda) not found. Topological features will NOT be computed.")
+    TOPOLOGY_AVAILABLE = False
+
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 # 设置 PyTorch 随机种子以获得可重复的结果
@@ -35,6 +44,77 @@ def save_object(obj, filepath):
     with open(filepath, "wb") as f:
         pickle.dump(obj, f)
     print(f"已保存: {filepath}")
+
+
+def extract_topological_features(X_sample, homology_dims=[0, 1]):
+    """
+    使用 giotto-tda 从单个样本中提取持续同调特征。
+    注意：这在实践中效率很低，因为每次只处理一个样本。
+    这只是一个概念演示。实际应用中应批量处理或寻找更高效的近似方法。
+    """
+    if not TOPOLOGY_AVAILABLE:
+        # Return a dummy feature vector of fixed size if topology library is not available
+        return np.zeros(5)  # Example placeholder
+
+    try:
+        # 确保输入是二维数组 (n_points, n_dimensions)
+        if X_sample.ndim == 1:
+            X_sample = X_sample.reshape(1, -1)
+
+        # gtda 要求输入是三维数组 (n_samples, n_points, n_dimensions)
+        # 我们只有一个样本，所以形状是 (1, n_points, n_dimensions)
+        # 如果X_sample已经是 (n_points, n_dimensions)，则需要reshape
+        if X_sample.ndim == 2:
+            X_diagram_input = X_sample.reshape(1, X_sample.shape[0], X_sample.shape[1])
+        else:
+            # This case handles if somehow it's already 3D but needs to be single sample
+            X_diagram_input = X_sample.reshape(1, -1, X_sample.shape[-1])
+
+            # 初始化 VietorisRipsPersistence
+        persistence = VietorisRipsPersistence(
+            metric="euclidean",
+            homology_dimensions=homology_dims,
+            collapse_edges=True,
+            max_edge_length=np.inf,
+            infinity_values=None,  # Let gtda handle inf
+            n_jobs=1  # Parallel processing can sometimes cause issues in loops
+        )
+
+        # 计算持续同调图
+        diagrams = persistence.fit_transform(X_diagram_input)
+
+        # 提取特征：例如，每个维度的条目数，最长寿命等
+        topo_features = []
+        diagram = diagrams[0]  # We have only one sample
+
+        for dim in homology_dims:
+            mask = (diagram[:, 2] == dim)  # The third column is the homology dimension in gtda
+            births_deaths_dim = diagram[mask][:, :2]  # First two columns are birth/death
+
+            if len(births_deaths_dim) > 0:
+                lifetimes = births_deaths_dim[:, 1] - births_deaths_dim[:, 0]
+                # Add some basic stats as features
+                topo_features.extend([
+                    np.sum(mask),  # Number of components/holes
+                    np.max(lifetimes) if len(lifetimes) > 0 else 0,  # Max lifetime
+                    np.mean(lifetimes) if len(lifetimes) > 0 else 0,  # Mean lifetime
+                    np.std(lifetimes) if len(lifetimes) > 1 else 0,  # Std lifetime
+                ])
+            else:
+                topo_features.extend([0, 0, 0, 0])  # Fill with zeros if no features for this dim
+
+        # Global feature: maximum death time across all dimensions
+        max_death_global = np.max(diagram[:, 1]) if diagram.size > 0 else 0
+        topo_features.append(max_death_global)
+
+        return np.array(topo_features)
+
+    except Exception as e:
+        print(f"Warning: Error computing topological features for a sample: {e}")
+        # Return a zero vector of consistent size on failure
+        # Adjust size based on number of dims and features per dim + global feature
+        expected_size = len(homology_dims) * 4 + 1
+        return np.zeros(expected_size)
 
 
 def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
@@ -566,6 +646,7 @@ if __name__ == "__main__":
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
     print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
     print("-> ***新增重大变更***: 构建异构修整器池，在其中挑选最适合的分类器")
+    print("-> ***新增重大变更***: 加入拓扑数据分析(TDA)特征提取模块")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -601,6 +682,10 @@ if __name__ == "__main__":
     variance_threshold_value = 0.0
     cv_folds_for_rfe = 3
     use_rfa = True  # <--- 新增配置项：是否使用 RFA
+    add_topological_features = True  # <--- 新增配置项：是否添加拓扑特征
+
+    # 拓扑分析配置
+    topo_homology_dims = [0, 1]  # Extract H0 (connected components) and H1 (loops)
 
     # WGAN-GP 配置 (注意：lr_decay_rate 被移除，新增 T_max)
     wgangp_config = {
@@ -685,13 +770,47 @@ if __name__ == "__main__":
     imputer = KNNImputer(n_neighbors=5)
     X_imputed = imputer.fit_transform(X_var_filtered)
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed)
+    X_scaled_initial = scaler.fit_transform(X_imputed)
 
     save_object(imputer, "./imputer.pkl")
     save_object(scaler, "./scaler.pkl")
     save_object(selector_variance, "./variance_selector.pkl")
 
-    # ---- 4. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
+    # ---- 4. 添加拓扑特征 ----
+    X_with_topo = X_scaled_initial  # Start with scaled features
+    topo_feature_names = []  # List to store names of added topo features
+
+    if add_topological_features and TOPOLOGY_AVAILABLE:
+        print("正在提取拓扑特征...")
+        topo_features_list = []
+        total_samples = X_scaled_initial.shape[0]
+
+        # Iterate through each sample to compute its topological signature
+        # Note: This loop is inefficient for large datasets due to repeated computation overhead.
+        # In practice, batching or pre-computation would be better.
+        for i, sample_row in enumerate(X_scaled_initial):
+            if (i + 1) % 200 == 0 or i == total_samples - 1:
+                print(f"  已处理 {i + 1}/{total_samples} 个样本的拓扑特征...")
+
+            topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims)
+            topo_features_list.append(topo_feat_vec)
+
+        topo_features_array = np.array(topo_features_list)
+        # Concatenate original features with topological ones
+        X_with_topo = np.hstack([X_scaled_initial, topo_features_array])
+
+        # Create generic names for topological features
+        num_topo_feats = topo_features_array.shape[1]
+        topo_feature_names = [f'topo_feat_{j}' for j in range(num_topo_feats)]
+
+        print(f"成功添加 {num_topo_feats} 个拓扑特征。总特征数变为: {X_with_topo.shape[1]}")
+    elif add_topological_features and not TOPOLOGY_AVAILABLE:
+        print("请求添加拓扑特征，但由于缺少 gtda 库而跳过。请安装 giotto-tda (`pip install giotto-tda`) 以启用此功能。")
+
+    # Update feature names list
+    updated_feature_names = selected_feature_names_variance + topo_feature_names
+
+    # ---- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
     print("使用 RFECV (XGBoost) 结合交叉验证自动选择最优特征数 ...")
 
     # 定义用于RFE的XGBoost估计器
@@ -702,20 +821,19 @@ if __name__ == "__main__":
 
     # 使用RFECV自动选择特征数
     selector_rfe = RFECV(estimator_rfe, step=5, cv=skf_cv, scoring='roc_auc', min_features_to_select=5)
-    selector_rfe.fit(X_scaled, y_all)
+    selector_rfe.fit(X_with_topo, y_all)
 
     # --- 获取选定特征 ---
     selected_top_feature_indices = selector_rfe.support_
-    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
+    X_selected_after_rfe = X_with_topo[:, selected_top_feature_indices]
 
     # --- 获取特征排名信息 ---
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
     # --- 准备最终使用的特征矩阵和名称 (RFE后) ---
-    X_selected_after_rfe = X_scaled[:, selected_top_feature_indices]
     original_indices_of_selected = np.where(selected_top_feature_indices)[0]
-    selected_feature_names_final = [selected_feature_names_variance[i] for i in original_indices_of_selected]
+    selected_feature_names_final = [updated_feature_names[i] for i in original_indices_of_selected]
 
     print(
         f"RFE (XGBoost) 特征选择完成，并自动选择了 {len(original_indices_of_selected)} 个特征.")
@@ -917,6 +1035,8 @@ if __name__ == "__main__":
         # Now stores an GradientBoostingClassifier instance OR other types depending on choice made above!
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
+        "add_topological_features": add_topological_features,  # 保存拓扑特征开关状态
+        "topo_homology_dims": topo_homology_dims,  # 保存拓扑维度配置
         "threshold_weights": threshold_weights,  # 保存阈值权重配置,
         "pool_of_meta_models_metadata": pool_of_meta_models  # Store extra info about alternative correctors too!
     }
