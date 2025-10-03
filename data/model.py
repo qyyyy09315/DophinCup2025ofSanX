@@ -46,11 +46,10 @@ def save_object(obj, filepath):
     print(f"已保存: {filepath}")
 
 
-# === 新增函数：动态拓扑尺度选择 ===
-def adaptive_scale_selection(X, feature_importances):
+# === 修改后的函数：动态拓扑尺度选择 ===
+def adaptive_scale_selection(feature_importances):
     """根据特征重要性动态调整拓扑分析尺度"""
-    if len(feature_importances) != X.shape[1]:
-        raise ValueError("Feature importance length must match number of features in X.")
+    # 移除了对 X 的依赖
 
     scales = []
     for i, imp in enumerate(feature_importances):
@@ -831,17 +830,11 @@ if __name__ == "__main__":
                 # Compute scale factor for this specific sample row
                 # Here we apply the inverse of the scale factors derived from global feature importances
                 # So that important features contribute less to distance (more fine-grained structure captured)
-                inv_scales = 1.0 / adaptive_scale_selection(None, feature_importances_temp)
-                effective_scale = np.prod(inv_scales) ** (1. / len(inv_scales))  # Geometric mean as overall multiplier?
-                # Or simpler approach just pass average or median? For now keep product idea...
-                # Actually let's do element-wise multiplication then take geometric mean maybe overkill so direct usage might work better conceptually though unclear how exactly without modifying VR constructor which takes uniform metric
-
-                # Simplifying assumption below uses avg effect rather than per point modification inside VR algo itself
-                # Better approximation could involve creating custom metric matrix but outside scope currently
 
                 # Pass geometric mean of reciprocal scales as an approximate multiplicative factor
+                # 正确调用了修改后的函数
                 approx_effective_avg_inv_scale = np.exp(
-                    np.mean(np.log(1. / adaptive_scale_selection(None, feature_importances_temp))))
+                    np.mean(np.log(1. / adaptive_scale_selection(feature_importances_temp))))
 
                 topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims,
                                                              scale_factor=approx_effective_avg_inv_scale)
