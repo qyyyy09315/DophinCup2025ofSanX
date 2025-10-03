@@ -352,6 +352,7 @@ if __name__ == "__main__":
     print("-> 关键改进: 在 RFE 阶段加入了交叉验证来评估特征子集性能")
     print("-> 新增功能: WGAN-GP中加入动态学习率调度 (ExponentialLR)")  # <-- 新增日志
     print("-> 修改: AdaptiveAttention 改为 SelfAttention")  # <-- 新增日志
+    print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")  # <-- 新增/关键修改日志
     print("=" * 60)
 
     # ----- 配置 -----
@@ -401,7 +402,7 @@ if __name__ == "__main__":
         'lr_decay_rate': 0.99  # 新增配置项
     }
 
-    # XGBoost 超参
+    # XGBoost 超参 (用于最终模型和RFE)
     xgb_params = {
         'max_depth': 4,
         'learning_rate': 0.1,
@@ -459,10 +460,12 @@ if __name__ == "__main__":
 
     save_object(brf_selector, "./brf_feature_selector.pkl")
 
-    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation-----
-    print("使用 RFE (LogisticRegression L2) 结合交叉验证获取特征排名并选择 Top 特征 ...")
-    estimator_rfe = LogisticRegression(penalty='l2', C=0.1, solver='liblinear', random_state=random_state,
-                                       max_iter=1000)
+    # ----- 5. Tree-based 特征权重 (替代DNN) -> 改为 RFE with Cross-Validation using XGBoost -----
+    print("使用 RFE (XGBoost) 结合交叉验证获取特征排名并选择 Top 特征 ...")
+
+    # 定义用于RFE的XGBoost估计器
+    estimator_rfe = xgb.XGBClassifier(**{k: v for k, v in xgb_params.items() if k != 'n_estimators'})
+    # 注意：为了兼容RFE接口，我们不传入'n_estimators'到构造函数
 
     skf_cv = StratifiedKFold(n_splits=cv_folds_for_rfe, shuffle=True, random_state=random_state)
 
@@ -475,25 +478,30 @@ if __name__ == "__main__":
     selector_rfe = RFE(estimator_rfe, n_features_to_select=rfe_num_features_to_select, step=5)
     selector_rfe.fit(X_brf_selected, y_all)
 
-    # --- 新增部分：在选定特征上进行交叉验证评分 ---
+    # --- 获取选定特征 ---
     selected_top_feature_indices = selector_rfe.support_
     X_rfe_selected = X_brf_selected[:, selected_top_feature_indices]
 
-    cv_scores = cross_val_score(estimator_rfe, X_rfe_selected, y_all, cv=skf_cv, scoring='roc_auc')
+    # --- 在选定特征上进行交叉验证评分 ---
+    # 我们再次使用带有固定迭代次数的XGBoost来进行CV评估
+    temp_xgb_for_cv = xgb.XGBClassifier(**xgb_params)
+    cv_scores = cross_val_score(temp_xgb_for_cv, X_rfe_selected, y_all, cv=skf_cv, scoring='roc_auc')
     mean_cv_score = np.mean(cv_scores)
     std_cv_score = np.std(cv_scores)
     print(
         f"RFE所选特征 ({rfe_num_features_to_select}个) 的交叉验证平均 AUC 得分: {mean_cv_score:.4f} (+/- {std_cv_score * 2:.4f})")
 
+    # --- 获取特征排名信息 ---
     feature_ranking = selector_rfe.ranking_
     ranked_idx_by_importance = np.argsort(feature_ranking)
 
+    # --- 准备最终使用的特征矩阵和名称 ---
     X_selected = X_brf_selected[:, selected_top_feature_indices]
     original_brf_indices_of_selected = np.where(selected_top_feature_indices)[0]
     selected_feature_names_final = [selected_feature_names_brf[i] for i in original_brf_indices_of_selected]
 
     print(
-        f"RFE 特征加权完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_brf_indices_of_selected)}/{X_brf_selected.shape[1]}) 的特征.")
+        f"RFE (XGBoost) 特征选择完成，并选择了 Top {top_percentile_to_select * 100}% ({len(original_brf_indices_of_selected)}/{X_brf_selected.shape[1]}) 的特征.")
     print(f"这些特征在交叉验证(AUC)下的表现约为: {mean_cv_score:.4f}")
 
     save_object(ranked_idx_by_importance, "./rfe_feature_ranking.pkl")
