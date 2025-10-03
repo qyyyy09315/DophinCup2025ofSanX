@@ -14,6 +14,7 @@ from sklearn.metrics import recall_score, roc_auc_score, precision_score, f1_sco
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier # 导入 GBM
 import xgboost as xgb
 
 import torch
@@ -470,7 +471,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(
-        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 XGBoost (原为 Logistic Regression)")
+        "开始训练：Variance Filter -> RFE (XGBoost) -> WGAN-GP (含自注意力+动态学习率) -> XGBoost -> 级联 GradientBoostingClassifier (原为 Logistic Regression)")
     print("-> 已移除平衡随机森林 (Balanced Random Forest) 特征选择阶段")
     print("-> 修改: RFE阶段基分类器由 LogisticRegression 改为 XGBoost")
     print("-> 关键改进: 缺失值填充方法由均值填充改为KNN填充 (n_neighbors=5)")
@@ -482,6 +483,7 @@ if __name__ == "__main__":
     print("-> 修改: 阈值选择改为基于加权分数 (Recall, AUC, Precision) 的代价敏感搜索")
     print("-> 修改: 代价敏感阈值搜索范围限制在 [0.2, 0.8]")
     print("-> 修改: 级联修正器 (Meta Model) 从 LogisticRegression 改为 XGBoost")
+    print("-> 修改: 再次修改: 级联修正器 (Meta Model) 从 XGBoost 改为 GradientBoostingClassifier (Scikit-learn GBM)")
     print("=" * 60)
 
     # ----- 配置 -----
@@ -543,18 +545,29 @@ if __name__ == "__main__":
         'predictor': 'cpu_predictor'
     }
 
-    # Meta Model (Cascade Corrector) XGBoost 超参
-    meta_xgb_params = {
-        'max_depth': 3,  # 较浅防止过拟合
+    # Meta Model (Cascade Corrector) GradientBoostingClassifier 超参
+    # 使用 Sklearn 默认参数为基础，稍作调整
+    meta_gbm_params = {
+        'n_estimators': 100,       # 较少迭代次数
         'learning_rate': 0.1,
-        'n_estimators': 100,  # 较少迭代次数
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'random_state': random_state + 1,  # Different seed
-        'n_jobs': -1,
-        'tree_method': 'hist',
-        'predictor': 'cpu_predictor'
+        'max_depth': 3,           # 较浅防止过拟合
+        'subsample': 1.0,         # 不进行子采样
+        'criterion': 'friedman_mse',
+        'min_samples_split': 2,
+        'min_samples_leaf': 1,
+        'min_impurity_decrease': 0.0,
+        'init': None,
+        'random_state': random_state + 1, # Different seed
+        'max_features': None,     # 使用所有特征
+        'verbose': 0,
+        'max_leaf_nodes': None,
+        'warm_start': False,
+        'validation_fraction': 0.1,
+        'n_iter_no_change': None,
+        'tol': 1e-4,
+        'ccp_alpha': 0.0
     }
+
 
     # 阈值搜索权重配置
     threshold_weights = {
@@ -737,8 +750,8 @@ if __name__ == "__main__":
     save_object(wrapped_xgb_model, "./base_model_xgboost.pkl")
     print("已训练基模型：XGBoost")
 
-    # ----- 9. 训练级联修正器 (现在也使用 XGBoost) -----
-    print("识别基模型误分类样本，训练级联修正器 (使用 XGBoost)...")
+    # ----- 9. 训练级联修正器 (现在也使用 GradientBoostingClassifier) -----
+    print("识别基模型误分类样本，训练级联修正器 (使用 GradientBoostingClassifier)...")
     _, train_probas = cascade_predict_single_model(wrapped_xgb_model, None, X_resampled, threshold=0.5)
     base_train_preds = (train_probas >= 0.5).astype(int)
 
@@ -747,10 +760,10 @@ if __name__ == "__main__":
 
     if len(X_hard) > 0 and len(np.unique(y_hard)) > 1:
 
-        # 使用 XGBoost 作为元模型
-        meta_clf = xgb.XGBClassifier(**meta_xgb_params)
+        # 使用 GradientBoostingClassifier 作为元模型
+        meta_clf = GradientBoostingClassifier(**meta_gbm_params)
         meta_clf.fit(X_hard, y_hard)
-        print(f"级联修正器 (XGBoost) 训练完成，困难样本数={len(X_hard)}")
+        print(f"级联修正器 (GradientBoostingClassifier) 训练完成，困难样本数={len(X_hard)}")
 
         # --- 新增部分：也可以对元模型做个简单的CV评估---
         try:
@@ -762,13 +775,13 @@ if __name__ == "__main__":
             print(f"无法计算 Meta-model 的 CV 分数: {e}")
 
     else:
-        # 如果没有足够的困难样本，仍初始化一个默认的 XGBoost 模型以防万一
-        print("未发现足够的误分类样本，但仍初始化默认的 XGBoost 修正器。")
-        meta_clf = xgb.XGBClassifier(**meta_xgb_params)
+        # 如果没有足够的困难样本，仍初始化一个默认的 GradientBoostingClassifier 模型以防万一
+        print("未发现足够的误分类样本，但仍初始化默认的 GradientBoostingClassifier 修正器。")
+        meta_clf = GradientBoostingClassifier(**meta_gbm_params)
         meta_clf.fit(X_resampled, y_resampled)  # Fit on all data
 
     # Save the meta model object directly instead of its internal booster
-    save_object(meta_clf, "./meta_model_xgboost.pkl")
+    save_object(meta_clf, "./meta_model_gbm.pkl") # 保存路径也做了相应更改
 
     # ----- 10. 阈值选择（修改为代价敏感） -----
     _, holdout_probas = cascade_predict_single_model(wrapped_xgb_model, meta_clf, X_holdout, threshold=0.5)
@@ -804,7 +817,7 @@ if __name__ == "__main__":
         "selected_feature_names": selected_feature_names_final,
         "base_models": wrapped_xgb_model,
         "base_types": ["XGBoost"],
-        "meta_nb": meta_clf,  # Now stores an XGBClassifier instance
+        "meta_nb": meta_clf,  # Now stores an GradientBoostingClassifier instance
         "threshold": float(best_thresh),
         "use_rfa": use_rfa,  # 保存配置
         "threshold_weights": threshold_weights  # 保存阈值权重配置
