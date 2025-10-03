@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold, RFECV
 # 导入 KNNImputer 和 特征选择工具
 from sklearn.impute import KNNImputer
@@ -923,7 +923,3 @@ if __name__ == "__main__":
     save_object(model_dict, "./model.pkl")
     print("已保存完整模型 ./model.pkl")
     print("=" * 60)
-
-
-
-

@@ -1,217 +1,26 @@
 import os
 import pickle
-import warnings
 
 import numpy as np
 import pandas as pd
-# 注意：如果环境中没有安装 imblearn，需要先通过 pip install imbalanced-learn 安装
-from sklearn.metrics import confusion_matrix
-
-# 导入 XGBoost
-try:
-    import xgboost as xgb
-
-    XGB_AVAILABLE = True
-except ImportError:
-    print("警告: 未找到 xgboost 库。请运行 'pip install xgboost' 进行安装。")
-    XGB_AVAILABLE = False
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-
-warnings.filterwarnings("ignore")
-np.random.seed(42)
-torch.manual_seed(42)
+import xgboost as xgb
 
 
-def save_object(obj, filepath):
-    with open(filepath, "wb") as f:
-        pickle.dump(obj, f)
-    print(f"已保存: {filepath}")
-
-
-def cascade_predict_single_model(base_model, meta_model, X, threshold=0.5):
-    """
-    修改版cascade_predict，适用于单个基模型。
-    修复了当meta_model为None时的错误处理
-    """
-    try:
-        probas_base = base_model.predict_proba(X)[:, 1]
-    except Exception:
-        probas_base = base_model.predict(X).astype(float)
-
-    preds = (probas_base >= threshold).astype(int)
-
-    # 简化的不确定性判断：这里我们假设当概率接近0.5时不确定
-    uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)  # 可调整阈值
-
-    # 只有当meta_model不为None且存在不确定样本时才使用meta_model
-    if meta_model is not None and uncertain_mask.sum() > 0:
-        meta_preds = meta_model.predict(X[uncertain_mask])
-        preds[uncertain_mask] = meta_preds
-
-    return preds, probas_base
-
-
-# 定义一个带残差连接的块
-class ResidualBlock(nn.Module):
-    def __init__(self, in_features, out_features, dropout_rate=0.0):
-        super(ResidualBlock, self).__init__()
-        # 主路径
-        self.linear1 = nn.Linear(in_features, out_features)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-        self.linear2 = nn.Linear(out_features, out_features)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
-
-        # 残差连接路径 (如果输入输出维度不同)
-        self.shortcut = nn.Identity()
-        if in_features != out_features:
-            self.shortcut = nn.Linear(in_features, out_features)
-
-    def forward(self, x):
-        identity = self.shortcut(x)
-
-        out = self.linear1(x)
-        out = self.relu1(out)
-        if self.dropout1:
-            out = self.dropout1(out)
-
-        out = self.linear2(out)
-        # 残差连接
-        out += identity
-        out = self.relu2(out)
-        if self.dropout2:
-            out = self.dropout2(out)
-
-        return out
-
-
-class DeepFeatureSelector(nn.Module):
-    """更深的全连接网络，包含残差连接"""
-
-    def __init__(self, input_dim):
-        super().__init__()
-        # 使用残差块构建网络
-        self.block1 = ResidualBlock(input_dim, 1024, 0.4)
-        self.block2 = ResidualBlock(1024, 512, 0.3)
-        self.block3 = ResidualBlock(512, 256, 0.3)
-        self.block4 = ResidualBlock(256, 128, 0.2)
-
-        # 输出层
-        self.output_layer = nn.Linear(128, 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.output_layer(x)
-        x = self.sigmoid(x)
-        return x
-
-
-def train_dnn_feature_selector_torch(X, y, input_dim, epochs=200, batch_size=128, lr=1e-3, device="cpu"):
-    # 确保模型在指定设备上
-    model = DeepFeatureSelector(input_dim).to(device)
-    criterion = nn.BCELoss()
-    # 可以考虑使用 weight_decay 进行 L2 正则化
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    # 将数据也移动到指定设备
-    dataset = TensorDataset(
-        torch.tensor(X, dtype=torch.float32).to(device),
-        torch.tensor(y, dtype=torch.float32).to(device)
-    )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        num_batches = 0
-        for xb, yb in loader:
-            # 数据已经在设备上了，无需再次移动
-            # xb, yb = xb.to(device), yb.to(device)
-            yb = yb.unsqueeze(1)  # 调整标签形状
-            optimizer.zero_grad()
-            outputs = model(xb)
-            loss = criterion(outputs, yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            num_batches += 1
-        # 可选：打印平均损失
-        # if (epoch + 1) % 50 == 0:
-        #     avg_loss = total_loss / num_batches
-        #     print(f"Epoch {epoch+1}/{epochs}, Avg Loss={avg_loss:.4f}")
-
-    # 提取第一层权重以计算特征重要性
-    # 注意：现在第一层是 ResidualBlock，我们需要访问其内部的 linear1 层
-    first_linear_layer = None
-    if hasattr(model, 'block1') and hasattr(model.block1, 'linear1'):
-        first_linear_layer = model.block1.linear1
-    else:
-        # 如果结构改变，尝试查找第一个 nn.Linear 层
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                first_linear_layer = module
-                break
-
-    if first_linear_layer is not None:
-        weights = first_linear_layer.weight.detach().cpu().numpy()  # shape=(1024, input_dim)
-        feature_importance = np.mean(np.abs(weights), axis=0)
-    else:
-        # 如果找不到线性层，则返回零重要性（理论上不应发生）
-        print("警告：无法找到第一层线性层以计算特征重要性。")
-        feature_importance = np.zeros(input_dim)
-
-    return feature_importance
-
-
-def youden_threshold(y_true, probas):
-    thresholds = np.linspace(0, 1, 101)
-    best_t, best_j = 0.5, -1
-    for t in thresholds:
-        preds = (probas >= t).astype(int)
-        # 处理只有一个类别的情况
-        cm = confusion_matrix(y_true, preds, labels=[0, 1])
-        if cm.size == 4:
-            tn, fp, fn, tp = cm.ravel()
-        elif cm.size == 1:
-            # 所有预测都是同一类
-            if y_true[0] == 0:
-                tn, fp, fn, tp = cm[0, 0], 0, 0, 0  # All predicted negative
-            else:
-                tn, fp, fn, tp = 0, 0, 0, cm[0, 0]  # All predicted positive
-        else:
-            # 不规则矩阵，填充缺失项
-            padded_cm = np.pad(cm, ((0, 2 - cm.shape[0]), (0, 2 - cm.shape[1])), mode='constant')
-            tn, fp, fn, tp = padded_cm.ravel()
-
-        sensitivity = tp / (tp + fn + 1e-8)
-        specificity = tn / (tn + fp + 1e-8)
-        J = sensitivity + specificity - 1
-        if J > best_j:
-            best_j, best_t = J, t
-    return best_t
 class WrappedXGBModel:
-        def __init__(self, booster):
-            self.booster = booster
+    def __init__(self, booster):
+        self.booster = booster
 
-        def predict_proba(self, X):
-            dmatrix = xgb.DMatrix(X)
-            probs = self.booster.predict(dmatrix)
-            # 返回二维数组 [[prob_0, prob_1], ...]
-            return np.vstack([1 - probs, probs]).T
+    def predict_proba(self, X):
+        dmatrix = xgb.DMatrix(X)
+        probs = self.booster.predict(dmatrix)
+        # For binary classification, Booster returns probabilities for class 1.
+        # We need to stack them with 1-probs for class 0 to form [prob_0, prob_1].
+        return np.column_stack([1 - probs, probs])
 
-        def predict(self, X):
-            dmatrix = xgb.DMatrix(X)
-            probs = self.booster.predict(dmatrix)
-            return (probs > 0.5).astype(int)
+    def predict(self, X):
+        dmatrix = xgb.DMatrix(X)
+        probs = self.booster.predict(dmatrix)
+        return (probs > 0.5).astype(int)
 
 def load_object(filepath):
     """加载通过pickle保存的对象"""
@@ -221,85 +30,208 @@ def load_object(filepath):
     return obj
 
 
-class LoadedPipelineWrapper:
+class ModelPipelineWrapper:
     """
-    包装加载的模型字典，使其行为类似于sklearn Pipeline，
-    并处理内部的XGBoost模型和级联逻辑。
+    封装整个模型流水线，包括预处理和预测步骤。
     """
 
     def __init__(self, model_dict):
+        """
+        初始化包装器。
+
+        :param model_dict: 包含所有模型组件的字典。
+        """
         self.model_dict = model_dict
-        # 从字典中提取各个组件
-        self.imputer = self.model_dict["imputer"]
-        self.scaler = self.model_dict["scaler"]
-        self.dnn_feature_ranking = self.model_dict["dnn_feature_ranking"]
+        # --- 预处理器 ---
+        self.imputer = model_dict["imputer"]
+        self.scaler = model_dict["scaler"]
+        self.variance_selector = model_dict["variance_selector"]
 
-        # 基模型是 WrappedXGBModel 实例
-        self.base_model = self.model_dict["base_models"]
-        # 元模型是 GaussianNB 实例
-        self.meta_model = self.model_dict["meta_nb"]
-        # 阈值
-        self.threshold = self.model_dict.get("threshold", 0.5)
+        # --- 特征信息 ---
+        self.selected_feature_names = model_dict["selected_feature_names"]
+        self.tree_feature_ranking = model_dict["tree_feature_ranking"]  # 保留但本次未使用
 
-    def _preprocess(self, X_raw):
-        """执行与训练时相同的预处理步骤"""
-        # 1. 填充缺失值
-        X_imp = self.imputer.transform(X_raw)
-        # 2. 标准化
-        X_sc = self.scaler.transform(X_imp)
-        # 3. 特征选择（根据DNN排名重排特征）
-        X_selected = X_sc[:, self.dnn_feature_ranking]
-        return X_selected
+        # --- 模型 ---
+        self.base_models = model_dict["base_models"]
+        self.meta_nb = model_dict["meta_nb"]
+
+        # --- 配置 ---
+        self.threshold = model_dict["threshold"]
+        self.use_rfa = model_dict.get("use_rfa", True)  # 默认True if missing
+        self.pool_of_meta_models_metadata = model_dict.get("pool_of_meta_models_metadata", [])
+
+    def _preprocess(self, X_raw_df):
+        """
+        对原始特征DataFrame进行预处理。
+        注意：此函数假定输入X_raw_df已经去掉了非特征列（如company_id），
+             并且其列名对应于训练时的初始特征名。
+        """
+        # 1. 方差过滤 (使用训练时保存的selector)
+        X_var_filtered = self.variance_selector.transform(X_raw_df)
+        # 获取方差过滤后对应的特征名索引
+        selected_indices_variance = self.variance_selector.get_support(indices=True)
+        # 假设 X_raw_df 的列名是初始特征名
+        feature_names_after_variance = X_raw_df.columns[selected_indices_variance]
+
+        # 2. KNN 填充缺失值
+        X_imputed = self.imputer.transform(X_var_filtered)
+
+        # 3. 标准化
+        X_scaled = self.scaler.transform(X_imputed)
+
+        # 4. 应用 RFE 或 RFA 选择的特征
+        # 我们需要找到在缩放后的特征中，哪些是我们最终选择的特征
+        # selected_feature_names 是最终选择的特征名列表
+        # 我们需要从 feature_names_after_variance 中找到它们的索引
+
+        # 创建一个映射：当前特征名 -> 当前方差过滤后特征的索引
+        current_feature_to_index = {name: i for i, name in enumerate(feature_names_after_variance)}
+
+        # 找到最终选中的特征在当前特征集中的索引
+        final_selected_indices_in_current = [
+            current_feature_to_index[name]
+            for name in self.selected_feature_names
+            if name in current_feature_to_index
+        ]
+
+        # 检查是否所有选中的特征都在当前特征集中
+        if len(final_selected_indices_in_current) != len(self.selected_feature_names):
+            missing_features = set(self.selected_feature_names) - set(feature_names_after_variance)
+            raise ValueError(f"测试数据缺少必要的特征: {missing_features}")
+
+        # 应用特征选择
+        X_final = X_scaled[:, final_selected_indices_in_current]
+
+        return X_final
 
     def predict_proba(self, X_raw):
         """
-        对原始特征数据进行预处理并预测概率。
-        实现与训练时一致的cascade_predict_single_model逻辑。
+        对原始特征矩阵进行预测，返回正类概率。
+
+        :param X_raw: 原始特征矩阵 (numpy array or DataFrame)。
+                      如果是numpy array, 列顺序必须与训练时完全一致。
+                      推荐使用DataFrame以利用列名匹配。
+        :return: 正类概率数组 (numpy array)。
         """
-        X_processed = self._preprocess(X_raw)
+        # 确保输入是 DataFrame 以便正确处理列名
+        if not isinstance(X_raw, pd.DataFrame):
+            # 如果不是DataFrame，我们无法安全地进行特征对齐，这里给出警告
+            # 并假设列顺序与训练时完全一致。这很脆弱，最好提供DataFrame。
+            print("警告: 输入不是 pandas DataFrame。强烈建议提供带有正确列名的 DataFrame 以确保特征对齐。")
+            # 为了兼容性，我们可以尝试继续，但这有风险。
+            # 我们需要知道训练时的初始特征名来进行正确的预处理。
+            # 这里我们做一个简化假设：X_raw 的列数等于训练时经过方差过滤前的特征数
+            # 并且顺序完全一致。这是一个强假设，可能导致错误。
+
+            # 一种更健壮的方法是在 model_dict 中保存初始特征名列表
+            # 但我们没有这样做。因此，如果输入是 ndarray，
+            # 最好要求用户提供一个带有正确列名的 DataFrame。
+            # 这里我们临时创建一个假的DataFrame，但这不是一个好的实践。
+            # 假设我们知道初始特征数量（这是不对的，因为我们不知道确切的名字）
+            # 因此，最安全的做法是强制要求输入为 DataFrame
+
+            # 抛出异常或要求输入为DataFrame
+            raise ValueError("输入 `X_raw` 必须是一个 pandas DataFrame，其中包含与训练数据一致的列名。")
+
+        # 如果是 DataFrame，则复制一份避免修改原数据，并进行预处理
+        X_processed = self._preprocess(X_raw.copy())
 
         # --- 级联预测逻辑 ---
+        # 1. 基模型预测
         try:
-            probas_base = self.base_model.predict_proba(X_processed)[:, 1]
-        except Exception:
-            probas_base = self.base_model.predict(X_processed).astype(float)
+            probas_base = self.base_models.predict_proba(X_processed)[:, 1]
+        except Exception as e:
+            print(f"基模型 predict_proba 失败: {e}")
+            # Fallback: 使用 predict 并假设输出可以直接解释为概率 (不推荐)
+            pred_or_score = self.base_models.predict(X_processed)
+            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
+                probas_base = np.clip(pred_or_score.flatten(), 0, 1)
+            else:
+                probas_base = pred_or_score[:, 1]
 
-        # 简化的不确定性判断
+        preds_initial = (probas_base >= 0.5).astype(int)
         uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
 
-        # 初始化最终预测概率为基模型概率
-        final_probas = probas_base.copy()
+        # 2. 如果有不确定样本且元模型存在，则用元模型修正
+        if self.meta_nb is not None and uncertain_mask.sum() > 0:
+            # Check if meta_model has predict_proba method for consistency
+            if hasattr(self.meta_nb, 'predict_proba'):
+                try:
+                    meta_probas = self.meta_nb.predict_proba(X_processed[uncertain_mask])[:, 1]
+                    # 不直接替换概率，而是可以替换预测结果，或者根据需求融合概率
+                    # 这里我们按照原始cascade_predict_single_model的逻辑，
+                    # 只更新那些被判定为“不确定”的样本的预测标签
+                    # 但返回的仍然是基模型的概率
+                    # 如果需要返回融合后的概率，逻辑会更复杂
+                    # 按照原始意图，只修正预测，不改变返回的概率？
+                    # 但是 cascade_predict_single_model 返回了修正后的 preds 和 base probas
+                    # 为了让 predict 方法工作，我们需要存储修正后的预测
+                    # 但 predict_proba 通常只返回主模型概率
+                    # 这里保持 predict_proba 返回基模型概率不变
 
-        # 如果有不确定样本且元模型存在，则使用元模型修正
-        if uncertain_mask.sum() > 0:
-            # 注意：这里我们只返回主类的概率，因为这是后续阈值判断所需要的
-            # cascade_predict_single_model 返回的是 (preds, probas_base)
-            # 我们需要模拟其对不确定样本使用meta_model预测的部分
-            # 但 meta_model (GaussianNB) 的 predict_proba 会返回两个类别的概率
-            meta_probas = self.meta_model.predict_proba(X_processed[uncertain_mask])
-            # 假设 meta_probas 是 [[p0_class0, p0_class1], [p1_class0, p1_class1], ...]
-            # 我们取 class1 的概率来替换原来的基模型概率
-            final_probas[uncertain_mask] = meta_probas[:, 1]
+                except Exception as e:
+                    print(f"元模型 predict_proba 失败: {e}")
+                    meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+            else:
+                meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
 
-        # 为了兼容接口，返回二维数组 [[prob_0, prob_1], ...]
-        # 这里简化处理，因为我们主要关心 prob_1 (final_probas)
-        prob_0 = 1 - final_probas
-        return np.vstack([prob_0, final_probas]).T
+            # 更新初始预测（仅用于内部状态或predict方法）
+            # 注意：predict_proba本身不修改其返回的概率值
+            # 但如果需要融合概率，需要在这里实现不同的逻辑
+            # 目前按惯例，predict_proba返回基模型概率
+            # 而predict方法结合阈值和可能的级联修正来决定最终类别
+
+            # 存储修正后的预测供 predict 方法使用
+            # 我们不能直接修改 preds_initial 因为 predict_proba 应该是无状态的
+            # 最好的方式是在 predict 方法中重新执行这部分逻辑
+            pass  # 在 predict 方法中处理
+
+        return np.column_stack([1 - probas_base, probas_base])  # 返回 [prob_0, prob_1]
 
     def predict(self, X_raw):
         """
-        对原始特征数据进行预处理并预测类别。
-        使用存储在模型中的阈值。
+        对原始特征矩阵进行预测，返回类别标签。
+
+        :param X_raw: 原始特征矩阵 (numpy array or DataFrame)。
+        :return: 类别标签数组 (numpy array)。
         """
-        probas = self.predict_proba(X_raw)
-        preds = (probas[:, 1] >= self.threshold).astype(int)
+        # 确保输入是 DataFrame 以便正确处理列名
+        if not isinstance(X_raw, pd.DataFrame):
+            raise ValueError("输入 `X_raw` 必须是一个 pandas DataFrame，其中包含与训练数据一致的列名。")
+
+        # 预处理
+        X_processed = self._preprocess(X_raw.copy())
+
+        # --- 级联预测逻辑 ---
+        # 1. 基模型预测
+        try:
+            probas_base = self.base_models.predict_proba(X_processed)[:, 1]
+        except Exception as e:
+            print(f"基模型 predict_proba 失败: {e}")
+            pred_or_score = self.base_models.predict(X_processed)
+            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
+                probas_base = np.clip(pred_or_score.flatten(), 0, 1)
+            else:
+                probas_base = pred_or_score[:, 1]
+
+        preds = (probas_base >= self.threshold).astype(int)  # 使用加载的阈值
+        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
+
+        # 2. 如果有不确定样本且元模型存在，则用元模型修正
+        if self.meta_nb is not None and uncertain_mask.sum() > 0:
+            if hasattr(self.meta_nb, 'predict_proba'):
+                try:
+                    meta_probas = self.meta_nb.predict_proba(X_processed[uncertain_mask])[:, 1]
+                    meta_preds = (meta_probas >= 0.5).astype(int)  # 元模型内部使用0.5阈值?
+                except Exception as e:
+                    print(f"元模型 predict_proba 失败: {e}")
+                    meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+            else:
+                meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+
+            preds[uncertain_mask] = meta_preds.astype(int)
+
         return preds
-
-
-def load_model(model_path):
-    """加载整个模型管道字典，并用包装器包装"""
-    model_dict = load_object(model_path)
-    return LoadedPipelineWrapper(model_dict)
 
 
 if __name__ == "__main__":
@@ -311,23 +243,22 @@ if __name__ == "__main__":
     if not os.path.exists(test_data_path):
         # 创建示例测试数据用于演示目的，实际运行时请替换为真实数据路径
         print(f"警告: 未找到测试数据文件 '{test_data_path}'。正在创建示例测试数据...")
-        sample_test_data = pd.DataFrame({
-            'feature1': np.random.randn(200),
-            'feature2': np.random.rand(200) * 100,
-            'category_A': ['Y'] * 60 + ['N'] * 140,
-            # target列通常在测试集中不存在，这里仅作占位符展示，不会参与预测
-        })
-        sample_test_data = pd.get_dummies(sample_test_data, drop_first=True)
-        # 确保测试集特征与训练集对齐（假设训练集有feature1, feature2, category_A_Y）
-        required_cols = ['feature1', 'feature2', 'category_A_Y']
-        for col in required_cols:
-            if col not in sample_test_data.columns:
-                # 添加缺失的列，默认填0
-                sample_test_data[col] = 0
-        sample_test_data = sample_test_data[required_cols]  # 重新排序以匹配预期顺序
-
+        np.random.seed(100)  # 固定种子以便示例一致
+        sample_n = 200
+        # 模拟训练脚本中生成的数据结构
+        # 训练时有 f0-f(N-zero_var_features-1), zero_var_0, zero_var_1
+        # 示例用了20个特征，其中2个是零方差的
+        feature_cols_simulation = [f'f{i}' for i in range(18)] + ['zero_var_0', 'zero_var_1']
+        sample_test_data_dict = {
+            col: np.random.randn(sample_n) for col in feature_cols_simulation if not col.startswith('zero_var')
+        }
+        # 添加零方差特征
+        sample_test_data_dict['zero_var_0'] = [5.0] * sample_n
+        sample_test_data_dict['zero_var_1'] = [5.0] * sample_n
         # 添加 company_id 列
-        sample_test_data.insert(0, 'company_id', [f"COMP_{i}" for i in range(len(sample_test_data))])
+        sample_test_data_dict['company_id'] = [f"COMP_{i}" for i in range(sample_n)]
+
+        sample_test_data = pd.DataFrame(sample_test_data_dict)
 
         sample_test_data.to_csv(test_data_path, index=False)
         print(f"已生成示例测试数据并保存至 {test_data_path}")
@@ -337,66 +268,60 @@ if __name__ == "__main__":
         f"测试数据加载成功，样本数: {test_data.shape[0]}, 特征数: {test_data.shape[1] - 1 if 'company_id' in test_data.columns else test_data.shape[1]}")
 
     # -----------------------------
-    # 2. 加载模型管道 (包括预处理器)
+    # 2. 加载模型字典并包装
     # -----------------------------
-    model_path = "./model_pipeline_cascade_dnn_torch.pkl"  # 确保此路径正确
+    model_path = "./model.pkl"  # 使用训练脚本最后保存的模型文件
     if not os.path.exists(model_path):
         print(f"错误: 找不到模型文件 '{model_path}'。请确保模型已训练并保存。")
         exit(1)
 
-    print(f"正在加载模型管道: {model_path}")
-    loaded_pipeline = load_model(model_path)
+    print(f"正在加载模型字典: {model_path}")
+    loaded_model_dict = load_object(model_path)
+
+    # 包装模型字典以便使用
+    loaded_pipeline = ModelPipelineWrapper(loaded_model_dict)
 
     # -----------------------------
     # 3. 读取阈值
     # -----------------------------
     threshold = loaded_pipeline.threshold
-    print(f"从模型对象读取阈值: {threshold}")
+    print(f"从模型对象读取阈值: {threshold:.4f}")
 
     # -----------------------------
-    # 4. 测试数据处理
+    # 4. 测试数据处理与预测
     # -----------------------------
-    # 去掉 ID 列
+    # 准备特征数据 (保留列名为DataFrame)
     feature_columns = [col for col in test_data.columns if col != "company_id"]
-    X_test_raw = test_data[feature_columns]
-    print(f"用于预测的原始特征数: {X_test_raw.shape[1]}")
+    X_test_raw_df = test_data[feature_columns]  # 保留为 DataFrame
+    print(f"用于预测的原始特征数: {X_test_raw_df.shape[1]}")
 
-    # 预处理已在 pipeline 内部的 predict_proba/predict 方法中完成
-    # X_test_proc = X_test_raw.copy()
-    # if imputer is not None:
-    #     X_test_proc = imputer.transform(X_test_proc)
-    #     print("已应用缺失值填充。")
-    #
-    # if scaler is not None:
-    #     X_test_proc = scaler.transform(X_test_proc)
-    #     print("已应用标准化。")
-    #
-    # if selector is not None:
-    #     X_test_proc = selector.transform(X_test_proc)
-    #     print(f"已应用特征选择，最终特征数: {X_test_proc.shape[1]}")
-
-    # -----------------------------
-    # 5. 预测
-    # -----------------------------
     print("正在进行预测...")
-    # 使用包装器的 predict_proba 方法，它会自动处理预处理和级联逻辑
-    y_proba_full = loaded_pipeline.predict_proba(X_test_raw.values)
-    y_proba = y_proba_full[:, 1]  # 获取正类概率
-    print(f"预测完成，共 {len(y_proba)} 个概率值。")
+    # 获取概率 (注意 predict_proba 返回的是二维数组 [[neg_prob, pos_prob], ...])
+    try:
+        y_proba_full = loaded_pipeline.predict_proba(X_test_raw_df)
+        y_proba = y_proba_full[:, 1]  # 获取正类概率
+        print(f"预测完成，共 {len(y_proba)} 个概率值。")
+    except Exception as e:
+        print(f"预测概率时发生错误: {e}")
+        exit(1)
 
-    print(f"应用分类阈值: {threshold}")
-    # 使用包装器的 predict 方法，它会自动处理预处理、级联逻辑和阈值判断
-    y_pred = loaded_pipeline.predict(X_test_raw.values)
-    print("分类完成。")
+    print(f"应用分类阈值: {threshold:.4f}")
+    # 获取最终预测结果 (0 或 1)
+    try:
+        y_pred = loaded_pipeline.predict(X_test_raw_df)
+        print("分类完成。")
+    except Exception as e:
+        print(f"分类时发生错误: {e}")
+        exit(1)
 
     # -----------------------------
-    # 6. 结果输出
+    # 5. 结果输出到桌面
     # -----------------------------
     if "company_id" in test_data.columns:
         uuid_column = test_data["company_id"]
     else:
         print("警告: 测试数据中未找到 'company_id' 列，将使用行索引作为 uuid。")
-        uuid_column = test_data.index.astype(str)  # 确保索引是字符串类型
+        uuid_column = test_data.index.map(str)  # 确保索引是字符串类型
 
     results_df = pd.DataFrame({
         "uuid": uuid_column,
@@ -405,11 +330,17 @@ if __name__ == "__main__":
     })
     print("结果数据框创建成功。")
 
-    output_path = "submit_predictions.csv"
+    # 构造桌面路径 (跨平台基本兼容的方式)
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    if not os.path.exists(desktop_path):
+        desktop_path = "."  # 如果桌面路径不存在，则保存到当前目录
+
+    output_filename = "submit_template.csv"
+    output_path = os.path.join(desktop_path, output_filename)
+
     print(f"正在保存结果到: {output_path}")
-    results_df.to_csv(output_path, index=False)
-    print(f"预测完成，阈值 {threshold}，结果已保存到 {output_path}")
-
-
-
-
+    try:
+        results_df.to_csv(output_path, index=False)
+        print(f"预测完成，阈值 {threshold:.4f}，结果已保存到 {output_path}")
+    except Exception as e:
+        print(f"保存结果时发生错误: {e}")
