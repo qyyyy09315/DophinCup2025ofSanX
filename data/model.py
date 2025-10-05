@@ -230,24 +230,44 @@ def feature_clustering(X, n_clusters_ratio=0.5):
         representative_indices: 每个簇中选出的一个代表性特征索引。
     """
     print("Performing feature clustering to reduce redundancy...")
+
+    # 检查并处理NaN值
+    if np.isnan(X).any():
+        print("Warning: NaN values detected in input data for clustering. Attempting to fix...")
+        # 使用列均值填充NaN值
+        col_means = np.nanmean(X, axis=0)
+        inds = np.where(np.isnan(X))
+        X[inds] = np.take(col_means, inds[1])
+
+    # 再次检查是否还有NaN值
+    if np.isnan(X).any():
+        print("Error: Still NaN values present after imputation. Cannot proceed with clustering.")
+        # 返回所有特征作为代表（跳过聚类）
+        return np.zeros(X.shape[1]), np.arange(X.shape[1])
+
     n_original_features = X.shape[1]
     n_clusters_target = max(1, int(n_original_features * n_clusters_ratio))
     print(f"Target number of clusters after agglomeration: {n_clusters_target}")
 
     # 计算特征之间的皮尔逊相关系数矩阵
-    corr_matrix = np.corrcoef(X, rowvar=False) # rowvar=False 表示每一列是一个变量
+    corr_matrix = np.corrcoef(X, rowvar=False)  # rowvar=False 表示每一列是一个变量
 
     # 将相关系数转换为距离矩阵: distance = 1 - |correlation|
     # 使用绝对值是因为我们关心的是相关性的强度，而不是方向
     # np.clip 确保结果在 [0, 1] 范围内，避免浮点数精度问题
     distance_matrix = np.clip(1 - np.abs(corr_matrix), 0, 2)
 
+    # 检查距离矩阵是否有NaN值
+    if np.isnan(distance_matrix).any():
+        print("Warning: NaN values detected in correlation matrix. Replacing with 1 (maximum distance)...")
+        distance_matrix[np.isnan(distance_matrix)] = 1
+
     # 使用 AgglomerativeClustering 对特征（现在是距离矩阵的节点）进行聚类
     # linkage='average' 对应于 UPGMA 方法，通常效果不错
     agglo = AgglomerativeClustering(
         n_clusters=n_clusters_target,
-        metric='precomputed', # 指定使用预计算的距离矩阵
-        linkage='average'     # 使用平均链接
+        metric='precomputed',  # 指定使用预计算的距离矩阵
+        linkage='average'  # 使用平均链接
     )
 
     # Fit the model and get cluster labels for each original feature
@@ -271,6 +291,8 @@ def feature_clustering(X, n_clusters_ratio=0.5):
 
     print(f"Selected {len(representative_indices)} representative features from clusters.")
     return cluster_labels, np.array(representative_indices)
+
+
 # --- 修改结束 ---
 
 
@@ -841,7 +863,7 @@ if __name__ == "__main__":
 
     MASK_MISCLASSIFIED_EXAMPLES = (PREDICTIONS_ON_TRAIN_SET_FROM_BASELINE != RESAMPLED_TRAIN_LABELS)
     HARD_CASE_FEATURE_SUBSET, HARD_CASE_TRUE_LABELS = RESAMPLED_TRAIN_FEATURES[MASK_MISCLASSIFIED_EXAMPLES], \
-    RESAMPLED_TRAIN_LABELS[MASK_MISCLASSIFIED_EXAMPLES]
+        RESAMPLED_TRAIN_LABELS[MASK_MISCLASSIFIED_EXAMPLES]
 
     _, BASELINE_PROBA_HOLDOUT_STAGE_ONE = cascade_predict_single_model(WRAPPED_MODEL_WRAPPER_INSTANCE, None,
                                                                        HOLDOUT_EVAL_SPLIT, threshold=0.5)
@@ -872,7 +894,7 @@ if __name__ == "__main__":
     RECALL_BEST, PRECISION_BEST, SPECIFICITY_BEST = METRICS_AT_OPTIMAL_POINT
 
     PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH = (
-                PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
+            PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
     ROC_AREA_UNDER_CURVE = roc_auc_score(HOLDOUT_TARGET_SPLIT, PROBABILITIES_HOLDOUT_COMBINED_PIPELINE)
     F1_MACRO_BALANCED_ACCURACY = f1_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH, zero_division=0)
     FBETA_MEASURE_ENHANCED_SENSITIVITY = fbeta_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH,
@@ -919,7 +941,6 @@ if __name__ == "__main__":
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\nComplete end-to-end modeling artifact exported to './model.pkl'")
     print("=" * 60)
-
 
 
 
