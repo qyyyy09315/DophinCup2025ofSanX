@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
-"""应用已训练的增强版机器学习管道进行预测。"""
+"""加载训练好的模型并应用于测试数据，输出预测结果到桌面。"""
 
 import os
 import pickle
-
 import numpy as np
 import pandas as pd
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import VarianceThreshold
 import xgboost as xgb
-
-# --- 注意：预测阶段不主动导入 gtda ---
-# 拓扑特征应在训练时完全计算并包含在最终特征集中，
-# 或者其计算对象应一并保存。在此阶段尝试重建会导致不一致。
-TOPOLOGY_AVAILABLE = False
+from sklearn.ensemble import GradientBoostingClassifier
 
 
 class WrappedXGBPredictiveModel:
@@ -28,226 +26,212 @@ class WrappedXGBPredictiveModel:
         predicted_probabilities = self.booster_internal_reference.predict(dmatrix_format_input)
         return (predicted_probabilities > 0.5).astype(int)
 
-
 def load_object(filepath):
-    """从文件反序列化加载Python对象"""
+    """从文件中反序列化加载Python对象"""
     with open(filepath, "rb") as f:
         obj = pickle.load(f)
     print(f"已从 {filepath} 加载对象")
     return obj
 
 
+class TargetEncoder:
+    """简单的均值目标编码器 (推理时使用)"""
+
+    def __init__(self):
+        self.mapping_ = {}
+
+    def transform(self, X):
+        X = np.asarray(X).flatten()
+        # 对于未见过的类别，使用全局均值
+        default_val = np.mean(list(self.mapping_.values())) if self.mapping_ else 0
+        return np.array([self.mapping_.get(x, default_val) for x in X]).reshape(-1, 1)
+
+
+# === 新增函数：分箱离散化 (推理时使用) ===
+def bin_features(X, discretizer):
+    """使用已训练的分箱器对特征进行分箱离散化"""
+    if X.size == 0:
+        return X
+    X_binned = discretizer.transform(X)
+    return X_binned
+
+
+# === 新增函数：分级特征处理 (推理时使用) ===
+# 注意：推理时使用的 FEATURE_HIERARCHY 需要与训练时完全一致
+FEATURE_HIERARCHY = {
+    "core": ['f0', 'f1', 'f2'],  # 示例核心特征
+    "secondary": [r'f[3-5]'],  # 示例次级特征
+    "contextual": [r'f[6-9]']  # 示例上下文特征
+}
+import re  # 确保导入正则表达式库
+
+
+def hierarchical_processing_inference(X, feature_names, encoders_dict, discretizers_dict):
+    """
+    推理时的分级特征处理
+    核心财务特征：保留原始数值
+    次级特征：使用训练时保存的分箱器分箱
+    上下文特征：使用训练时保存的目标编码器编码
+    """
+    print("正在执行推理时的分级特征处理...")
+    core_idx = [i for i, n in enumerate(feature_names)
+                if any(n == p for p in FEATURE_HIERARCHY['core'])]
+
+    sec_idx = [i for i, n in enumerate(feature_names)
+               if any(re.match(p, n) for p in FEATURE_HIERARCHY['secondary'])]
+
+    ctx_idx = [i for i, n in enumerate(feature_names)
+               if any(re.match(p, n) for p in FEATURE_HIERARCHY['contextual'])]
+
+    processed_parts = []
+    processed_names = []
+
+    # 核心特征：直接保留
+    if core_idx:
+        processed_parts.append(X[:, core_idx])
+        processed_names.extend([feature_names[i] for i in core_idx])
+        print(f"  - 核心特征 ({len(core_idx)} 个): 已保留原始数值")
+
+    # 次级特征：分箱 (使用保存的分箱器)
+    if sec_idx:
+        X_sec_list = []
+        for i in sec_idx:
+            disc = discretizers_dict.get(feature_names[i], None)
+            if disc is not None:
+                X_sec_binned = bin_features(X[:, i].reshape(-1, 1), disc)
+                X_sec_list.append(X_sec_binned.flatten())
+            else:
+                print(f"  - 警告: 未找到特征 '{feature_names[i]}' 的分箱器，将保留原始数值。")
+                X_sec_list.append(X[:, i])
+        if X_sec_list:
+            X_sec_final = np.column_stack(X_sec_list)
+            processed_parts.append(X_sec_final)
+            processed_names.extend([f"{feature_names[i]}_binned" for i in sec_idx])
+            print(f"  - 次级特征 ({len(sec_idx)} 个): 已进行分箱离散化")
+        else:
+            print("  - 次级特征处理失败。")
+
+    # 上下文特征：目标编码 (使用保存的编码器)
+    if ctx_idx:
+        X_ctx_list = []
+        ctx_names_out = []
+        for i in ctx_idx:
+            te = encoders_dict.get(feature_names[i], None)
+            if te is not None:
+                # 假设上下文特征是字符串或可以转换为字符串的类别
+                feat_vals = X[:, i].astype(str)
+                X_ctx_enc = te.transform(feat_vals)
+                X_ctx_list.append(X_ctx_enc.flatten())
+                ctx_names_out.append(f"{feature_names[i]}_target_encoded")
+            else:
+                print(f"  - 警告: 未找到特征 '{feature_names[i]}' 的目标编码器，将保留原始数值。")
+                X_ctx_list.append(X[:, i])
+        if X_ctx_list:
+            X_ctx_final = np.column_stack(X_ctx_list)
+            processed_parts.append(X_ctx_final)
+            processed_names.extend(ctx_names_out)
+            print(f"  - 上下文特征 ({len(ctx_idx)} 个): 已进行目标编码")
+        else:
+            print("  - 上下文特征处理失败。")
+
+    if processed_parts:
+        X_processed = np.hstack(processed_parts)
+        print(f"推理分级处理完成，输出特征数: {X_processed.shape[1]}")
+        return X_processed, processed_names
+    else:
+        print("未找到匹配任何分级的特征，返回原始数据。")
+        return X, feature_names
+
+
 class ModelPipelineWrapper:
-    """
-    包装整个模型流水线的对象，提供predict和predict_proba接口。
-    """
+    """包装加载的模型字典，提供统一的预测接口"""
 
     def __init__(self, model_artifact_dict):
-        """
-        初始化包装器。
-
-        :param model_artifact_dict: 由训练脚本保存的包含所有组件的字典。
-        """
-        self.artifact = model_artifact_dict
-        # 提取各个组件
-        self.imputer = self.artifact["imputer"]
-        self.scaler = self.artifact["scaler"]
-        self.variance_selector = self.artifact["variance_selector"]
-
-        # 训练时最终选定的特征名称列表
-        self.selected_feature_names = self.artifact["selected_feature_names"]
-
-        # 基础模型和元模型
-        self.base_model = self.artifact["base_models"]
-        self.meta_model = self.artifact["meta_nb"]
-
-        # 决策阈值
-        self.threshold = self.artifact["threshold"]
-
-        # 拓扑相关配置 (记录状态，但预测时不执行)
-        self.add_topological_features = self.artifact.get("add_topological_features", False)
-        if self.add_topological_features and not TOPOLOGY_AVAILABLE:
-            print("警告: 模型配置使用了拓扑特征，但预测环境中未启用或缺少 gtda 库。"
-                  "预测将基于不含拓扑特征的数据进行，请确认这与训练方式一致。")
-
-        # RFA相关 (用于理解训练过程，但不影响预测核心逻辑)
-        self.use_rfa = self.artifact.get("use_rfa", True)
+        self.artifact_dict = model_artifact_dict
+        # 从字典中提取各个组件
+        self.imputer = self.artifact_dict["imputer"]
+        self.scaler = self.artifact_dict["scaler"]
+        self.variance_selector = self.artifact_dict["variance_selector"]
+        self.selected_feature_names = self.artifact_dict["selected_feature_names"]
+        self.base_model = self.artifact_dict["base_models"]
+        self.meta_model = self.artifact_dict["meta_nb"]
+        self.threshold = self.artifact_dict["threshold"]
+        self.use_hierarchical_processing = self.artifact_dict.get("use_hierarchical_processing", False)
+        # 注意：训练时未保存 encoders 和 discretizers，推理时无法直接使用。
+        # 这是一个简化示例。在完整实现中，应在训练时保存这些对象。
+        self.encoders = {}  # 在此示例中为空
+        self.discretizers = {}  # 在此示例中为空
 
     def _preprocess(self, X_df):
-        """
-        对输入的DataFrame进行预处理，使其与训练时的格式一致。
-        包括：独热编码、方差过滤、插补、标准化、特征对齐。
-        """
-        print("正在进行预测数据预处理...")
+        """内部预处理函数"""
+        print("开始预处理测试数据...")
+        # 1. 确保列顺序与训练时一致（如果需要）
+        #    这里假设输入DataFrame的列已经与训练时选择的特征一致
+        #    实际应用中可能需要更复杂的映射和处理
 
-        # 1. 独热编码 (模拟训练时的行为)
-        #    假设 X_df 是原始特征，可能需要 OHE。
-        #    注意：必须与训练时使用的 get_dummies 参数保持一致。
-        X_encoded_df = pd.get_dummies(X_df, drop_first=True)
-        print(f"独热编码后特征数: {X_encoded_df.shape[1]}")
+        # 2. 独热编码 (如果训练时有)
+        #    这里假设测试数据已经经过了与训练数据相同的预处理步骤
+        #    例如，分类变量已经被正确编码或在训练时被丢弃
+        #    为简化，我们假设输入已经是数值型且列名匹配
+        feature_names_initial = X_df.columns.tolist()
+        X_numeric = X_df.values
 
-        # 2. 获取训练时初始特征名（用于后续步骤参考）
-        #    这一步是为了知道哪些特征应该参与 variance_filtering。
-        #    实际项目中，这部分信息最好也保存下来。
-        initial_feature_names = self._get_initial_feature_names()
+        # 3. 方差筛选
+        print("应用 VarianceFilter...")
+        X_after_variance = self.variance_selector.transform(X_numeric)
+        selected_feature_idx_post_variance = self.variance_selector.get_support(indices=True)
+        selected_feature_names_post_variance = [feature_names_initial[i] for i in selected_feature_idx_post_variance]
+        print(
+            f"经过 VarianceFilter 后: 保留了 {X_after_variance.shape[1]} 个特征 (移除了 {len(feature_names_initial) - len(selected_feature_names_post_variance)})")
 
-        # 3. 确保特征列与训练时经过VarianceFilter后的列对齐
-        #    a. 找出训练时经过 VarianceThreshold 后保留的特征名
-        selected_feature_names_post_variance_from_training = [
-            name for i, name in enumerate(initial_feature_names)
-            if i in self.variance_selector.get_support(indices=True)
-        ]
-        print(f"训练时方差过滤后应保留特征数: {len(selected_feature_names_post_variance_from_training)}")
-
-        #    b. 对齐预测数据集中的特征
-        #       缺失的特征用0填充（或根据业务逻辑）
-        #       多余的特征会被丢弃
-        for feat_name in selected_feature_names_post_variance_from_training:
-            if feat_name not in X_encoded_df.columns:
-                print(f"警告: 特征 '{feat_name}' 在预测数据中缺失，将以0填充。")
-                X_encoded_df[feat_name] = 0
-
-                #    c. 只保留经过方差筛选的特征 (按训练时的顺序)
-        try:
-            X_aligned_variance_filtered = X_encoded_df[selected_feature_names_post_variance_from_training].values
-        except KeyError as e:
-            print(f"错误: 预测数据无法正确对齐方差过滤后的特征。缺失特征: {e}")
-            raise
-
-        current_feature_names_after_variance = selected_feature_names_post_variance_from_training.copy()
-        print(f"方差过滤后特征矩阵形状: {X_aligned_variance_filtered.shape}")
-
-        # 4. 插补 (使用训练时fit的imputer)
-        X_imputed = self.imputer.transform(X_aligned_variance_filtered)
-        print(f"插补后特征矩阵形状: {X_imputed.shape}")
-
-        # 5. 标准化 (使用训练时fit的scaler)
-        X_scaled = self.scaler.transform(X_imputed)
-        print(f"标准化后特征矩阵形状: {X_scaled.shape}")
-
-        # 6. 最终特征对齐 (确保列名和顺序与模型期望的一致)
-        #    此时 X_scaled 的列对应于 current_feature_names_after_variance
-
-        # 查找最终选中特征在当前处理后特征中的索引
-        final_selected_names = self.selected_feature_names
-        indices_of_final_selected_features = []
-        missing_features_in_final_set = []
-
-        for name in final_selected_names:
+        # 4. 分级处理 (如果启用)
+        if self.use_hierarchical_processing:
+            # 注意：此示例中 encoders 和 discretizers 为空，因此实际效果是保留原始特征或使用默认处理
+            # 在完整实现中，需要加载训练时保存的这些对象
             try:
-                idx = current_feature_names_after_variance.index(name)
-                indices_of_final_selected_features.append(idx)
-            except ValueError:
-                # 如果找不到，可能是交互项或拓扑特征命名存在差异
-                # 但由于我们在预测时不再生成这些，它们必须存在于 current_feature_names_after_variance 中
-                # 否则说明训练和预测的数据预处理不匹配
-                missing_features_in_final_set.append(name)
+                X_hierarchical_processed, names_hierarchical_processed = hierarchical_processing_inference(
+                    X_after_variance, selected_feature_names_post_variance, self.encoders, self.discretizers
+                )
+                X_after_hierarchical = X_hierarchical_processed
+                feature_names_after_hierarchical = names_hierarchical_processed
+                print(f"分级处理后特征数: {len(feature_names_after_hierarchical)}")
+            except Exception as e:
+                print(f"推理时分级处理失败: {e}。回退到方差筛选后的特征。")
+                X_after_hierarchical = X_after_variance
+                feature_names_after_hierarchical = selected_feature_names_post_variance
+        else:
+            X_after_hierarchical = X_after_variance
+            feature_names_after_hierarchical = selected_feature_names_post_variance
 
-        if missing_features_in_final_set:
-            error_msg = (f"严重错误: 以下特征在预处理后的特征集中未找到，但却是模型所必需的: "
-                         f"{missing_features_in_final_set}. "
-                         f"请检查预测数据的特征工程是否与训练时完全一致。")
-            print(error_msg)
-            raise ValueError(error_msg)
+        # 5. 插补和标准化
+        print("进行插补和标准化...")
+        X_imputed = self.imputer.transform(X_after_hierarchical)
+        X_scaled = self.scaler.transform(X_imputed)
 
-        if not indices_of_final_selected_features:
-            raise ValueError("没有找到任何训练时选定的特征。")
+        # 6. 特征对齐 (确保特征顺序和数量与模型训练时一致)
+        #    假设 self.selected_feature_names 已经包含了所有需要的特征（包括可能的拓扑特征）
+        #    并且经过上述步骤后，X_scaled 的列已经与之对应。
+        #    如果存在不匹配（例如，训练时用了RFA但这里没有），则需要更复杂的映射逻辑。
+        #    此示例假设处理后的特征与模型期望的特征完全匹配。
 
-        # 选择最终进入模型的特征
-        X_final_preprocessed = X_scaled[:, indices_of_final_selected_features]
-        print(f"最终预处理后特征矩阵形状: {X_final_preprocessed.shape}, 特征数: {len(final_selected_names)}")
-
-        return X_final_preprocessed
-
-    def _get_initial_feature_names(self):
-        """
-        辅助函数：重建训练开始时的特征名称列表。
-        ***注意***: 这个函数需要与训练脚本严格同步！
-        因为它没有被保存到 pkl 中，所以这是一个脆弱的设计点。
-        推荐做法是在训练时也将此列表存入 model.pkl 字典。
-        """
-        # 这些参数需要与训练脚本保持一致才能正确工作
-        N_FEATURES_TOTAL = 20  # 示例值，需根据实际情况调整
-        ZERO_VAR_FEATS = 2  # 示例值，需根据实际情况调整
-        FEATURE_NAMES_LIST = [f"f{i}" for i in range(N_FEATURES_TOTAL - ZERO_VAR_FEATS)] \
-                             + [f"zero_var_{j}" for j in range(ZERO_VAR_FEATS)]
-        return FEATURE_NAMES_LIST
+        print("预处理完成。")
+        return X_scaled
 
     def predict_proba(self, X_df):
-        """
-        对输入数据进行预测，返回各类别的概率。
-
-        :param X_df: pandas.DataFrame, 待预测的数据，列名为特征名。
-        :return: numpy.ndarray, shape (n_samples, 2), 第一列为负类概率，第二列为正类概率。
-        """
-        # 预处理
+        """获取预测概率"""
         X_processed = self._preprocess(X_df)
-
-        # 使用基础模型预测概率
-        try:
-            probas_base = self.base_model.predict_proba(X_processed)  # 返回 [neg_prob, pos_prob]
-        except AttributeError:
-            # 如果 base_model 没有 predict_proba，尝试用 predict 并假设输出是概率
-            pred_or_score = self.base_model.predict(X_processed)
-            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
-                # 假设是一维概率数组
-                clipped_probs = np.clip(pred_or_score.flatten(), 0, 1)
-                probas_base = np.column_stack([1 - clipped_probs, clipped_probs])
-            else:
-                # 假设是二维概率数组
-                probas_base = pred_or_score
-
-        return probas_base  # 已经是正确的 [neg_prob, pos_prob] 形式
+        # 假设 base_model 是 WrappedXGBPredictiveModel 或类似接口
+        return self.base_model.predict_proba(X_processed)
 
     def predict(self, X_df):
-        """
-        对输入数据进行预测，返回类别标签 (0 或 1)。
-
-        :param X_df: pandas.DataFrame, 待预测的数据，列名为特征名。
-        :return: numpy.ndarray, shape (n_samples,), 类别标签。
-        """
-        # 预处理
+        """获取最终预测结果"""
         X_processed = self._preprocess(X_df)
-
-        # 调用级联预测逻辑
-        preds, _ = self._cascade_predict(X_processed)
+        # 假设 base_model 和 meta_model 有 predict_proba 或 predict 方法
+        # 这里简化实现，直接使用基础模型的概率和阈值
+        # 级联预测逻辑可以更复杂，但需要保存 meta_model 的输入特征对齐信息
+        probas = self.base_model.predict_proba(X_processed)[:, 1]
+        preds = (probas >= self.threshold).astype(int)
         return preds
-
-    def _cascade_predict(self, X):
-        """内部方法：执行级联预测逻辑"""
-        try:
-            probas_base_full = self.base_model.predict_proba(X)  # [neg_prob, pos_prob]
-            probas_base = probas_base_full[:, 1]  # 获取正类概率
-        except AttributeError:
-            pred_or_score = self.base_model.predict(X)
-            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
-                probas_base = np.clip(pred_or_score.flatten(), 0, 1)
-            else:
-                probas_base = pred_or_score[:, 1]
-
-        # 应用最优阈值进行初步分类
-        preds = (probas_base >= self.threshold).astype(int)
-
-        # 确定不确定性样本
-        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
-
-        # 如果有不确定样本且元模型可用，则使用元模型重新预测
-        if self.meta_model is not None and uncertain_mask.sum() > 0:
-            print(f"发现 {uncertain_mask.sum()} 个不确定性样本，交由元模型处理...")
-
-            if hasattr(self.meta_model, 'predict_proba'):
-                try:
-                    meta_probas_full = self.meta_model.predict_proba(X[uncertain_mask])
-                    meta_preds = (meta_probas_full[:, 1] >= 0.5).astype(int)  # 使用元模型的概率做判断
-                except Exception as e:
-                    print(f"使用元模型 predict_proba 出错 ({e}), 尝试直接 predict...")
-                    meta_preds = self.meta_model.predict(X[uncertain_mask])
-            else:
-                meta_preds = self.meta_model.predict(X[uncertain_mask])
-
-            preds[uncertain_mask] = meta_preds.astype(int)
-
-        return preds, probas_base  # 返回标签和基础模型的正类概率
 
 
 if __name__ == "__main__":
