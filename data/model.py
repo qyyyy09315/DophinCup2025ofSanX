@@ -649,7 +649,7 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
 if __name__ == "__main__":
     print("=" * 60)
     print("训练流水线启动:")
-    print("- 方差筛选 -> RFA (自动确定特征数)")
+    print("- 方差筛选 -> 直接进入模型训练 (取消RFA)")
     print("- 移除特征聚类阶段。")
     print("- 缺失值填补方式变更为 KNNImputer (邻居数=5)。")
     print("- 为WGAN-GP增加了动态学习率调度 (CosineAnnealingLR)。")
@@ -668,7 +668,7 @@ if __name__ == "__main__":
     RANDOM_STATE = 42
     VARIANCE_THRESHOLD_VALUE = 0.0
     CV_FOLDS_FOR_RFE = 3
-    USE_RFA = True  # 现在总是为真
+    USE_RFA = False  # 修改：不再使用RFA
     ADD_TOPOLOGICAL_FEATURES = True
     USE_ADAPTIVE_SCALES = False  # 再次禁用自适应缩放逻辑
     USE_HIERARCHICAL_PROCESSING = True  # 启用分级处理
@@ -775,8 +775,7 @@ if __name__ == "__main__":
     POSITIVE_CLASS_COUNT_INITIAL = LABEL_VECTOR_ALL.sum()
     NEGATIVE_CLASS_COUNT_INITIAL = (LABEL_VECTOR_ALL == 0).sum()
     print(f"加载的数据形状: 特征({FEATURES_MATRIX_ALL.shape}), 标签({LABEL_VECTOR_ALL.shape}).")
-    print(
-        f"预处理前的类别分布: 正类={POSITIVE_CLASS_COUNT_INITIAL}, 负类={NEGATIVE_CLASS_COUNT_INITIAL}")
+    print(f"预处理前的类别分布: 正类={POSITIVE_CLASS_COUNT_INITIAL}, 负类={NEGATIVE_CLASS_COUNT_INITIAL}")
 
     # 第二步：方差筛选
     print(f"应用 VarianceFilter，阈值={VARIANCE_THRESHOLD_VALUE} ...")
@@ -785,19 +784,7 @@ if __name__ == "__main__":
     SELECTED_FEATURE_IDX_POST_VARIANCE = selector_variance_filter.get_support(indices=True)
     SELECTED_FEATURE_NAMES_POST_VARIANCE = [INITIAL_FEATURE_NAMES[i] for i in SELECTED_FEATURE_IDX_POST_VARIANCE]
     print(
-        f"经过 VarianceFilter 后: 保留了 {FEATURES_AFTER_VARIANCE_FILTERING.shape[1]} 个特征 "
-        f"(移除了 {len(INITIAL_FEATURE_NAMES) - len(SELECTED_FEATURE_NAMES_POST_VARIANCE)})")
-
-    # 第三步：插补与标准化 (在分级处理后进行)
-    # knn_imputer_instance = KNNImputer(n_neighbors=5)
-    # FEATURES_IMPUTED_NO_MISSING = knn_imputer_instance.fit_transform(FEATURES_AFTER_VARIANCE_FILTERING)
-
-    # standard_scaler_instance = StandardScaler()
-    # FEATURES_SCALED_STANDARDIZED = standard_scaler_instance.fit_transform(FEATURES_IMPUTED_NO_MISSING)
-
-    # save_object(knn_imputer_instance, "./imputer.pkl")
-    # save_object(standard_scaler_instance, "./scaler.pkl")
-    # save_object(selector_variance_filter, "./variance_selector.pkl")
+        f"经过 VarianceFilter 后: 保留了 {FEATURES_AFTER_VARIANCE_FILTERING.shape[1]} 个特征 (移除了 {len(INITIAL_FEATURE_NAMES) - len(SELECTED_FEATURE_NAMES_POST_VARIANCE)})")
 
     # ===================== 核心修改：添加特征分级处理 =====================
     print("\n执行增强型流水线: 添加特征分级处理...\n")
@@ -865,9 +852,9 @@ if __name__ == "__main__":
         print(
             f"成功追加了 {COUNT_NEWLY_ADDED_TOPOLOGY_FEATURES} 个拓扑描述符。新的总数: {FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1]}")
 
+
     elif ADD_TOPOLOGICAL_FEATURES and not TOPOLOGY_AVAILABLE:
-        print(
-            "由于缺少依赖项 ('giotto-tda')，请求的拓扑分析已跳过。请安装软件包以启用该功能。")
+        print("由于缺少依赖项 ('giotto-tda')，请求的拓扑分析已跳过。请安装软件包以启用该功能。")
 
     UPDATED_COMPLETE_FEATURE_SET_NAMES = FEATURE_NAMES_AFTER_HIERARCHICAL + TOPOLOGY_FEATURE_NAME_PREFIXES
 
@@ -878,43 +865,22 @@ if __name__ == "__main__":
     FINAL_FEATURE_NAMES_WITH_INTERACTIONS = UPDATED_COMPLETE_FEATURE_SET_NAMES
     # ===================== 动态特征交互构建结束 =====================
 
-    # ===================== 核心修改：取消特征聚类，直接应用RFA =====================
-    print("\n执行增强型流水线: 不经特征聚类直接运行RFA...\n")
+    # ===================== 核心修改：取消RFA，直接使用分级处理后的特征=====================
+    print("\n执行增强型流水线: 取消RFA，直接使用分级处理后的特征进行训练...\n")
 
-    # B阶段：对所有特征（包括交互项）应用RFA（取消聚类步骤）
-    estimator_used_by_rfa = xgb.XGBClassifier(**XGB_PARAMS)
+    # 不再运行RFA，而是直接使用处理后的特征
+    FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_INTERACTIONS
+    NAMES_FINAL_SELECTED_FEATURES = FINAL_FEATURE_NAMES_WITH_INTERACTIONS
+    INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_INTERACTIONS.shape[1])  # 回退到完整索引
 
-    try:
-        FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES, SCORE_HISTORY_PER_STEP, FULL_RANKINGS_INFO_ARRAY = recursive_feature_addition(
-            estimator_used_by_rfa,
-            FEATURES_WITH_INTERACTIONS,  # 使用包含交互项的特征矩阵
-            LABEL_VECTOR_ALL,
-            cv=StratifiedKFold(n_splits=CV_FOLDS_FOR_RFE, shuffle=True, random_state=RANDOM_STATE),
-            scoring='roc_auc'
-        )
+    # 创建一个假的排名数组，表示所有特征都被选中并且排名相同（因为我们没有排序）
+    FULL_RANKINGS_INFO_ARRAY = np.ones(FEATURES_WITH_INTERACTIONS.shape[1])
 
-        # 映射局部索引回到完整特征空间（降维前）
-        ABSOLUTE_INDICES_OF_CHOSEN_FEATURES = FULL_RANKINGS_INFO_ARRAY.argsort()
-        INDEX_MAPPING_LOCAL_TO_GLOBAL = FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES
+    # 打印最终使用的特征列表
+    feature_list_str = '\n'.join(['  ' + str(name) for name in NAMES_FINAL_SELECTED_FEATURES])
+    print(f"\n最终特征列表 (共 {len(NAMES_FINAL_SELECTED_FEATURES)} 个):\n{feature_list_str}\n")
 
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_INTERACTIONS[:,  # 使用包含交互项的特征矩阵
-                                         FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
-        NAMES_FINAL_SELECTED_FEATURES = [FINAL_FEATURE_NAMES_WITH_INTERACTIONS[i] for i in  # 使用更新后的特征名
-                                         FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
-
-        # 修复f-string中的反斜杠问题
-        feature_list_str = '\n'.join(['  ' + str(name) for name in NAMES_FINAL_SELECTED_FEATURES])
-        print(
-            f"\n最终特征选择结果: 选择了 {len(NAMES_FINAL_SELECTED_FEATURES)} 个。\n列表:\n{feature_list_str}\n")
-
-    except Exception as err_msg:
-        print(f"在RFA执行阶段发生错误: {err_msg}")
-        print("回退到未经进一步精炼的所有特征。")
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_INTERACTIONS  # 回退到包含交互项的特征矩阵
-        NAMES_FINAL_SELECTED_FEATURES = FINAL_FEATURE_NAMES_WITH_INTERACTIONS  # 回退到更新后的特征名
-        INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_INTERACTIONS.shape[1])  # 回退到完整索引
-
-    # 保存由修改后的RFA函数得到的综合排名信息
+    # 保存由修改后的流程得到的信息（模拟RFA的结果）
     save_object(FULL_RANKINGS_INFO_ARRAY, "./rfe_feature_ranking.pkl")
     # ====================== 核心修改结束 =======================
 
@@ -1012,7 +978,7 @@ if __name__ == "__main__":
     RECALL_BEST, PRECISION_BEST, SPECIFICITY_BEST = METRICS_AT_OPTIMAL_POINT
 
     PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH = (
-            PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
+                PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
 
     ROC_AREA_UNDER_CURVE = roc_auc_score(HOLDOUT_TARGET_SPLIT, PROBABILITIES_HOLDOUT_COMBINED_PIPELINE)
     ACCURACY_BEST = accuracy_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH)
@@ -1025,7 +991,7 @@ if __name__ == "__main__":
     # <<<--------------------------------------------------->>>
 
     # 自定义最终评价分数公式 (注意这里也做了修改)
-    # CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * ACCURACY_BEST + 30 * RECALL_CALCULATED_AGAIN
+    # CUSTOM_EVALUATION_SCORE_FINAL = 50*ROC_AREA_UNDER_CURVE + 20*ACCURACY_BEST + 30*RECALL_CALCULATED_AGAIN
     CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * PRECISION_CALCULATED + 30 * RECALL_CALCULATED_AGAIN
 
     print(f"\n选定的最佳操作点 (阈值): {OPTIMAL_DECISION_BOUNDARY:.4f}")
