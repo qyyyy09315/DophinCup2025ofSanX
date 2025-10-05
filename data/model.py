@@ -683,6 +683,7 @@ if __name__ == "__main__":
     print("-> 构建异构修整器池，在其中挑选最适合的分类器")
     print("-> 加入拓扑数据分析(TDA)特征提取模块")
     print("-> 动态拓扑尺度选择")
+    print("-> 取消拓扑特征构建的多尺度识别")
     print("=" * 60)
     # ===================== 主要修改区域结束 =====================
 
@@ -720,7 +721,7 @@ if __name__ == "__main__":
     cv_folds_for_rfe = 3  # Note: still used by RFA internally even though named rfe
     use_rfa = True  # <--- 新增配置项：是否使用 RFA (强制开启)
     add_topological_features = True  # <--- 新增配置项：是否添加拓扑特征
-    use_adaptive_scales = True  # <--- 新增配置项：是否使用动态拓扑尺度
+    use_adaptive_scales = False  # <--- 修改配置项：取消动态拓扑尺度
 
     # 拓扑分析配置
     topo_homology_dims = [0, 1]  # Extract H0 (connected components) and H1 (loops)
@@ -839,25 +840,8 @@ if __name__ == "__main__":
                 print(f"  已处理 {i + 1}/{total_samples} 个样本的拓扑特征...")
 
             # --- Modified call to include dynamic scaling ---
-            if use_adaptive_scales:
-                # Compute scale factor for this specific sample row
-                # Here we apply the inverse of the scale factors derived from global feature importances
-                # So that important features contribute less to distance (more fine-grained structure captured)
-                # 修复：正确传递参数
-                inv_scales = 1.0 / adaptive_scale_selection(X_scaled_initial, feature_importances_temp)
-                effective_scale = np.prod(inv_scales) ** (1. / len(inv_scales))  # Geometric mean as overall multiplier?
-                # Or simpler approach just pass average or median? For now keep product idea...
-                # Actually let's do element-wise multiplication then take geometric mean maybe overkill so direct usage might work better conceptually though unclear how exactly without modifying VR constructor which takes uniform metric
-
-                # Pass geometric mean of reciprocal scales as an approximate multiplicative factor
-                approx_effective_avg_inv_scale = np.exp(
-                    np.mean(np.log(1. / adaptive_scale_selection(X_scaled_initial, feature_importances_temp))))
-
-                topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims,
-                                                             scale_factor=approx_effective_avg_inv_scale)
-
-            else:
-                topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims)
+            # 取消动态尺度
+            topo_feat_vec = extract_topological_features(sample_row, homology_dims=topo_homology_dims)
 
             topo_features_list.append(topo_feat_vec)
 
