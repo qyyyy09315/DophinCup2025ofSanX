@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""增强版机器学习管道，实现了带特征聚类的递归特征添加(RFA)优化。"""
+"""增强版机器学习管道，实现了优化的过采样策略。"""
 
 import os
 import pickle
@@ -12,16 +12,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
-# --- 修改导入 ---
-# 导入 AgglomerativeClustering 而不是 FeatureAgglomeration
-from sklearn.cluster import AgglomerativeClustering
-# ---
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer
 from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
 
 # 尝试导入 giotto-tda 用于拓扑数据分析
 try:
@@ -214,93 +211,23 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
     return best_t, best_score, best_metrics
 
 
-# ========== 核心修改：引入特征聚类 ==========
-# --- 修改后的 feature_clustering 函数 ---
-def feature_clustering(X, n_clusters_ratio=0.5):
-    """
-    基于特征间相关性的聚类，以减少冗余特征。
-    使用 AgglomerativeClustering 和预计算的距离矩阵。
-
-    Args:
-        X: 输入特征矩阵 (numpy array)。
-        n_clusters_ratio: 目标簇数量相对于原始特征数的比例。
-
-    Returns:
-        cluster_labels: 每个特征所属的簇标签。
-        representative_indices: 每个簇中选出的一个代表性特征索引。
-    """
-    print("Performing feature clustering to reduce redundancy...")
-
-    # 检查并处理NaN值
-    if np.isnan(X).any():
-        print("Warning: NaN values detected in input data for clustering. Attempting to fix...")
-        # 使用列均值填充NaN值
-        col_means = np.nanmean(X, axis=0)
-        inds = np.where(np.isnan(X))
-        X[inds] = np.take(col_means, inds[1])
-
-    # 再次检查是否还有NaN值
-    if np.isnan(X).any():
-        print("Error: Still NaN values present after imputation. Cannot proceed with clustering.")
-        # 返回所有特征作为代表（跳过聚类）
-        return np.zeros(X.shape[1]), np.arange(X.shape[1])
-
-    n_original_features = X.shape[1]
-    n_clusters_target = max(1, int(n_original_features * n_clusters_ratio))
-    print(f"Target number of clusters after agglomeration: {n_clusters_target}")
-
-    # 计算特征之间的皮尔逊相关系数矩阵
-    corr_matrix = np.corrcoef(X, rowvar=False)  # rowvar=False 表示每一列是一个变量
-
-    # 将相关系数转换为距离矩阵: distance = 1 - |correlation|
-    # 使用绝对值是因为我们关心的是相关性的强度，而不是方向
-    # np.clip 确保结果在 [0, 1] 范围内，避免浮点数精度问题
-    distance_matrix = np.clip(1 - np.abs(corr_matrix), 0, 2)
-
-    # 检查距离矩阵是否有NaN值
-    if np.isnan(distance_matrix).any():
-        print("Warning: NaN values detected in correlation matrix. Replacing with 1 (maximum distance)...")
-        distance_matrix[np.isnan(distance_matrix)] = 1
-
-    # 使用 AgglomerativeClustering 对特征（现在是距离矩阵的节点）进行聚类
-    # linkage='average' 对应于 UPGMA 方法，通常效果不错
-    agglo = AgglomerativeClustering(
-        n_clusters=n_clusters_target,
-        metric='precomputed',  # 指定使用预计算的距离矩阵
-        linkage='average'  # 使用平均链接
-    )
-
-    # Fit the model and get cluster labels for each original feature
-    cluster_labels = agglo.fit_predict(distance_matrix)
-    print(f"Clustering resulted in {len(set(cluster_labels))} distinct clusters.")
-
-    # Select one representative feature per cluster (the one with highest variance)
-    representative_indices = []
-    for cluster_id in set(cluster_labels):
-        indices_in_cluster = np.where(cluster_labels == cluster_id)[0]
-
-        # Calculate variances for features within the current cluster
-        vars_in_cluster = np.var(X[:, indices_in_cluster], axis=0)
-
-        # Find index (within the subset) that has maximum variance
-        idx_of_max_var_within_cluster = np.argmax(vars_in_cluster)
-
-        # Map back to original feature space index
-        selected_feature_index = indices_in_cluster[idx_of_max_var_within_cluster]
-        representative_indices.append(selected_feature_index)
-
-    print(f"Selected {len(representative_indices)} representative features from clusters.")
-    return cluster_labels, np.array(representative_indices)
-
-
-# --- 修改结束 ---
+# ========== 核心修改：添加生成样本质量控制 ==========
+def quality_filter(generated, original, threshold=0.95):
+    """基于KNN相似度过滤生成样本"""
+    print("Filtering generated samples based on KNN similarity...")
+    nn = NearestNeighbors(n_neighbors=5).fit(original)
+    distances, _ = nn.kneighbors(generated)
+    mean_distances = np.mean(distances, axis=1)
+    mask = mean_distances < threshold
+    filtered_samples = generated[mask]
+    print(f"Filtered out {len(generated) - len(filtered_samples)} samples. Kept {len(filtered_samples)} samples.")
+    return filtered_samples
 
 
 # --- RFA (Recursive Feature Addition) 实现 ---
 def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_features=5):
     """
     递归特征添加 (RFA) 算法，自动确定最优特征数量。
-    修改后：这是唯一的特征选择步骤。
     """
     print("Starting Recursive Feature Addition (RFA)...")
     n_features = X.shape[1]
@@ -455,9 +382,10 @@ def compute_gradient_penalty(critic, real_samples, fake_samples, device):
 
 
 def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=300, batch_size=64, lr=0.0001,
-                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, T_max=None):
+                    device='cpu', n_critic=5, clip_value=0.01, lambda_gp=10, T_max=None, filter_threshold=0.95):
     """
     使用 WGAN-GP 对少数类样本进行过采样，并加入动态学习率调度 (余弦退火)。
+    添加了生成样本质量控制过滤器。
     """
     print("Starting WGAN-GP oversampling (with cosine annealing LR schedule)...")
     X_minority = X_train[y_train == minority_class]
@@ -544,13 +472,16 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
         z_new = torch.randn(num_to_generate, latent_dim, device=device)
         generated_data = generator(z_new).cpu().numpy()
 
+    # Apply quality filtering
+    filtered_generated_data = quality_filter(generated_data, X_minority, threshold=filter_threshold)
+
     # Combine original and generated data
-    resampled_X = np.vstack([X_train, generated_data])
-    new_labels = np.full(num_to_generate, minority_class)
+    resampled_X = np.vstack([X_train, filtered_generated_data])
+    new_labels = np.full(len(filtered_generated_data), minority_class)
     resampled_y = np.hstack([y_train, new_labels])
 
     counts_after_sampling = dict(zip(*np.unique(resampled_y, return_counts=True)))
-    print(f"WGAN-GP sampling finished. Generated {num_to_generate} new samples.")
+    print(f"WGAN-GP sampling finished. Generated {len(filtered_generated_data)} new samples after filtering.")
     print(f"Distribution after resampling: {counts_after_sampling}")
     return resampled_X, resampled_y
 
@@ -559,14 +490,15 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
 if __name__ == "__main__":
     print("=" * 60)
     print("Training Pipeline Started:")
-    print("- Variance Filter -> Feature Clustering -> Representative Selection -> RFA (Automatic Feature Count)")
-    print("- Removed Balanced Random Forest stage.")
+    print("- Variance Filter -> RFA (Automatic Feature Count)")
+    print("- Removed Feature Clustering stage.")
     print("- Missing value imputation changed to KNNImputer (n_neighbors=5).")
     print("- Dynamic learning rate scheduling added to WGAN-GP (CosineAnnealingLR).")
     print("- Threshold selection optimized for positive class metrics.")
     print("- Cascade corrector switched to GradientBoostingClassifier.")
     print("- Added Topological Data Analysis (TDA) feature extraction module.")
     print("- Disabled multi-scale recognition in topology construction.")
+    print("- Added quality filtering for WGAN-GP generated samples.")
     print("=" * 60)
 
     # Configuration Section
@@ -579,8 +511,6 @@ if __name__ == "__main__":
     ADD_TOPOLOGICAL_FEATURES = True
     USE_ADAPTIVE_SCALES = False  # Disable adaptive scaling logic again
 
-    CLUSTERING_RATIO = 0.7  # Retain ~70% of features via clustering representatives
-
     TOPO_HOMOLOGY_DIMS = [0, 1]
 
     WGANGP_CONFIG = {
@@ -591,7 +521,8 @@ if __name__ == "__main__":
         'lambda_gp': 10,
         'n_critic': 5,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'T_max': None
+        'T_max': None,
+        'filter_threshold': 0.95  # 添加过滤阈值
     }
 
     XGB_PARAMS = {
@@ -746,42 +677,28 @@ if __name__ == "__main__":
 
     UPDATED_COMPLETE_FEATURE_SET_NAMES = SELECTED_FEATURE_NAMES_POST_VARIANCE + TOPOLOGY_FEATURE_NAME_PREFIXES
 
-    # ===================== Core Modification Begins Here =====================
-    print("\nExecuting enhanced pipeline: Feature Clustering followed by RFA...\n")
+    # ===================== 核心修改：取消特征聚类，直接应用RFA =====================
+    print("\nExecuting enhanced pipeline: Direct RFA without feature clustering...\n")
 
-    # Stage A: Cluster Features to Reduce Redundancy
-    _, REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING = feature_clustering(
-        FEATURES_WITH_OPTIONAL_TOPOLOGY,
-        n_clusters_ratio=CLUSTERING_RATIO
-    )
-
-    # Create reduced view of data containing only these representative features
-    FEATURES_REDUCED_BY_CLUSTER_SELECTION = FEATURES_WITH_OPTIONAL_TOPOLOGY[:,
-                                            REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING]
-    NAMES_REPRESENTATIVES_ONLY = [UPDATED_COMPLETE_FEATURE_SET_NAMES[i] for i in
-                                  REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING]
-
-    # Stage B: Apply RFA Only On These Representatives
+    # Stage B: Apply RFA on all features (取消聚类步骤)
     estimator_used_by_rfa = xgb.XGBClassifier(**XGB_PARAMS)
 
     try:
         FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES, SCORE_HISTORY_PER_STEP, FULL_RANKINGS_INFO_ARRAY = recursive_feature_addition(
             estimator_used_by_rfa,
-            FEATURES_REDUCED_BY_CLUSTER_SELECTION,
+            FEATURES_WITH_OPTIONAL_TOPOLOGY,
             LABEL_VECTOR_ALL,
             cv=StratifiedKFold(n_splits=CV_FOLDS_FOR_RFE, shuffle=True, random_state=RANDOM_STATE),
             scoring='roc_auc'
         )
 
         # Map local indices back to full feature space (before reduction step)
-        ABSOLUTE_INDICES_OF_CHOSEN_FEATURES = REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING[
-            FULL_RANKINGS_INFO_ARRAY.argsort()]
-        INDEX_MAPPING_LOCAL_TO_GLOBAL = REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING[
-            FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
+        ABSOLUTE_INDICES_OF_CHOSEN_FEATURES = FULL_RANKINGS_INFO_ARRAY.argsort()
+        INDEX_MAPPING_LOCAL_TO_GLOBAL = FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES
 
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_REDUCED_BY_CLUSTER_SELECTION[:,
+        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_OPTIONAL_TOPOLOGY[:,
                                          FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
-        NAMES_FINAL_SELECTED_FEATURES = [NAMES_REPRESENTATIVES_ONLY[i] for i in
+        NAMES_FINAL_SELECTED_FEATURES = [UPDATED_COMPLETE_FEATURE_SET_NAMES[i] for i in
                                          FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
 
         # 修复f-string中的反斜杠问题
@@ -791,14 +708,14 @@ if __name__ == "__main__":
 
     except Exception as err_msg:
         print(f"Error occurred during RFA execution phase: {err_msg}")
-        print("Falling back to clustered-reduced feature pool without further refinement.")
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_REDUCED_BY_CLUSTER_SELECTION
-        NAMES_FINAL_SELECTED_FEATURES = NAMES_REPRESENTATIVES_ONLY
-        INDEX_MAPPING_LOCAL_TO_GLOBAL = REPRESENTATIVE_FEATURE_INDICES_FROM_CLUSTERING
+        print("Falling back to all features without further refinement.")
+        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_OPTIONAL_TOPOLOGY
+        NAMES_FINAL_SELECTED_FEATURES = UPDATED_COMPLETE_FEATURE_SET_NAMES
+        INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1])
 
     # Save comprehensive ranking info obtained from modified RFA function
     save_object(FULL_RANKINGS_INFO_ARRAY, "./rfe_feature_ranking.pkl")
-    # ====================== Core Modification Ends =======================
+    # ====================== 核心修改结束 =======================
 
     print(f"Post-feature engineering summary: Final feature count = {FEATURES_SELECTED_FINAL_OUTPUT.shape[1]}")
 
@@ -941,6 +858,3 @@ if __name__ == "__main__":
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\nComplete end-to-end modeling artifact exported to './model.pkl'")
     print("=" * 60)
-
-
-
