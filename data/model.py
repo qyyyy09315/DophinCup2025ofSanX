@@ -15,7 +15,7 @@ import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, fbeta_score
+from sklearn.metrics import roc_auc_score, accuracy_score, recall_score, confusion_matrix, fbeta_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
@@ -26,7 +26,7 @@ try:
 
     TOPOLOGY_AVAILABLE = True
 except ImportError:
-    print("Warning: gtda (giotto-tda) not found. Topological features will NOT be computed.")
+    print("警告: 未找到 gtda (giotto-tda)。将不会计算拓扑特征。")
     TOPOLOGY_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
@@ -43,14 +43,14 @@ def save_object(obj, filepath):
     """将Python对象序列化保存到文件"""
     with open(filepath, "wb") as f:
         pickle.dump(obj, f)
-    print(f"Saved object to: {filepath}")
+    print(f"已保存对象至: {filepath}")
 
 
 # === 新增函数：动态拓扑尺度选择 ===
 def adaptive_scale_selection(X, feature_importances):
     """根据特征重要性动态调整拓扑分析尺度"""
     if len(feature_importances) != X.shape[1]:
-        raise ValueError("Feature importance length must match number of features in X.")
+        raise ValueError("特征重要性的长度必须与X中的特征数量匹配。")
 
     scales = []
     for i, imp in enumerate(feature_importances):
@@ -74,8 +74,8 @@ def extract_topological_features(X_sample, homology_dims=[0, 1], scale_factor=1.
     新增 scale_factor 参数用于调整距离计算的尺度。
     """
     if not TOPOLOGY_AVAILABLE:
-        # Return a dummy feature vector of fixed size if topology library is not available
-        return np.zeros(5)  # Example placeholder
+        # 如果拓扑库不可用，则返回固定大小的虚拟特征向量
+        return np.zeros(5)  # 示例占位符
 
     try:
         # 确保输入是二维数组 (n_points, n_dimensions)
@@ -91,7 +91,7 @@ def extract_topological_features(X_sample, homology_dims=[0, 1], scale_factor=1.
         if scaled_X_sample.ndim == 2:
             X_diagram_input = scaled_X_sample.reshape(1, scaled_X_sample.shape[0], scaled_X_sample.shape[1])
         else:
-            # This case handles if somehow it's already 3D but needs to be single sample
+            # 此情况处理如果不知何故它已经是3D但需要是单一样本
             X_diagram_input = scaled_X_sample.reshape(1, -1, scaled_X_sample.shape[-1])
 
         # 初始化 VietorisRipsPersistence
@@ -100,8 +100,8 @@ def extract_topological_features(X_sample, homology_dims=[0, 1], scale_factor=1.
             homology_dimensions=homology_dims,
             collapse_edges=True,
             max_edge_length=np.inf,
-            infinity_values=None,  # Let gtda handle inf
-            n_jobs=1  # Parallel processing can sometimes cause issues in loops
+            infinity_values=None,  # 让 gtda 处理 inf
+            n_jobs=1  # 并行处理有时会在循环中引起问题
         )
 
         # 计算持续同调图
@@ -109,34 +109,34 @@ def extract_topological_features(X_sample, homology_dims=[0, 1], scale_factor=1.
 
         # 提取特征：例如，每个维度的条目数，最长寿命等
         topo_features = []
-        diagram = diagrams[0]  # We have only one sample
+        diagram = diagrams[0]  # 我们只有一个样本
 
         for dim in homology_dims:
-            mask = (diagram[:, 2] == dim)  # The third column is the homology dimension in gtda
-            births_deaths_dim = diagram[mask][:, :2]  # First two columns are birth/death
+            mask = (diagram[:, 2] == dim)  # 在 gtda 中第三列是同调维数
+            births_deaths_dim = diagram[mask][:, :2]  # 前两列是出生/死亡时间
 
             if len(births_deaths_dim) > 0:
                 lifetimes = births_deaths_dim[:, 1] - births_deaths_dim[:, 0]
-                # Add some basic stats as features
+                # 添加一些基本统计信息作为特征
                 topo_features.extend([
-                    np.sum(mask),  # Number of components/holes
-                    np.max(lifetimes) if len(lifetimes) > 0 else 0,  # Max lifetime
-                    np.mean(lifetimes) if len(lifetimes) > 0 else 0,  # Mean lifetime
-                    np.std(lifetimes) if len(lifetimes) > 1 else 0,  # Std lifetime
+                    np.sum(mask),  # 组件/孔洞的数量
+                    np.max(lifetimes) if len(lifetimes) > 0 else 0,  # 最大生命周期
+                    np.mean(lifetimes) if len(lifetimes) > 0 else 0,  # 平均生命周期
+                    np.std(lifetimes) if len(lifetimes) > 1 else 0,  # 生命周期标准差
                 ])
             else:
-                topo_features.extend([0, 0, 0, 0])  # Fill with zeros if no features for this dim
+                topo_features.extend([0, 0, 0, 0])  # 如果此维度没有特征则填充零
 
-        # Global feature: maximum death time across all dimensions
+        # 全局特征：所有维度的最大死亡时间
         max_death_global = np.max(diagram[:, 1]) if diagram.size > 0 else 0
         topo_features.append(max_death_global)
 
         return np.array(topo_features)
 
     except Exception as e:
-        print(f"Warning: Error computing topological features for a sample: {e}")
-        # Return a zero vector of consistent size on failure
-        # Adjust size based on number of dims and features per dim + global feature
+        print(f"警告: 计算样本的拓扑特征时出错: {e}")
+        # 出错时返回一致大小的零向量
+        # 根据维度数量和每个维度的特征 + 全局特征调整大小
         expected_size = len(homology_dims) * 4 + 1
         return np.zeros(expected_size)
 
@@ -179,7 +179,7 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
     max_threshold = 0.8
     thresholds = np.linspace(min_threshold, max_threshold, 101)
     print(
-        f"Optimizing threshold search (range: [{min_threshold}, {max_threshold}], weights: Recall={recall_weight}, Precision={precision_weight}, Specificity={specificity_weight})...")
+        f"正在优化阈值搜索 (范围: [{min_threshold}, {max_threshold}], 权重: Recall={recall_weight}, Precision={precision_weight}, Specificity={specificity_weight})...")
 
     best_t, best_score = 0.5, -np.inf
     best_metrics = (0.0, 0.0, 0.0)
@@ -196,7 +196,7 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
             specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
 
         except Exception as e:
-            print(f"Warning during metrics calculation at threshold={t}: {e}")
+            print(f"警告: 在阈值={t}处计算指标时发生错误: {e}")
             recall, precision, specificity = 0.0, 0.0, 0.0
 
         final_score = recall_weight * recall + precision_weight * precision - specificity_weight * (1 - specificity)
@@ -205,22 +205,22 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
             best_score, best_t = final_score, t
             best_metrics = (recall, precision, specificity)
 
-    print(f"Threshold optimization completed. Best threshold: {best_t:.4f}, Best weighted score: {best_score:.4f}")
+    print(f"阈值优化完成。最佳阈值: {best_t:.4f}, 最佳加权得分: {best_score:.4f}")
     print(
-        f"  Metrics at best threshold: Recall={best_metrics[0]:.4f}, Precision={best_metrics[1]:.4f}, Specificity={best_metrics[2]:.4f}")
+        f"  最佳阈值下的指标: Recall={best_metrics[0]:.4f}, Precision={best_metrics[1]:.4f}, Specificity={best_metrics[2]:.4f}")
     return best_t, best_score, best_metrics
 
 
 # ========== 核心修改：添加生成样本质量控制 ==========
 def quality_filter(generated, original, threshold=0.95):
     """基于KNN相似度过滤生成样本"""
-    print("Filtering generated samples based on KNN similarity...")
+    print("正在基于KNN相似度过滤生成的样本...")
     nn = NearestNeighbors(n_neighbors=5).fit(original)
     distances, _ = nn.kneighbors(generated)
     mean_distances = np.mean(distances, axis=1)
     mask = mean_distances < threshold
     filtered_samples = generated[mask]
-    print(f"Filtered out {len(generated) - len(filtered_samples)} samples. Kept {len(filtered_samples)} samples.")
+    print(f"过滤掉了 {len(generated) - len(filtered_samples)} 个样本。保留了 {len(filtered_samples)} 个样本。")
     return filtered_samples
 
 
@@ -229,7 +229,7 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
     """
     递归特征添加 (RFA) 算法，自动确定最优特征数量。
     """
-    print("Starting Recursive Feature Addition (RFA)...")
+    print("开始进行递归特征添加 (RFA)...")
     n_features = X.shape[1]
 
     if cv is None:
@@ -239,20 +239,20 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
     remaining_indices = list(range(n_features))
     scores_history = []
 
-    # Track rankings for all features
-    ranking_info = np.full(n_features, fill_value=n_features)  # Initialize with worst possible rank
+    # 跟踪所有特征的排名
+    ranking_info = np.full(n_features, fill_value=n_features)  # 初始化为最坏可能的排名
 
-    while len(selected_indices) < n_features and len(selected_indices) < 50:  # Limit max features
+    while len(selected_indices) < n_features and len(selected_indices) < 50:  # 限制最大特征数
         scores_with_candidates = []
 
-        # Evaluate adding each candidate feature
+        # 评估添加每个候选特征
         for i in remaining_indices:
             candidate_indices = selected_indices + [i]
             try:
                 score = cross_val_score(estimator, X[:, candidate_indices], y, cv=cv, scoring=scoring).mean()
                 scores_with_candidates.append((score, i))
             except Exception as e:
-                print(f"Warning evaluating feature {i}: {e}")
+                print(f"警告: 评估特征 {i} 时出错: {e}")
                 scores_with_candidates.append((-np.inf, i))
 
         if not scores_with_candidates:
@@ -261,26 +261,26 @@ def recursive_feature_addition(estimator, X, y, cv=None, scoring='roc_auc', min_
         scores_with_candidates.sort(reverse=True)
         best_score, best_idx = scores_with_candidates[0]
 
-        # Stop condition based on performance gain
+        # 基于性能提升停止条件
         if len(scores_history) > 0 and best_score <= max(scores_history) and len(selected_indices) >= min_features:
-            print(f"Performance plateau detected. Stopping addition. Optimal features count: {len(selected_indices)}")
+            print(f"检测到性能平台期。停止添加。最终选定特征数: {len(selected_indices)}")
             break
 
         selected_indices.append(best_idx)
         remaining_indices.remove(best_idx)
 
-        # Assign rank to newly added feature
+        # 为新添加的特征分配排名
         ranking_info[best_idx] = len(selected_indices)
 
         scores_history.append(best_score)
-        print(f"  Added feature index {best_idx} (Score: {best_score:.4f}), Current Rank: {ranking_info[best_idx]}")
+        print(f"  已添加特征索引 {best_idx} (得分: {best_score:.4f}), 当前排名: {ranking_info[best_idx]}")
 
-    # Remaining unselected features get ranks lower than those selected
+    # 未被选中的剩余特征获得比那些已被选中的更低的排名
     remaining_rank_counter = len(selected_indices) + 1
     for idx_in_remaining, original_idx in enumerate(sorted(remaining_indices)):
         ranking_info[original_idx] = remaining_rank_counter + idx_in_remaining
 
-    print(f"RFA completed, finally selected {len(selected_indices)} features.")
+    print(f"RFA 完成，最终选择了 {len(selected_indices)} 个特征。")
     return np.array(selected_indices), scores_history, ranking_info
 
 
@@ -314,7 +314,7 @@ class SelfAttention(nn.Module):
         attended_values = attended_values.squeeze(-1)  # (B, D)
         attended_values = self.out_proj(attended_values)  # (B, D)
 
-        out = self.layer_norm(x + attended_values)  # Residual connection + Norm
+        out = self.layer_norm(x + attended_values)  # 残差连接 + 归一化
         return out
 
 
@@ -387,10 +387,10 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     使用 WGAN-GP 对少数类样本进行过采样，并加入动态学习率调度 (余弦退火)。
     添加了生成样本质量控制过滤器。
     """
-    print("Starting WGAN-GP oversampling (with cosine annealing LR schedule)...")
+    print("开始 WGAN-GP 过采样 (带有余弦退火学习率调度)...")
     X_minority = X_train[y_train == minority_class]
     if len(X_minority) == 0:
-        print("Warning: No minority class samples found. Cannot perform WGAN-GP sampling.")
+        print("警告: 未发现少数类样本。无法执行 WGAN-GP 采样。")
         return X_train, y_train
 
     data_dim = X_train.shape[1]
@@ -399,11 +399,11 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     num_to_generate = num_majority - num_minority
 
     if num_to_generate <= 0:
-        print("Minority class already balanced or dominant. Skipping WGAN-GP resampling.")
+        print("少数类已经平衡或处于主导地位。跳过 WGAN-GP 重采样。")
         return X_train, y_train
 
-    print(f"Current minority samples: {num_minority}, majority samples: {num_majority}")
-    print(f"Planning to generate {num_to_generate} synthetic minority samples...")
+    print(f"当前少数类样本: {num_minority}, 多数类样本: {num_majority}")
+    print(f"计划生成 {num_to_generate} 个合成少数类样本...")
 
     X_minority_tensor = torch.tensor(X_minority, dtype=torch.float32).to(device)
 
@@ -417,7 +417,7 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
         T_max = epochs
     scheduler_G = optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=T_max, eta_min=1e-6)
     scheduler_C = optim.lr_scheduler.CosineAnnealingLR(optimizer_C, T_max=T_max, eta_min=1e-6)
-    print(f"CosineAnnealingLR enabled, T_max={T_max}")
+    print(f"启用 CosineAnnealingLR, T_max={T_max}")
 
     generator.train()
     critic.train()
@@ -425,7 +425,7 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     batches_done = 0
     for epoch in range(epochs):
 
-        # Train Critic multiple times per generator update
+        # 每次生成器更新多次训练判别器
         for _ in range(n_critic):
             idx = np.random.choice(len(X_minority_tensor), size=batch_size,
                                    replace=False if len(X_minority_tensor) >= batch_size else True)
@@ -443,73 +443,73 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
             c_loss.backward()
             optimizer_C.step()
 
-        # Train Generator once every n_critic steps
+        # 每 n_critic 步训练一次生成器
         optimizer_G.zero_grad()
         gen_data = generator(torch.randn(batch_size, latent_dim, device=device))
         g_loss = -torch.mean(critic(gen_data))
         g_loss.backward()
         optimizer_G.step()
 
-        # Update learning rates
+        # 更新学习率
         scheduler_G.step()
         scheduler_C.step()
 
-        # Log periodically
+        # 定期记录日志
         if (epoch + 1) % 100 == 0 or epoch == 0:
             current_lr_g = optimizer_G.param_groups[0]['lr']
             current_lr_c = optimizer_C.param_groups[0]['lr']
             print(
-                f"Epoch [{epoch + 1}/{epochs}], "
-                f"C Loss: {loss_critic.item():.4f}, "
-                f"GP: {gradient_penalty.item():.4f}, "
-                f"G Loss: {g_loss.item():.4f}, "
-                f"LR_G: {current_lr_g:.6f}, LR_C: {current_lr_c:.6f}"
+                f"轮次 [{epoch + 1}/{epochs}], "
+                f"C 损失: {loss_critic.item():.4f}, "
+                f"梯度惩罚(GP): {gradient_penalty.item():.4f}, "
+                f"G 损失: {g_loss.item():.4f}, "
+                f"学习率 G: {current_lr_g:.6f}, 学习率 C: {current_lr_c:.6f}"
             )
 
-    # Generate new samples after training completes
+    # 训练完成后生成新样本
     generator.eval()
     with torch.no_grad():
         z_new = torch.randn(num_to_generate, latent_dim, device=device)
         generated_data = generator(z_new).cpu().numpy()
 
-    # Apply quality filtering
+    # 应用质量过滤
     filtered_generated_data = quality_filter(generated_data, X_minority, threshold=filter_threshold)
 
-    # Combine original and generated data
+    # 合并原始数据和生成的数据
     resampled_X = np.vstack([X_train, filtered_generated_data])
     new_labels = np.full(len(filtered_generated_data), minority_class)
     resampled_y = np.hstack([y_train, new_labels])
 
     counts_after_sampling = dict(zip(*np.unique(resampled_y, return_counts=True)))
-    print(f"WGAN-GP sampling finished. Generated {len(filtered_generated_data)} new samples after filtering.")
-    print(f"Distribution after resampling: {counts_after_sampling}")
+    print(f"WGAN-GP 采样完成。过滤后生成了 {len(filtered_generated_data)} 个新样本。")
+    print(f"重采样后的分布: {counts_after_sampling}")
     return resampled_X, resampled_y
 
 
 # ======== 主程序入口及其它辅助函数 ========
 if __name__ == "__main__":
     print("=" * 60)
-    print("Training Pipeline Started:")
-    print("- Variance Filter -> RFA (Automatic Feature Count)")
-    print("- Removed Feature Clustering stage.")
-    print("- Missing value imputation changed to KNNImputer (n_neighbors=5).")
-    print("- Dynamic learning rate scheduling added to WGAN-GP (CosineAnnealingLR).")
-    print("- Threshold selection optimized for positive class metrics.")
-    print("- Cascade corrector switched to GradientBoostingClassifier.")
-    print("- Added Topological Data Analysis (TDA) feature extraction module.")
-    print("- Disabled multi-scale recognition in topology construction.")
-    print("- Added quality filtering for WGAN-GP generated samples.")
+    print("训练流水线启动:")
+    print("- 方差筛选 -> RFA (自动确定特征数)")
+    print("- 移除特征聚类阶段。")
+    print("- 缺失值填补方式变更为 KNNImputer (邻居数=5)。")
+    print("- 为WGAN-GP增加了动态学习率调度 (CosineAnnealingLR)。")
+    print("- 阈值选择针对阳性类别指标进行了优化。")
+    print("- 级联校正器切换为GradientBoostingClassifier。")
+    print("- 添加了拓扑数据分析(TDA)特征提取模块。")
+    print("- 在拓扑构建中禁用了多尺度识别。")
+    print("- 为WGAN-GP生成的样本添加了质量过滤。")
     print("=" * 60)
 
-    # Configuration Section
+    # 配置区域
     DATA_PATH = "./clean.csv"
     TEST_SIZE = 0.10
     RANDOM_STATE = 42
     VARIANCE_THRESHOLD_VALUE = 0.0
     CV_FOLDS_FOR_RFE = 3
-    USE_RFA = True  # Always true now
+    USE_RFA = True  # 现在总是为真
     ADD_TOPOLOGICAL_FEATURES = True
-    USE_ADAPTIVE_SCALES = False  # Disable adaptive scaling logic again
+    USE_ADAPTIVE_SCALES = False  # 再次禁用自适应缩放逻辑
 
     TOPO_HOMOLOGY_DIMS = [0, 1]
 
@@ -564,9 +564,9 @@ if __name__ == "__main__":
         'specificity_weight': 0.5
     }
 
-    # Step 1: Load/Create Dataset
+    # 第一步：加载/创建数据集
     if not os.path.exists(DATA_PATH):
-        print(f"Data file '{DATA_PATH}' not found. Creating example dataset...")
+        print(f"未找到数据文件 '{DATA_PATH}'。正在创建示例数据集...")
         N_SAMPLES = 1000
         N_FEATURES_TOTAL = 20
         ZERO_VAR_FEATS = 2
@@ -594,7 +594,7 @@ if __name__ == "__main__":
         EXAMPLE_DF = pd.DataFrame(SAMPLE_X_FINAL, columns=FEATURE_NAMES_LIST)
         EXAMPLE_DF['target'] = SAMPLE_Y_CLEANED
         EXAMPLE_DF.to_csv(DATA_PATH, index=False)
-        print(f"...Example imbalanced dataset saved to '{DATA_PATH}'")
+        print(f"...示例不平衡数据集已保存到 '{DATA_PATH}'")
 
     df_raw = pd.read_csv(DATA_PATH)
     if 'company_id' in df_raw.columns:
@@ -603,7 +603,7 @@ if __name__ == "__main__":
         df_cleaned = df_raw.copy()
 
     df_encoded = pd.get_dummies(df_cleaned, drop_first=True)
-    assert "target" in df_encoded.columns, "'target' column missing."
+    assert "target" in df_encoded.columns, "缺少 'target' 列."
 
     FEATURES_MATRIX_ALL = df_encoded.drop(columns=["target"]).values
     INITIAL_FEATURE_NAMES = df_encoded.drop(columns=["target"]).columns.tolist()
@@ -612,21 +612,21 @@ if __name__ == "__main__":
     TOTAL_SAMPLES_BEFORE_PREPROCESSING = FEATURES_MATRIX_ALL.shape[0]
     POSITIVE_CLASS_COUNT_INITIAL = LABEL_VECTOR_ALL.sum()
     NEGATIVE_CLASS_COUNT_INITIAL = (LABEL_VECTOR_ALL == 0).sum()
-    print(f"Loaded data shape: Features({FEATURES_MATRIX_ALL.shape}), Labels({LABEL_VECTOR_ALL.shape}).")
+    print(f"加载的数据形状: 特征({FEATURES_MATRIX_ALL.shape}), 标签({LABEL_VECTOR_ALL.shape}).")
     print(
-        f"Class distribution before preprocessing: Positive={POSITIVE_CLASS_COUNT_INITIAL}, Negative={NEGATIVE_CLASS_COUNT_INITIAL}")
+        f"预处理前的类别分布: 正类={POSITIVE_CLASS_COUNT_INITIAL}, 负类={NEGATIVE_CLASS_COUNT_INITIAL}")
 
-    # Step 2: Variance Filtering
-    print(f"Applying VarianceFilter with threshold={VARIANCE_THRESHOLD_VALUE} ...")
+    # 第二步：方差筛选
+    print(f"应用 VarianceFilter，阈值={VARIANCE_THRESHOLD_VALUE} ...")
     selector_variance_filter = VarianceThreshold(threshold=VARIANCE_THRESHOLD_VALUE)
     FEATURES_AFTER_VARIANCE_FILTERING = selector_variance_filter.fit_transform(FEATURES_MATRIX_ALL)
     SELECTED_FEATURE_IDX_POST_VARIANCE = selector_variance_filter.get_support(indices=True)
     SELECTED_FEATURE_NAMES_POST_VARIANCE = [INITIAL_FEATURE_NAMES[i] for i in SELECTED_FEATURE_IDX_POST_VARIANCE]
     print(
-        f"After VarianceFilter: retained {FEATURES_AFTER_VARIANCE_FILTERING.shape[1]} features "
-        f"(removed {len(INITIAL_FEATURE_NAMES) - len(SELECTED_FEATURE_NAMES_POST_VARIANCE)})")
+        f"经过 VarianceFilter 后: 保留了 {FEATURES_AFTER_VARIANCE_FILTERING.shape[1]} 个特征 "
+        f"(移除了 {len(INITIAL_FEATURE_NAMES) - len(SELECTED_FEATURE_NAMES_POST_VARIANCE)})")
 
-    # Step 3: Imputation & Scaling
+    # 第三步：插补与标准化
     knn_imputer_instance = KNNImputer(n_neighbors=5)
     FEATURES_IMPUTED_NO_MISSING = knn_imputer_instance.fit_transform(FEATURES_AFTER_VARIANCE_FILTERING)
 
@@ -637,12 +637,12 @@ if __name__ == "__main__":
     save_object(standard_scaler_instance, "./scaler.pkl")
     save_object(selector_variance_filter, "./variance_selector.pkl")
 
-    # Step 4: Add Topological Features (Optional Enhancement)
+    # 第四步：添加拓扑特征（可选增强）
     FEATURES_WITH_OPTIONAL_TOPOLOGY = FEATURES_SCALED_STANDARDIZED
     TOPOLOGY_FEATURE_NAME_PREFIXES = []
 
     if ADD_TOPOLOGICAL_FEATURES and TOPOLOGY_AVAILABLE:
-        print("Extracting topological signatures using persistent homology...")
+        print("使用持久同调提取拓扑签名...")
         TOPOLOGICAL_SIGNATURES_BATCH = []
         NUM_ROWS_IN_DATASET = FEATURES_SCALED_STANDARDIZED.shape[0]
 
@@ -654,7 +654,7 @@ if __name__ == "__main__":
 
         for row_index, ROW_OF_SAMPLE in enumerate(FEATURES_SCALED_STANDARDIZED):
             if (row_index + 1) % 200 == 0 or row_index == NUM_ROWS_IN_DATASET - 1:
-                print(f"Processed topological features for {row_index + 1}/{NUM_ROWS_IN_DATASET} rows.")
+                print(f"已完成第 {row_index + 1}/{NUM_ROWS_IN_DATASET} 行的拓扑特征处理.")
 
             TOPOLOGICAL_FEATURE_VECTOR_SINGLE_ROW = extract_topological_features(
                 ROW_OF_SAMPLE,
@@ -669,18 +669,18 @@ if __name__ == "__main__":
         TOPOLOGY_FEATURE_NAME_PREFIXES = [f'topo_feat_{idx}' for idx in range(COUNT_NEWLY_ADDED_TOPOLOGY_FEATURES)]
 
         print(
-            f"Successfully appended {COUNT_NEWLY_ADDED_TOPOLOGY_FEATURES} topological descriptors. New total: {FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1]}")
+            f"成功追加了 {COUNT_NEWLY_ADDED_TOPOLOGY_FEATURES} 个拓扑描述符。新的总数: {FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1]}")
 
     elif ADD_TOPOLOGICAL_FEATURES and not TOPOLOGY_AVAILABLE:
         print(
-            "Requested topological analysis skipped due to missing dependency ('giotto-tda'). Install package to enable.")
+            "由于缺少依赖项 ('giotto-tda')，请求的拓扑分析已跳过。请安装软件包以启用该功能。")
 
     UPDATED_COMPLETE_FEATURE_SET_NAMES = SELECTED_FEATURE_NAMES_POST_VARIANCE + TOPOLOGY_FEATURE_NAME_PREFIXES
 
     # ===================== 核心修改：取消特征聚类，直接应用RFA =====================
-    print("\nExecuting enhanced pipeline: Direct RFA without feature clustering...\n")
+    print("\n执行增强型流水线: 不经特征聚类直接运行RFA...\n")
 
-    # Stage B: Apply RFA on all features (取消聚类步骤)
+    # B阶段：对所有特征应用RFA（取消聚类步骤）
     estimator_used_by_rfa = xgb.XGBClassifier(**XGB_PARAMS)
 
     try:
@@ -692,7 +692,7 @@ if __name__ == "__main__":
             scoring='roc_auc'
         )
 
-        # Map local indices back to full feature space (before reduction step)
+        # 映射局部索引回到完整特征空间（降维前）
         ABSOLUTE_INDICES_OF_CHOSEN_FEATURES = FULL_RANKINGS_INFO_ARRAY.argsort()
         INDEX_MAPPING_LOCAL_TO_GLOBAL = FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES
 
@@ -704,40 +704,40 @@ if __name__ == "__main__":
         # 修复f-string中的反斜杠问题
         feature_list_str = '\n'.join(['  ' + str(name) for name in NAMES_FINAL_SELECTED_FEATURES])
         print(
-            f"\nFinal feature selection result: {len(NAMES_FINAL_SELECTED_FEATURES)} chosen.\nList:\n{feature_list_str}\n")
+            f"\n最终特征选择结果: 选择了 {len(NAMES_FINAL_SELECTED_FEATURES)} 个。\n列表:\n{feature_list_str}\n")
 
     except Exception as err_msg:
-        print(f"Error occurred during RFA execution phase: {err_msg}")
-        print("Falling back to all features without further refinement.")
+        print(f"在RFA执行阶段发生错误: {err_msg}")
+        print("回退到未经进一步精炼的所有特征。")
         FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_OPTIONAL_TOPOLOGY
         NAMES_FINAL_SELECTED_FEATURES = UPDATED_COMPLETE_FEATURE_SET_NAMES
         INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1])
 
-    # Save comprehensive ranking info obtained from modified RFA function
+    # 保存由修改后的RFA函数得到的综合排名信息
     save_object(FULL_RANKINGS_INFO_ARRAY, "./rfe_feature_ranking.pkl")
     # ====================== 核心修改结束 =======================
 
-    print(f"Post-feature engineering summary: Final feature count = {FEATURES_SELECTED_FINAL_OUTPUT.shape[1]}")
+    print(f"特征工程后期总结: 最终特征计数 = {FEATURES_SELECTED_FINAL_OUTPUT.shape[1]}")
 
-    # Continue with standard ML workflow...
+    # 继续标准ML工作流...
     TRAIN_INPUT_SPLIT, HOLDOUT_EVAL_SPLIT, TRAIN_TARGET_SPLIT, HOLDOUT_TARGET_SPLIT = train_test_split(
         FEATURES_SELECTED_FINAL_OUTPUT, LABEL_VECTOR_ALL, test_size=TEST_SIZE, stratify=LABEL_VECTOR_ALL,
         random_state=RANDOM_STATE
     )
-    print(f"Splitted into Training ({TRAIN_INPUT_SPLIT.shape}) and Holdout ({HOLDOUT_EVAL_SPLIT.shape}) sets.")
+    print(f"分割为训练集 ({TRAIN_INPUT_SPLIT.shape}) 和留出验证集 ({HOLDOUT_EVAL_SPLIT.shape})。")
 
-    print(f"\nInitiating WGAN-GP augmentation process...")
+    print(f"\n启动 WGAN-GP 数据扩充过程...")
     DISTRIBUTION_BEFORE_SAMPLING_TRAINSET = dict(Counter(TRAIN_TARGET_SPLIT))
-    print(f"Pre-WGAN-GP label balance in training split: {DISTRIBUTION_BEFORE_SAMPLING_TRAINSET}")
+    print(f"训练集中采样前的标签均衡状况: {DISTRIBUTION_BEFORE_SAMPLING_TRAINSET}")
 
     try:
         RESAMPLED_TRAIN_FEATURES, RESAMPLED_TRAIN_LABELS = wgangp_resample(TRAIN_INPUT_SPLIT, TRAIN_TARGET_SPLIT,
                                                                            **WGANGP_CONFIG)
     except Exception as wg_error:
-        print(f"WGAN-GP failed unexpectedly: {wg_error}. Proceeding with raw imbalanced data instead.")
+        print(f"WGAN-GP 异常失败: {wg_error}. 改为继续使用原始不平衡数据。")
         RESAMPLED_TRAIN_FEATURES, RESAMPLED_TRAIN_LABELS = TRAIN_INPUT_SPLIT, TRAIN_TARGET_SPLIT
 
-    print("Building primary classifier (XGBoost)...")
+    print("建立主分类器 (XGBoost)...")
     DMATRIX_RESAMPLED_TRAIN = xgb.DMatrix(RESAMPLED_TRAIN_FEATURES, label=RESAMPLED_TRAIN_LABELS)
     DMATRIX_HOLDOUT_VALIDATION = xgb.DMatrix(HOLDOUT_EVAL_SPLIT, label=HOLDOUT_TARGET_SPLIT)
 
@@ -770,9 +770,9 @@ if __name__ == "__main__":
 
     WRAPPED_MODEL_WRAPPER_INSTANCE = WrappedXGBPredictiveModel(MODEL_TRAINED_USING_XGB_API)
     save_object(WRAPPED_MODEL_WRAPPER_INSTANCE, "./base_model_xgboost.pkl")
-    print("Base learner successfully trained and persisted.")
+    print("基础学习器训练完毕并已存储。")
 
-    print("Identifying hard-to-classify examples for secondary correction layer...")
+    print("识别难以分类的例子以供二级修正层使用...")
     _, PROBABILITIES_ON_TRAIN_SET_PREDICTED_BY_BASELINE = cascade_predict_single_model(WRAPPED_MODEL_WRAPPER_INSTANCE,
                                                                                        None, RESAMPLED_TRAIN_FEATURES,
                                                                                        threshold=0.5)
@@ -786,18 +786,18 @@ if __name__ == "__main__":
                                                                        HOLDOUT_EVAL_SPLIT, threshold=0.5)
 
     if len(HARD_CASE_FEATURE_SUBSET) > 0 and len(np.unique(HARD_CASE_TRUE_LABELS)) > 1:
-        print("Constructing corrective ensemble using misclassified instances...")
+        print("利用误分类实例构建纠正模型...")
         CORRECTIVE_LEARNER_SECONDARY = GradientBoostingClassifier(**META_GBM_PARAMS)
         CORRECTIVE_LEARNER_SECONDARY.fit(HARD_CASE_FEATURE_SUBSET, HARD_CASE_TRUE_LABELS)
     else:
-        print("Insufficient difficult cases encountered; initializing fallback GBM anyway.")
+        print("遇到困难案例不足；无论如何初始化备用GBM。")
         CORRECTIVE_LEARNER_SECONDARY = GradientBoostingClassifier(**META_GBM_PARAMS)
         CORRECTIVE_LEARNER_SECONDARY.fit(RESAMPLED_TRAIN_FEATURES, RESAMPLED_TRAIN_LABELS)
 
     save_object(CORRECTIVE_LEARNER_SECONDARY, "./meta_model.pkl")
-    print("Secondary corrective component built successfully.")
+    print("二次纠正组件成功构建。")
 
-    print("Determining optimal decision boundary via customized criterion...")
+    print("通过定制准则确定最佳决策边界...")
     _, PROBABILITIES_HOLDOUT_COMBINED_PIPELINE = cascade_predict_single_model(WRAPPED_MODEL_WRAPPER_INSTANCE,
                                                                               CORRECTIVE_LEARNER_SECONDARY,
                                                                               HOLDOUT_EVAL_SPLIT, threshold=0.5)
@@ -812,32 +812,22 @@ if __name__ == "__main__":
 
     PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH = (
             PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
+
     ROC_AREA_UNDER_CURVE = roc_auc_score(HOLDOUT_TARGET_SPLIT, PROBABILITIES_HOLDOUT_COMBINED_PIPELINE)
-    F1_MACRO_BALANCED_ACCURACY = f1_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH, zero_division=0)
+    ACCURACY_BEST = accuracy_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH)
+    RECALL_CALCULATED_AGAIN = recall_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH, zero_division=0)
     FBETA_MEASURE_ENHANCED_SENSITIVITY = fbeta_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH,
                                                      beta=1.2, zero_division=0)
 
-    CUSTOM_EVALUATION_SCORE_FINAL = (
-            THRESHOLD_WEIGHTS['recall_weight'] * RECALL_BEST +
-            THRESHOLD_WEIGHTS['precision_weight'] * PRECISION_BEST -
-            THRESHOLD_WEIGHTS['specificity_weight'] * (1 - SPECIFICITY_BEST)
-    )
+    # 自定义最终评价分数公式
+    CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * ACCURACY_BEST + 30 * RECALL_CALCULATED_AGAIN
 
-    print(f"\nChosen optimal operating point (threshold): {OPTIMAL_DECISION_BOUNDARY:.4f}")
-    print("Associated evaluation metrics:")
-    print(f"  Recall/Sensitivity = {RECALL_BEST:.5f}")
-    print(f"  Area Under ROC Curve = {ROC_AREA_UNDER_CURVE:.5f}")
-    print(f"  Precision/Positive Predictive Value = {PRECISION_BEST:.5f}")
-    print(f"  Specificity/TNR = {SPECIFICITY_BEST:.5f}")
-    print(f"  Harmonic Mean (F1-Score) = {F1_MACRO_BALANCED_ACCURACY:.4f}")
-    print(f"  Weighted F-Beta Metric (β=1.2) = {FBETA_MEASURE_ENHANCED_SENSITIVITY:.4f}")
-    print(f"  Composite Score Formula Applied: ")
-    formula_str = (
-        f"Recall×{THRESHOLD_WEIGHTS['recall_weight']} + "
-        f"Precision×{THRESHOLD_WEIGHTS['precision_weight']} − "
-        f"(1−Specificity)×{THRESHOLD_WEIGHTS['specificity_weight']}"
-    )
-    print(f"    {formula_str} = {CUSTOM_EVALUATION_SCORE_FINAL:.5f}")
+    print(f"\n选定的最佳操作点 (阈值): {OPTIMAL_DECISION_BOUNDARY:.4f}")
+    print("关联的评估指标:")
+    print(f"  AUC = {ROC_AREA_UNDER_CURVE:.5f}")
+    print(f"  Accuracy = {ACCURACY_BEST:.5f}")
+    print(f"  Recall/Sensitivity = {RECALL_CALCULATED_AGAIN:.5f}")
+    print(f"  加权总分为 (50*AUC + 20*Accuracy + 30*Recall): {CUSTOM_EVALUATION_SCORE_FINAL:.5f}")
 
     PIPELINE_ARTIFACT_DICTIONARY = {
         "imputer": knn_imputer_instance,
@@ -856,5 +846,9 @@ if __name__ == "__main__":
         "use_adaptive_scales": USE_ADAPTIVE_SCALES
     }
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
-    print("\nComplete end-to-end modeling artifact exported to './model.pkl'")
+    print("\n完整的端到端建模产物已导出至 './model.pkl'")
     print("=" * 60)
+
+
+
+
