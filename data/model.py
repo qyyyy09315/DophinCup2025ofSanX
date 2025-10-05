@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import xgboost as xgb
-from sklearn.cluster import FeatureAgglomeration
+# --- 修改导入 ---
+# 导入 AgglomerativeClustering 而不是 FeatureAgglomeration
+from sklearn.cluster import AgglomerativeClustering
+# ---
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer
@@ -212,9 +215,11 @@ def cost_sensitive_threshold(y_true, probas, recall_weight=1.0, precision_weight
 
 
 # ========== 核心修改：引入特征聚类 ==========
+# --- 修改后的 feature_clustering 函数 ---
 def feature_clustering(X, n_clusters_ratio=0.5):
     """
     基于特征间相关性的聚类，以减少冗余特征。
+    使用 AgglomerativeClustering 和预计算的距离矩阵。
 
     Args:
         X: 输入特征矩阵 (numpy array)。
@@ -229,16 +234,24 @@ def feature_clustering(X, n_clusters_ratio=0.5):
     n_clusters_target = max(1, int(n_original_features * n_clusters_ratio))
     print(f"Target number of clusters after agglomeration: {n_clusters_target}")
 
-    # 使用特征矩阵而不是距离矩阵进行聚类，避免AttributeError
-    agglo = FeatureAgglomeration(
+    # 计算特征之间的皮尔逊相关系数矩阵
+    corr_matrix = np.corrcoef(X, rowvar=False) # rowvar=False 表示每一列是一个变量
+
+    # 将相关系数转换为距离矩阵: distance = 1 - |correlation|
+    # 使用绝对值是因为我们关心的是相关性的强度，而不是方向
+    # np.clip 确保结果在 [0, 1] 范围内，避免浮点数精度问题
+    distance_matrix = np.clip(1 - np.abs(corr_matrix), 0, 2)
+
+    # 使用 AgglomerativeClustering 对特征（现在是距离矩阵的节点）进行聚类
+    # linkage='average' 对应于 UPGMA 方法，通常效果不错
+    agglo = AgglomerativeClustering(
         n_clusters=n_clusters_target,
-        linkage="complete",  # Complete linkage tends to produce compact clusters
-        affinity="euclidean"  # 使用欧几里得距离而不是预计算距离矩阵
+        metric='precomputed', # 指定使用预计算的距离矩阵
+        linkage='average'     # 使用平均链接
     )
 
     # Fit the model and get cluster labels for each original feature
-    # 我们需要转置X，因为FeatureAgglomeration对样本进行聚类，而不是特征
-    cluster_labels = agglo.fit_predict(X.T)  # Transpose to cluster features
+    cluster_labels = agglo.fit_predict(distance_matrix)
     print(f"Clustering resulted in {len(set(cluster_labels))} distinct clusters.")
 
     # Select one representative feature per cluster (the one with highest variance)
@@ -258,6 +271,7 @@ def feature_clustering(X, n_clusters_ratio=0.5):
 
     print(f"Selected {len(representative_indices)} representative features from clusters.")
     return cluster_labels, np.array(representative_indices)
+# --- 修改结束 ---
 
 
 # --- RFA (Recursive Feature Addition) 实现 ---
@@ -905,6 +919,7 @@ if __name__ == "__main__":
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\nComplete end-to-end modeling artifact exported to './model.pkl'")
     print("=" * 60)
+
 
 
 
