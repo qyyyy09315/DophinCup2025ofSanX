@@ -751,8 +751,10 @@ if __name__ == "__main__":
         NAMES_FINAL_SELECTED_FEATURES = [NAMES_REPRESENTATIVES_ONLY[i] for i in
                                          FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
 
+        # 修复f-string中的反斜杠问题
+        feature_list_str = '\n'.join(['  ' + str(name) for name in NAMES_FINAL_SELECTED_FEATURES])
         print(
-            f"\nFinal feature selection result: {len(NAMES_FINAL_SELECTED_FEATURES)} chosen.\nList:\n{'\\n'.join(['  ' + str(name) for name in NAMES_FINAL_SELECTED_FEATURES])}\n")
+            f"\nFinal feature selection result: {len(NAMES_FINAL_SELECTED_FEATURES)} chosen.\nList:\n{feature_list_str}\n")
 
     except Exception as err_msg:
         print(f"Error occurred during RFA execution phase: {err_msg}")
@@ -906,7 +908,6 @@ if __name__ == "__main__":
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\nComplete end-to-end modeling artifact exported to './model.pkl'")
     print("=" * 60)
-
 
 
 
