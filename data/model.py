@@ -16,7 +16,7 @@ import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer
-from sklearn.metrics import roc_auc_score, accuracy_score, recall_score, confusion_matrix, fbeta_score
+from sklearn.metrics import roc_auc_score, accuracy_score, recall_score, confusion_matrix, fbeta_score, precision_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
@@ -877,15 +877,24 @@ if __name__ == "__main__":
     FBETA_MEASURE_ENHANCED_SENSITIVITY = fbeta_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH,
                                                      beta=1.2, zero_division=0)
 
-    # 自定义最终评价分数公式
-    CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * ACCURACY_BEST + 30 * RECALL_CALCULATED_AGAIN
+    # <<<--- 关键修改在这里：计算精确率 Precision --->>>
+    PRECISION_CALCULATED = precision_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH, zero_division=0)
+    # <<<--------------------------------------------------->>>
+
+    # 自定义最终评价分数公式 (注意这里也做了修改)
+    # CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * ACCURACY_BEST + 30 * RECALL_CALCULATED_AGAIN
+    CUSTOM_EVALUATION_SCORE_FINAL = 50 * ROC_AREA_UNDER_CURVE + 20 * PRECISION_CALCULATED + 30 * RECALL_CALCULATED_AGAIN
 
     print(f"\n选定的最佳操作点 (阈值): {OPTIMAL_DECISION_BOUNDARY:.4f}")
     print("关联的评估指标:")
     print(f"  AUC = {ROC_AREA_UNDER_CURVE:.5f}")
     print(f"  Accuracy = {ACCURACY_BEST:.5f}")
+    # <<<--- 关键修改在这里：打印精确率 Precision --->>>
+    print(f"  Precision = {PRECISION_CALCULATED:.5f}")
+    # <<<------------------------------------------>>>
     print(f"  Recall/Sensitivity = {RECALL_CALCULATED_AGAIN:.5f}")
-    print(f"  加权总分为 (50*AUC + 20*Accuracy + 30*Recall): {CUSTOM_EVALUATION_SCORE_FINAL:.5f}")
+    # <<<--- 关键修改在这里：更新打印的加权总分说明 --->>>
+    print(f"  加权总分为 (50*AUC + 20*Precision + 30*Recall): {CUSTOM_EVALUATION_SCORE_FINAL:.5f}")
 
     PIPELINE_ARTIFACT_DICTIONARY = {
         "imputer": knn_imputer_instance,
