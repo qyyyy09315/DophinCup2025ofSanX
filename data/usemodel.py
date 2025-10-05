@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+"""应用已训练的增强版机器学习管道进行预测。"""
+
 import os
 import pickle
 
@@ -5,233 +8,246 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+# --- 注意：预测阶段不主动导入 gtda ---
+# 拓扑特征应在训练时完全计算并包含在最终特征集中，
+# 或者其计算对象应一并保存。在此阶段尝试重建会导致不一致。
+TOPOLOGY_AVAILABLE = False
 
-class WrappedXGBModel:
-    def __init__(self, booster):
-        self.booster = booster
 
-    def predict_proba(self, X):
-        dmatrix = xgb.DMatrix(X)
-        probs = self.booster.predict(dmatrix)
-        # For binary classification, Booster returns probabilities for class 1.
-        # We need to stack them with 1-probs for class 0 to form [prob_0, prob_1].
-        return np.column_stack([1 - probs, probs])
+class WrappedXGBPredictiveModel:
+    def __init__(self, booster_obj_ref):
+        self.booster_internal_reference = booster_obj_ref
 
-    def predict(self, X):
-        dmatrix = xgb.DMatrix(X)
-        probs = self.booster.predict(dmatrix)
-        return (probs > 0.5).astype(int)
+    def predict_proba(self, input_features_array_like):
+        dmatrix_format_input = xgb.DMatrix(input_features_array_like)
+        probabilities_positives_only = self.booster_internal_reference.predict(dmatrix_format_input)
+        return np.column_stack([1 - probabilities_positives_only, probabilities_positives_only])
+
+    def predict(self, input_features_array_like):
+        dmatrix_format_input = xgb.DMatrix(input_features_array_like)
+        predicted_probabilities = self.booster_internal_reference.predict(dmatrix_format_input)
+        return (predicted_probabilities > 0.5).astype(int)
+
 
 def load_object(filepath):
-    """加载通过pickle保存的对象"""
+    """从文件反序列化加载Python对象"""
     with open(filepath, "rb") as f:
         obj = pickle.load(f)
-    print(f"已加载: {filepath}")
+    print(f"已从 {filepath} 加载对象")
     return obj
 
 
 class ModelPipelineWrapper:
     """
-    封装整个模型流水线，包括预处理和预测步骤。
+    包装整个模型流水线的对象，提供predict和predict_proba接口。
     """
 
-    def __init__(self, model_dict):
+    def __init__(self, model_artifact_dict):
         """
         初始化包装器。
 
-        :param model_dict: 包含所有模型组件的字典。
+        :param model_artifact_dict: 由训练脚本保存的包含所有组件的字典。
         """
-        self.model_dict = model_dict
-        # --- 预处理器 ---
-        self.imputer = model_dict["imputer"]
-        self.scaler = model_dict["scaler"]
-        self.variance_selector = model_dict["variance_selector"]
+        self.artifact = model_artifact_dict
+        # 提取各个组件
+        self.imputer = self.artifact["imputer"]
+        self.scaler = self.artifact["scaler"]
+        self.variance_selector = self.artifact["variance_selector"]
 
-        # --- 特征信息 ---
-        self.selected_feature_names = model_dict["selected_feature_names"]
-        self.tree_feature_ranking = model_dict["tree_feature_ranking"]  # 保留但本次未使用
+        # 训练时最终选定的特征名称列表
+        self.selected_feature_names = self.artifact["selected_feature_names"]
 
-        # --- 模型 ---
-        self.base_models = model_dict["base_models"]
-        self.meta_nb = model_dict["meta_nb"]
+        # 基础模型和元模型
+        self.base_model = self.artifact["base_models"]
+        self.meta_model = self.artifact["meta_nb"]
 
-        # --- 配置 ---
-        self.threshold = model_dict["threshold"]
-        self.use_rfa = model_dict.get("use_rfa", True)  # 默认True if missing
-        self.pool_of_meta_models_metadata = model_dict.get("pool_of_meta_models_metadata", [])
+        # 决策阈值
+        self.threshold = self.artifact["threshold"]
 
-    def _preprocess(self, X_raw_df):
+        # 拓扑相关配置 (记录状态，但预测时不执行)
+        self.add_topological_features = self.artifact.get("add_topological_features", False)
+        if self.add_topological_features and not TOPOLOGY_AVAILABLE:
+            print("警告: 模型配置使用了拓扑特征，但预测环境中未启用或缺少 gtda 库。"
+                  "预测将基于不含拓扑特征的数据进行，请确认这与训练方式一致。")
+
+        # RFA相关 (用于理解训练过程，但不影响预测核心逻辑)
+        self.use_rfa = self.artifact.get("use_rfa", True)
+
+    def _preprocess(self, X_df):
         """
-        对原始特征DataFrame进行预处理。
-        注意：此函数假定输入X_raw_df已经去掉了非特征列（如company_id），
-             并且其列名对应于训练时的初始特征名。
+        对输入的DataFrame进行预处理，使其与训练时的格式一致。
+        包括：独热编码、方差过滤、插补、标准化、特征对齐。
         """
-        # 1. 方差过滤 (使用训练时保存的selector)
-        X_var_filtered = self.variance_selector.transform(X_raw_df)
-        # 获取方差过滤后对应的特征名索引
-        selected_indices_variance = self.variance_selector.get_support(indices=True)
-        # 假设 X_raw_df 的列名是初始特征名
-        feature_names_after_variance = X_raw_df.columns[selected_indices_variance]
+        print("正在进行预测数据预处理...")
 
-        # 2. KNN 填充缺失值
-        X_imputed = self.imputer.transform(X_var_filtered)
+        # 1. 独热编码 (模拟训练时的行为)
+        #    假设 X_df 是原始特征，可能需要 OHE。
+        #    注意：必须与训练时使用的 get_dummies 参数保持一致。
+        X_encoded_df = pd.get_dummies(X_df, drop_first=True)
+        print(f"独热编码后特征数: {X_encoded_df.shape[1]}")
 
-        # 3. 标准化
-        X_scaled = self.scaler.transform(X_imputed)
+        # 2. 获取训练时初始特征名（用于后续步骤参考）
+        #    这一步是为了知道哪些特征应该参与 variance_filtering。
+        #    实际项目中，这部分信息最好也保存下来。
+        initial_feature_names = self._get_initial_feature_names()
 
-        # 4. 应用 RFE 或 RFA 选择的特征
-        # 我们需要找到在缩放后的特征中，哪些是我们最终选择的特征
-        # selected_feature_names 是最终选择的特征名列表
-        # 我们需要从 feature_names_after_variance 中找到它们的索引
-
-        # 创建一个映射：当前特征名 -> 当前方差过滤后特征的索引
-        current_feature_to_index = {name: i for i, name in enumerate(feature_names_after_variance)}
-
-        # 找到最终选中的特征在当前特征集中的索引
-        final_selected_indices_in_current = [
-            current_feature_to_index[name]
-            for name in self.selected_feature_names
-            if name in current_feature_to_index
+        # 3. 确保特征列与训练时经过VarianceFilter后的列对齐
+        #    a. 找出训练时经过 VarianceThreshold 后保留的特征名
+        selected_feature_names_post_variance_from_training = [
+            name for i, name in enumerate(initial_feature_names)
+            if i in self.variance_selector.get_support(indices=True)
         ]
+        print(f"训练时方差过滤后应保留特征数: {len(selected_feature_names_post_variance_from_training)}")
 
-        # 检查是否所有选中的特征都在当前特征集中
-        if len(final_selected_indices_in_current) != len(self.selected_feature_names):
-            missing_features = set(self.selected_feature_names) - set(feature_names_after_variance)
-            raise ValueError(f"测试数据缺少必要的特征: {missing_features}")
+        #    b. 对齐预测数据集中的特征
+        #       缺失的特征用0填充（或根据业务逻辑）
+        #       多余的特征会被丢弃
+        for feat_name in selected_feature_names_post_variance_from_training:
+            if feat_name not in X_encoded_df.columns:
+                print(f"警告: 特征 '{feat_name}' 在预测数据中缺失，将以0填充。")
+                X_encoded_df[feat_name] = 0
 
-        # 应用特征选择
-        X_final = X_scaled[:, final_selected_indices_in_current]
-
-        return X_final
-
-    def predict_proba(self, X_raw):
-        """
-        对原始特征矩阵进行预测，返回正类概率。
-
-        :param X_raw: 原始特征矩阵 (numpy array or DataFrame)。
-                      如果是numpy array, 列顺序必须与训练时完全一致。
-                      推荐使用DataFrame以利用列名匹配。
-        :return: 正类概率数组 (numpy array)。
-        """
-        # 确保输入是 DataFrame 以便正确处理列名
-        if not isinstance(X_raw, pd.DataFrame):
-            # 如果不是DataFrame，我们无法安全地进行特征对齐，这里给出警告
-            # 并假设列顺序与训练时完全一致。这很脆弱，最好提供DataFrame。
-            print("警告: 输入不是 pandas DataFrame。强烈建议提供带有正确列名的 DataFrame 以确保特征对齐。")
-            # 为了兼容性，我们可以尝试继续，但这有风险。
-            # 我们需要知道训练时的初始特征名来进行正确的预处理。
-            # 这里我们做一个简化假设：X_raw 的列数等于训练时经过方差过滤前的特征数
-            # 并且顺序完全一致。这是一个强假设，可能导致错误。
-
-            # 一种更健壮的方法是在 model_dict 中保存初始特征名列表
-            # 但我们没有这样做。因此，如果输入是 ndarray，
-            # 最好要求用户提供一个带有正确列名的 DataFrame。
-            # 这里我们临时创建一个假的DataFrame，但这不是一个好的实践。
-            # 假设我们知道初始特征数量（这是不对的，因为我们不知道确切的名字）
-            # 因此，最安全的做法是强制要求输入为 DataFrame
-
-            # 抛出异常或要求输入为DataFrame
-            raise ValueError("输入 `X_raw` 必须是一个 pandas DataFrame，其中包含与训练数据一致的列名。")
-
-        # 如果是 DataFrame，则复制一份避免修改原数据，并进行预处理
-        X_processed = self._preprocess(X_raw.copy())
-
-        # --- 级联预测逻辑 ---
-        # 1. 基模型预测
+                #    c. 只保留经过方差筛选的特征 (按训练时的顺序)
         try:
-            probas_base = self.base_models.predict_proba(X_processed)[:, 1]
-        except Exception as e:
-            print(f"基模型 predict_proba 失败: {e}")
-            # Fallback: 使用 predict 并假设输出可以直接解释为概率 (不推荐)
-            pred_or_score = self.base_models.predict(X_processed)
-            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
-                probas_base = np.clip(pred_or_score.flatten(), 0, 1)
-            else:
-                probas_base = pred_or_score[:, 1]
+            X_aligned_variance_filtered = X_encoded_df[selected_feature_names_post_variance_from_training].values
+        except KeyError as e:
+            print(f"错误: 预测数据无法正确对齐方差过滤后的特征。缺失特征: {e}")
+            raise
 
-        preds_initial = (probas_base >= 0.5).astype(int)
-        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
+        current_feature_names_after_variance = selected_feature_names_post_variance_from_training.copy()
+        print(f"方差过滤后特征矩阵形状: {X_aligned_variance_filtered.shape}")
 
-        # 2. 如果有不确定样本且元模型存在，则用元模型修正
-        if self.meta_nb is not None and uncertain_mask.sum() > 0:
-            # Check if meta_model has predict_proba method for consistency
-            if hasattr(self.meta_nb, 'predict_proba'):
-                try:
-                    meta_probas = self.meta_nb.predict_proba(X_processed[uncertain_mask])[:, 1]
-                    # 不直接替换概率，而是可以替换预测结果，或者根据需求融合概率
-                    # 这里我们按照原始cascade_predict_single_model的逻辑，
-                    # 只更新那些被判定为“不确定”的样本的预测标签
-                    # 但返回的仍然是基模型的概率
-                    # 如果需要返回融合后的概率，逻辑会更复杂
-                    # 按照原始意图，只修正预测，不改变返回的概率？
-                    # 但是 cascade_predict_single_model 返回了修正后的 preds 和 base probas
-                    # 为了让 predict 方法工作，我们需要存储修正后的预测
-                    # 但 predict_proba 通常只返回主模型概率
-                    # 这里保持 predict_proba 返回基模型概率不变
+        # 4. 插补 (使用训练时fit的imputer)
+        X_imputed = self.imputer.transform(X_aligned_variance_filtered)
+        print(f"插补后特征矩阵形状: {X_imputed.shape}")
 
-                except Exception as e:
-                    print(f"元模型 predict_proba 失败: {e}")
-                    meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
-            else:
-                meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+        # 5. 标准化 (使用训练时fit的scaler)
+        X_scaled = self.scaler.transform(X_imputed)
+        print(f"标准化后特征矩阵形状: {X_scaled.shape}")
 
-            # 更新初始预测（仅用于内部状态或predict方法）
-            # 注意：predict_proba本身不修改其返回的概率值
-            # 但如果需要融合概率，需要在这里实现不同的逻辑
-            # 目前按惯例，predict_proba返回基模型概率
-            # 而predict方法结合阈值和可能的级联修正来决定最终类别
+        # 6. 最终特征对齐 (确保列名和顺序与模型期望的一致)
+        #    此时 X_scaled 的列对应于 current_feature_names_after_variance
 
-            # 存储修正后的预测供 predict 方法使用
-            # 我们不能直接修改 preds_initial 因为 predict_proba 应该是无状态的
-            # 最好的方式是在 predict 方法中重新执行这部分逻辑
-            pass  # 在 predict 方法中处理
+        # 查找最终选中特征在当前处理后特征中的索引
+        final_selected_names = self.selected_feature_names
+        indices_of_final_selected_features = []
+        missing_features_in_final_set = []
 
-        return np.column_stack([1 - probas_base, probas_base])  # 返回 [prob_0, prob_1]
+        for name in final_selected_names:
+            try:
+                idx = current_feature_names_after_variance.index(name)
+                indices_of_final_selected_features.append(idx)
+            except ValueError:
+                # 如果找不到，可能是交互项或拓扑特征命名存在差异
+                # 但由于我们在预测时不再生成这些，它们必须存在于 current_feature_names_after_variance 中
+                # 否则说明训练和预测的数据预处理不匹配
+                missing_features_in_final_set.append(name)
 
-    def predict(self, X_raw):
+        if missing_features_in_final_set:
+            error_msg = (f"严重错误: 以下特征在预处理后的特征集中未找到，但却是模型所必需的: "
+                         f"{missing_features_in_final_set}. "
+                         f"请检查预测数据的特征工程是否与训练时完全一致。")
+            print(error_msg)
+            raise ValueError(error_msg)
+
+        if not indices_of_final_selected_features:
+            raise ValueError("没有找到任何训练时选定的特征。")
+
+        # 选择最终进入模型的特征
+        X_final_preprocessed = X_scaled[:, indices_of_final_selected_features]
+        print(f"最终预处理后特征矩阵形状: {X_final_preprocessed.shape}, 特征数: {len(final_selected_names)}")
+
+        return X_final_preprocessed
+
+    def _get_initial_feature_names(self):
         """
-        对原始特征矩阵进行预测，返回类别标签。
-
-        :param X_raw: 原始特征矩阵 (numpy array or DataFrame)。
-        :return: 类别标签数组 (numpy array)。
+        辅助函数：重建训练开始时的特征名称列表。
+        ***注意***: 这个函数需要与训练脚本严格同步！
+        因为它没有被保存到 pkl 中，所以这是一个脆弱的设计点。
+        推荐做法是在训练时也将此列表存入 model.pkl 字典。
         """
-        # 确保输入是 DataFrame 以便正确处理列名
-        if not isinstance(X_raw, pd.DataFrame):
-            raise ValueError("输入 `X_raw` 必须是一个 pandas DataFrame，其中包含与训练数据一致的列名。")
+        # 这些参数需要与训练脚本保持一致才能正确工作
+        N_FEATURES_TOTAL = 20  # 示例值，需根据实际情况调整
+        ZERO_VAR_FEATS = 2  # 示例值，需根据实际情况调整
+        FEATURE_NAMES_LIST = [f"f{i}" for i in range(N_FEATURES_TOTAL - ZERO_VAR_FEATS)] \
+                             + [f"zero_var_{j}" for j in range(ZERO_VAR_FEATS)]
+        return FEATURE_NAMES_LIST
 
+    def predict_proba(self, X_df):
+        """
+        对输入数据进行预测，返回各类别的概率。
+
+        :param X_df: pandas.DataFrame, 待预测的数据，列名为特征名。
+        :return: numpy.ndarray, shape (n_samples, 2), 第一列为负类概率，第二列为正类概率。
+        """
         # 预处理
-        X_processed = self._preprocess(X_raw.copy())
+        X_processed = self._preprocess(X_df)
 
-        # --- 级联预测逻辑 ---
-        # 1. 基模型预测
+        # 使用基础模型预测概率
         try:
-            probas_base = self.base_models.predict_proba(X_processed)[:, 1]
-        except Exception as e:
-            print(f"基模型 predict_proba 失败: {e}")
-            pred_or_score = self.base_models.predict(X_processed)
+            probas_base = self.base_model.predict_proba(X_processed)  # 返回 [neg_prob, pos_prob]
+        except AttributeError:
+            # 如果 base_model 没有 predict_proba，尝试用 predict 并假设输出是概率
+            pred_or_score = self.base_model.predict(X_processed)
+            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
+                # 假设是一维概率数组
+                clipped_probs = np.clip(pred_or_score.flatten(), 0, 1)
+                probas_base = np.column_stack([1 - clipped_probs, clipped_probs])
+            else:
+                # 假设是二维概率数组
+                probas_base = pred_or_score
+
+        return probas_base  # 已经是正确的 [neg_prob, pos_prob] 形式
+
+    def predict(self, X_df):
+        """
+        对输入数据进行预测，返回类别标签 (0 或 1)。
+
+        :param X_df: pandas.DataFrame, 待预测的数据，列名为特征名。
+        :return: numpy.ndarray, shape (n_samples,), 类别标签。
+        """
+        # 预处理
+        X_processed = self._preprocess(X_df)
+
+        # 调用级联预测逻辑
+        preds, _ = self._cascade_predict(X_processed)
+        return preds
+
+    def _cascade_predict(self, X):
+        """内部方法：执行级联预测逻辑"""
+        try:
+            probas_base_full = self.base_model.predict_proba(X)  # [neg_prob, pos_prob]
+            probas_base = probas_base_full[:, 1]  # 获取正类概率
+        except AttributeError:
+            pred_or_score = self.base_model.predict(X)
             if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
                 probas_base = np.clip(pred_or_score.flatten(), 0, 1)
             else:
                 probas_base = pred_or_score[:, 1]
 
-        preds = (probas_base >= self.threshold).astype(int)  # 使用加载的阈值
+        # 应用最优阈值进行初步分类
+        preds = (probas_base >= self.threshold).astype(int)
+
+        # 确定不确定性样本
         uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
 
-        # 2. 如果有不确定样本且元模型存在，则用元模型修正
-        if self.meta_nb is not None and uncertain_mask.sum() > 0:
-            if hasattr(self.meta_nb, 'predict_proba'):
+        # 如果有不确定样本且元模型可用，则使用元模型重新预测
+        if self.meta_model is not None and uncertain_mask.sum() > 0:
+            print(f"发现 {uncertain_mask.sum()} 个不确定性样本，交由元模型处理...")
+
+            if hasattr(self.meta_model, 'predict_proba'):
                 try:
-                    meta_probas = self.meta_nb.predict_proba(X_processed[uncertain_mask])[:, 1]
-                    meta_preds = (meta_probas >= 0.5).astype(int)  # 元模型内部使用0.5阈值?
+                    meta_probas_full = self.meta_model.predict_proba(X[uncertain_mask])
+                    meta_preds = (meta_probas_full[:, 1] >= 0.5).astype(int)  # 使用元模型的概率做判断
                 except Exception as e:
-                    print(f"元模型 predict_proba 失败: {e}")
-                    meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+                    print(f"使用元模型 predict_proba 出错 ({e}), 尝试直接 predict...")
+                    meta_preds = self.meta_model.predict(X[uncertain_mask])
             else:
-                meta_preds = self.meta_nb.predict(X_processed[uncertain_mask])
+                meta_preds = self.meta_model.predict(X[uncertain_mask])
 
             preds[uncertain_mask] = meta_preds.astype(int)
 
-        return preds
+        return preds, probas_base  # 返回标签和基础模型的正类概率
 
 
 if __name__ == "__main__":
@@ -303,6 +319,9 @@ if __name__ == "__main__":
         print(f"预测完成，共 {len(y_proba)} 个概率值。")
     except Exception as e:
         print(f"预测概率时发生错误: {e}")
+        import traceback
+
+        traceback.print_exc()
         exit(1)
 
     print(f"应用分类阈值: {threshold:.4f}")
@@ -312,6 +331,9 @@ if __name__ == "__main__":
         print("分类完成。")
     except Exception as e:
         print(f"分类时发生错误: {e}")
+        import traceback
+
+        traceback.print_exc()
         exit(1)
 
     # -----------------------------
@@ -344,3 +366,7 @@ if __name__ == "__main__":
         print(f"预测完成，阈值 {threshold:.4f}，结果已保存到 {output_path}")
     except Exception as e:
         print(f"保存结果时发生错误: {e}")
+
+
+
+
