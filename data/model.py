@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""增强版机器学习管道，实现了优化的过采样策略。"""
+"""增强版机器学习管道，实现了优化的过采样策略和动态特征交互构建。"""
 
 import os
 import pickle
 import warnings
 from collections import Counter
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,40 @@ def save_object(obj, filepath):
     with open(filepath, "wb") as f:
         pickle.dump(obj, f)
     print(f"已保存对象至: {filepath}")
+
+
+# === 新增函数：动态特征交互构建 ===
+def generate_interactions(X, feature_names, feature_importances, top_k_ratio=0.2):
+    """
+    基于特征重要性创建交互项。
+    选择重要性排名前 top_k_ratio 的特征进行两两组合。
+    """
+    print("正在生成特征交互项...")
+    num_features = X.shape[1]
+    if len(feature_importances) != num_features:
+        raise ValueError("特征重要性数组长度与特征数量不匹配。")
+
+    # 确定重要特征的阈值
+    k = max(2, int(num_features * top_k_ratio))  # 至少选择2个特征
+    important_indices = np.argsort(feature_importances)[-k:]
+
+    interaction_features_X = []
+    interaction_feature_names = []
+
+    # 生成重要特征之间的所有组合
+    for i, j in combinations(important_indices, 2):
+        interaction_term = (X[:, i] * X[:, j]).reshape(-1, 1)
+        interaction_features_X.append(interaction_term)
+        interaction_feature_names.append(f"{feature_names[i]}_x_{feature_names[j]}")
+
+    if interaction_features_X:
+        interaction_features_X = np.hstack(interaction_features_X)
+        X_with_interactions = np.hstack([X, interaction_features_X])
+        print(f"生成了 {len(interaction_feature_names)} 个交互特征。")
+        return X_with_interactions, interaction_feature_names
+    else:
+        print("未生成交互特征。")
+        return X, []
 
 
 # === 新增函数：动态拓扑尺度选择 ===
@@ -499,6 +534,7 @@ if __name__ == "__main__":
     print("- 添加了拓扑数据分析(TDA)特征提取模块。")
     print("- 在拓扑构建中禁用了多尺度识别。")
     print("- 为WGAN-GP生成的样本添加了质量过滤。")
+    print("- 添加了基于特征重要性的动态特征交互构建。")
     print("=" * 60)
 
     # 配置区域
@@ -677,16 +713,38 @@ if __name__ == "__main__":
 
     UPDATED_COMPLETE_FEATURE_SET_NAMES = SELECTED_FEATURE_NAMES_POST_VARIANCE + TOPOLOGY_FEATURE_NAME_PREFIXES
 
+    # ===================== 核心修改：添加动态特征交互构建 =====================
+    print("\n执行增强型流水线: 添加动态特征交互构建...\n")
+
+    # 在添加交互项之前，先用一个简单的模型获取特征重要性
+    temp_xgb_for_interaction_importance = xgb.XGBClassifier(
+        **{k: v for k, v in XGB_PARAMS.items() if k != 'n_estimators'})
+    temp_xgb_for_interaction_importance.set_params(n_estimators=100)  # 使用较少的树来快速获取重要性
+    temp_xgb_for_interaction_importance.fit(FEATURES_WITH_OPTIONAL_TOPOLOGY, LABEL_VECTOR_ALL)
+    initial_feature_importances = temp_xgb_for_interaction_importance.feature_importances_
+
+    # 生成交互特征
+    FEATURES_WITH_INTERACTIONS, INTERACTION_FEATURE_NAMES = generate_interactions(
+        FEATURES_WITH_OPTIONAL_TOPOLOGY,
+        UPDATED_COMPLETE_FEATURE_SET_NAMES,
+        initial_feature_importances,
+        top_k_ratio=0.2  # 选择前20%重要特征进行交互
+    )
+
+    # 更新特征名称列表
+    FINAL_FEATURE_NAMES_WITH_INTERACTIONS = UPDATED_COMPLETE_FEATURE_SET_NAMES + INTERACTION_FEATURE_NAMES
+    # ===================== 动态特征交互构建结束 =====================
+
     # ===================== 核心修改：取消特征聚类，直接应用RFA =====================
     print("\n执行增强型流水线: 不经特征聚类直接运行RFA...\n")
 
-    # B阶段：对所有特征应用RFA（取消聚类步骤）
+    # B阶段：对所有特征（包括交互项）应用RFA（取消聚类步骤）
     estimator_used_by_rfa = xgb.XGBClassifier(**XGB_PARAMS)
 
     try:
         FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES, SCORE_HISTORY_PER_STEP, FULL_RANKINGS_INFO_ARRAY = recursive_feature_addition(
             estimator_used_by_rfa,
-            FEATURES_WITH_OPTIONAL_TOPOLOGY,
+            FEATURES_WITH_INTERACTIONS,  # 使用包含交互项的特征矩阵
             LABEL_VECTOR_ALL,
             cv=StratifiedKFold(n_splits=CV_FOLDS_FOR_RFE, shuffle=True, random_state=RANDOM_STATE),
             scoring='roc_auc'
@@ -696,9 +754,9 @@ if __name__ == "__main__":
         ABSOLUTE_INDICES_OF_CHOSEN_FEATURES = FULL_RANKINGS_INFO_ARRAY.argsort()
         INDEX_MAPPING_LOCAL_TO_GLOBAL = FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES
 
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_OPTIONAL_TOPOLOGY[:,
+        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_INTERACTIONS[:,  # 使用包含交互项的特征矩阵
                                          FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
-        NAMES_FINAL_SELECTED_FEATURES = [UPDATED_COMPLETE_FEATURE_SET_NAMES[i] for i in
+        NAMES_FINAL_SELECTED_FEATURES = [FINAL_FEATURE_NAMES_WITH_INTERACTIONS[i] for i in  # 使用更新后的特征名
                                          FINAL_SELECTED_FEATURE_INDICES_RELATIVE_TO_REPRESENTATIVES]
 
         # 修复f-string中的反斜杠问题
@@ -709,9 +767,9 @@ if __name__ == "__main__":
     except Exception as err_msg:
         print(f"在RFA执行阶段发生错误: {err_msg}")
         print("回退到未经进一步精炼的所有特征。")
-        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_OPTIONAL_TOPOLOGY
-        NAMES_FINAL_SELECTED_FEATURES = UPDATED_COMPLETE_FEATURE_SET_NAMES
-        INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_OPTIONAL_TOPOLOGY.shape[1])
+        FEATURES_SELECTED_FINAL_OUTPUT = FEATURES_WITH_INTERACTIONS  # 回退到包含交互项的特征矩阵
+        NAMES_FINAL_SELECTED_FEATURES = FINAL_FEATURE_NAMES_WITH_INTERACTIONS  # 回退到更新后的特征名
+        INDEX_MAPPING_LOCAL_TO_GLOBAL = np.arange(FEATURES_WITH_INTERACTIONS.shape[1])  # 回退到完整索引
 
     # 保存由修改后的RFA函数得到的综合排名信息
     save_object(FULL_RANKINGS_INFO_ARRAY, "./rfe_feature_ranking.pkl")
