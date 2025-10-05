@@ -225,23 +225,20 @@ def feature_clustering(X, n_clusters_ratio=0.5):
         representative_indices: 每个簇中选出的一个代表性特征索引。
     """
     print("Performing feature clustering to reduce redundancy...")
-    corr_matrix = np.abs(np.corrcoef(X.T))  # Compute absolute correlation matrix
-    distance_matrix = 1 - corr_matrix  # Convert correlation to distance
-
-    # Determine number of clusters
     n_original_features = X.shape[1]
     n_clusters_target = max(1, int(n_original_features * n_clusters_ratio))
     print(f"Target number of clusters after agglomeration: {n_clusters_target}")
 
-    # Perform Agglomerative Clustering using precomputed distances
+    # 使用特征矩阵而不是距离矩阵进行聚类，避免AttributeError
     agglo = FeatureAgglomeration(
         n_clusters=n_clusters_target,
         linkage="complete",  # Complete linkage tends to produce compact clusters
-        affinity="precomputed"  # Use our custom distance matrix
+        affinity="euclidean"  # 使用欧几里得距离而不是预计算距离矩阵
     )
 
     # Fit the model and get cluster labels for each original feature
-    cluster_labels = agglo.fit_predict(distance_matrix)
+    # 我们需要转置X，因为FeatureAgglomeration对样本进行聚类，而不是特征
+    cluster_labels = agglo.fit_predict(X.T)  # Transpose to cluster features
     print(f"Clustering resulted in {len(set(cluster_labels))} distinct clusters.")
 
     # Select one representative feature per cluster (the one with highest variance)
