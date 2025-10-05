@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""增强版机器学习管道，实现了优化的过采样策略和动态特征交互构建。"""
+"""增强版机器学习管道，实现了优化的过采样策略、动态特征交互构建和特征分级处理。"""
 
 import os
 import pickle
 import warnings
+import re  # 导入正则表达式库用于特征分级
 from collections import Counter
 from itertools import combinations
 
@@ -15,10 +16,13 @@ import torch.optim as optim
 import xgboost as xgb
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
+# 注意：KNNImputer 对于分类特征（如目标编码后的）可能不是最佳选择，但在此简化示例中仍使用。
+# 实际应用中，可能需要对不同类型的特征使用不同的插补策略。
 from sklearn.impute import KNNImputer
 from sklearn.metrics import roc_auc_score, accuracy_score, recall_score, confusion_matrix, fbeta_score, precision_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, KBinsDiscretizer
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.neighbors import NearestNeighbors
 
 # 尝试导入 giotto-tda 用于拓扑数据分析
@@ -45,6 +49,126 @@ def save_object(obj, filepath):
     with open(filepath, "wb") as f:
         pickle.dump(obj, f)
     print(f"已保存对象至: {filepath}")
+
+
+# === 新增函数：特征分级体系 ===
+# 建立特征分级体系
+# 注意：这里的特征名是示例，需要根据实际数据集的列名进行调整。
+FEATURE_HIERARCHY = {
+    "core": ['f0', 'f1', 'f2'],  # 示例核心特征，对应原始数据的前三个特征
+    "secondary": [r'f[3-5]'],  # 示例次级特征，匹配 f3, f4, f5
+    "contextual": [r'f[6-9]']  # 示例上下文特征，匹配 f6 到 f9
+}
+
+
+# === 新增函数：目标编码器 ===
+class TargetEncoder(BaseEstimator, TransformerMixin):
+    """简单的均值目标编码器"""
+
+    def __init__(self, smoothing=1.0):
+        self.smoothing = smoothing
+        self.mapping_ = {}
+
+    def fit(self, X, y):
+        # 假设 X 是一维或二维数组，且为分类特征
+        X = np.asarray(X).flatten()
+        y = np.asarray(y)
+        unique_vals = np.unique(X)
+        global_mean = np.mean(y)
+
+        for val in unique_vals:
+            mask = (X == val)
+            count = np.sum(mask)
+            mean_val = np.mean(y[mask])
+            # 应用平滑
+            smoothed_mean = (count * mean_val + self.smoothing * global_mean) / (count + self.smoothing)
+            self.mapping_[val] = smoothed_mean
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X).flatten()
+        # 对于未见过的类别，使用全局均值
+        default_val = np.mean(list(self.mapping_.values())) if self.mapping_ else 0
+        return np.array([self.mapping_.get(x, default_val) for x in X]).reshape(-1, 1)
+
+
+# === 新增函数：分箱离散化 ===
+def bin_features(X, n_bins=5):
+    """对特征进行分箱离散化"""
+    if X.size == 0:
+        return X
+    discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
+    X_binned = discretizer.fit_transform(X)
+    return X_binned
+
+
+# === 新增函数：分级特征处理 ===
+def hierarchical_processing(X, feature_names, y=None):
+    """
+    分级特征处理
+    核心财务特征：保留原始数值
+    次级特征：分箱离散化
+    上下文特征：目标编码 (需要标签y)
+    """
+    print("正在执行分级特征处理...")
+    core_idx = [i for i, n in enumerate(feature_names)
+                if any(n == p for p in FEATURE_HIERARCHY['core'])]
+
+    sec_idx = [i for i, n in enumerate(feature_names)
+               if any(re.match(p, n) for p in FEATURE_HIERARCHY['secondary'])]
+
+    ctx_idx = [i for i, n in enumerate(feature_names)
+               if any(re.match(p, n) for p in FEATURE_HIERARCHY['contextual'])]
+
+    processed_parts = []
+    processed_names = []
+
+    # 核心特征：直接保留
+    if core_idx:
+        processed_parts.append(X[:, core_idx])
+        processed_names.extend([feature_names[i] for i in core_idx])
+        print(f"  - 核心特征 ({len(core_idx)} 个): 已保留原始数值")
+
+    # 次级特征：分箱
+    if sec_idx:
+        X_sec = bin_features(X[:, sec_idx])
+        processed_parts.append(X_sec)
+        processed_names.extend([f"{feature_names[i]}_binned" for i in sec_idx])
+        print(f"  - 次级特征 ({len(sec_idx)} 个): 已进行分箱离散化")
+
+    # 上下文特征：目标编码 (如果提供了y)
+    if ctx_idx:
+        if y is None:
+            print("  - 警告: 上下文特征存在但未提供标签y，将保留原始数值。")
+            processed_parts.append(X[:, ctx_idx])
+            processed_names.extend([feature_names[i] for i in ctx_idx])
+        else:
+            X_ctx_list = []
+            ctx_names_out = []
+            for i in ctx_idx:
+                te = TargetEncoder()
+                # 假设上下文特征是字符串或可以转换为字符串的类别
+                feat_vals = X[:, i].astype(str)
+                X_ctx_enc = te.fit_transform(feat_vals, y)
+                X_ctx_list.append(X_ctx_enc.flatten())
+                ctx_names_out.append(f"{feature_names[i]}_target_encoded")
+                # 保存编码器以便后续使用
+                # 在完整管道中，你可能需要将这些编码器保存起来
+            if X_ctx_list:
+                X_ctx_final = np.column_stack(X_ctx_list)
+                processed_parts.append(X_ctx_final)
+                processed_names.extend(ctx_names_out)
+                print(f"  - 上下文特征 ({len(ctx_idx)} 个): 已进行目标编码")
+            else:
+                print("  - 上下文特征处理失败。")
+
+    if processed_parts:
+        X_processed = np.hstack(processed_parts)
+        print(f"分级处理完成，输出特征数: {X_processed.shape[1]}")
+        return X_processed, processed_names
+    else:
+        print("未找到匹配任何分级的特征，返回原始数据。")
+        return X, feature_names
 
 
 # === 新增函数：动态特征交互构建 ===
@@ -535,6 +659,7 @@ if __name__ == "__main__":
     print("- 在拓扑构建中禁用了多尺度识别。")
     print("- 为WGAN-GP生成的样本添加了质量过滤。")
     print("- 添加了基于特征重要性的动态特征交互构建。")
+    print("- 添加了特征分级处理 (核心/次级/上下文)。")
     print("=" * 60)
 
     # 配置区域
@@ -546,6 +671,7 @@ if __name__ == "__main__":
     USE_RFA = True  # 现在总是为真
     ADD_TOPOLOGICAL_FEATURES = True
     USE_ADAPTIVE_SCALES = False  # 再次禁用自适应缩放逻辑
+    USE_HIERARCHICAL_PROCESSING = True  # 启用分级处理
 
     TOPO_HOMOLOGY_DIMS = [0, 1]
 
@@ -662,9 +788,40 @@ if __name__ == "__main__":
         f"经过 VarianceFilter 后: 保留了 {FEATURES_AFTER_VARIANCE_FILTERING.shape[1]} 个特征 "
         f"(移除了 {len(INITIAL_FEATURE_NAMES) - len(SELECTED_FEATURE_NAMES_POST_VARIANCE)})")
 
-    # 第三步：插补与标准化
+    # 第三步：插补与标准化 (在分级处理后进行)
+    # knn_imputer_instance = KNNImputer(n_neighbors=5)
+    # FEATURES_IMPUTED_NO_MISSING = knn_imputer_instance.fit_transform(FEATURES_AFTER_VARIANCE_FILTERING)
+
+    # standard_scaler_instance = StandardScaler()
+    # FEATURES_SCALED_STANDARDIZED = standard_scaler_instance.fit_transform(FEATURES_IMPUTED_NO_MISSING)
+
+    # save_object(knn_imputer_instance, "./imputer.pkl")
+    # save_object(standard_scaler_instance, "./scaler.pkl")
+    # save_object(selector_variance_filter, "./variance_selector.pkl")
+
+    # ===================== 核心修改：添加特征分级处理 =====================
+    print("\n执行增强型流水线: 添加特征分级处理...\n")
+
+    if USE_HIERARCHICAL_PROCESSING:
+        try:
+            FEATURES_HIERARCHICAL_PROCESSED, NAMES_HIERARCHICAL_PROCESSED = hierarchical_processing(
+                FEATURES_AFTER_VARIANCE_FILTERING, SELECTED_FEATURE_NAMES_POST_VARIANCE, LABEL_VECTOR_ALL
+            )
+            FEATURES_AFTER_HIERARCHICAL = FEATURES_HIERARCHICAL_PROCESSED
+            FEATURE_NAMES_AFTER_HIERARCHICAL = NAMES_HIERARCHICAL_PROCESSED
+            print(f"分级处理后特征数: {len(FEATURE_NAMES_AFTER_HIERARCHICAL)}")
+        except Exception as e:
+            print(f"分级处理失败: {e}。回退到原始特征。")
+            FEATURES_AFTER_HIERARCHICAL = FEATURES_AFTER_VARIANCE_FILTERING
+            FEATURE_NAMES_AFTER_HIERARCHICAL = SELECTED_FEATURE_NAMES_POST_VARIANCE
+    else:
+        FEATURES_AFTER_HIERARCHICAL = FEATURES_AFTER_VARIANCE_FILTERING
+        FEATURE_NAMES_AFTER_HIERARCHICAL = SELECTED_FEATURE_NAMES_POST_VARIANCE
+
+    # 在分级处理后进行插补和标准化
+    print("对分级处理后的特征进行插补和标准化...")
     knn_imputer_instance = KNNImputer(n_neighbors=5)
-    FEATURES_IMPUTED_NO_MISSING = knn_imputer_instance.fit_transform(FEATURES_AFTER_VARIANCE_FILTERING)
+    FEATURES_IMPUTED_NO_MISSING = knn_imputer_instance.fit_transform(FEATURES_AFTER_HIERARCHICAL)
 
     standard_scaler_instance = StandardScaler()
     FEATURES_SCALED_STANDARDIZED = standard_scaler_instance.fit_transform(FEATURES_IMPUTED_NO_MISSING)
@@ -672,6 +829,7 @@ if __name__ == "__main__":
     save_object(knn_imputer_instance, "./imputer.pkl")
     save_object(standard_scaler_instance, "./scaler.pkl")
     save_object(selector_variance_filter, "./variance_selector.pkl")
+    # ===================== 特征分级处理结束 =====================
 
     # 第四步：添加拓扑特征（可选增强）
     FEATURES_WITH_OPTIONAL_TOPOLOGY = FEATURES_SCALED_STANDARDIZED
@@ -711,28 +869,13 @@ if __name__ == "__main__":
         print(
             "由于缺少依赖项 ('giotto-tda')，请求的拓扑分析已跳过。请安装软件包以启用该功能。")
 
-    UPDATED_COMPLETE_FEATURE_SET_NAMES = SELECTED_FEATURE_NAMES_POST_VARIANCE + TOPOLOGY_FEATURE_NAME_PREFIXES
+    UPDATED_COMPLETE_FEATURE_SET_NAMES = FEATURE_NAMES_AFTER_HIERARCHICAL + TOPOLOGY_FEATURE_NAME_PREFIXES
 
-    # ===================== 核心修改：添加动态特征交互构建 =====================
-    print("\n执行增强型流水线: 添加动态特征交互构建...\n")
-
-    # 在添加交互项之前，先用一个简单的模型获取特征重要性
-    temp_xgb_for_interaction_importance = xgb.XGBClassifier(
-        **{k: v for k, v in XGB_PARAMS.items() if k != 'n_estimators'})
-    temp_xgb_for_interaction_importance.set_params(n_estimators=100)  # 使用较少的树来快速获取重要性
-    temp_xgb_for_interaction_importance.fit(FEATURES_WITH_OPTIONAL_TOPOLOGY, LABEL_VECTOR_ALL)
-    initial_feature_importances = temp_xgb_for_interaction_importance.feature_importances_
-
-    # 生成交互特征
-    FEATURES_WITH_INTERACTIONS, INTERACTION_FEATURE_NAMES = generate_interactions(
-        FEATURES_WITH_OPTIONAL_TOPOLOGY,
-        UPDATED_COMPLETE_FEATURE_SET_NAMES,
-        initial_feature_importances,
-        top_k_ratio=0.2  # 选择前20%重要特征进行交互
-    )
-
-    # 更新特征名称列表
-    FINAL_FEATURE_NAMES_WITH_INTERACTIONS = UPDATED_COMPLETE_FEATURE_SET_NAMES + INTERACTION_FEATURE_NAMES
+    # ===================== 核心修改：取消特征交互构建 (根据要求) =====================
+    print("\n根据要求，取消动态特征交互构建步骤。\n")
+    FEATURES_WITH_INTERACTIONS = FEATURES_WITH_OPTIONAL_TOPOLOGY
+    INTERACTION_FEATURE_NAMES = []
+    FINAL_FEATURE_NAMES_WITH_INTERACTIONS = UPDATED_COMPLETE_FEATURE_SET_NAMES
     # ===================== 动态特征交互构建结束 =====================
 
     # ===================== 核心修改：取消特征聚类，直接应用RFA =====================
@@ -910,8 +1053,13 @@ if __name__ == "__main__":
         "add_topological_features": ADD_TOPOLOGICAL_FEATURES,
         "topo_homology_dims": TOPO_HOMOLOGY_DIMS,
         "threshold_weights": THRESHOLD_WEIGHTS,
-        "use_adaptive_scales": USE_ADAPTIVE_SCALES
+        "use_adaptive_scales": USE_ADAPTIVE_SCALES,
+        "use_hierarchical_processing": USE_HIERARCHICAL_PROCESSING  # 保存配置
     }
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\n完整的端到端建模产物已导出至 './model.pkl'")
     print("=" * 60)
+
+
+
+
