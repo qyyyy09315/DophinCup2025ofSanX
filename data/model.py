@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""增强版机器学习管道，实现了优化的过采样策略、动态特征交互构建和特征分级处理。"""
+"""增强版机器学习管道，实现了优化的过采样策略、动态特征交互构建和特征分级处理。分类器部分替换为DNN。"""
 
 import os
 import pickle
@@ -645,6 +645,133 @@ def wgangp_resample(X_train, y_train, minority_class=1, latent_dim=100, epochs=3
     return resampled_X, resampled_y
 
 
+# ======== DNN模型相关定义 ========
+class SimpleDNN(nn.Module):
+    """一个简单的深度神经网络分类器"""
+
+    def __init__(self, input_dim, hidden_layers=[128, 64], dropout_rate=0.3):
+        super(SimpleDNN, self).__init__()
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(prev_dim, h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = h_dim
+
+        layers.append(nn.Linear(prev_dim, 1))  # 输出 logits
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class WrappedDNNPredictiveModel:
+    """包装 PyTorch DNN 模型以符合 scikit-learn 接口"""
+
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+    def predict_proba(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
+            logits = self.model(X_tensor).squeeze()
+            probs_positive = torch.sigmoid(logits).cpu().numpy()
+            # 返回 [prob_negative, prob_positive]
+            return np.column_stack([1 - probs_positive, probs_positive])
+
+    def predict(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
+            logits = self.model(X_tensor).squeeze()
+            predictions = (torch.sigmoid(logits) > 0.5).long().cpu().numpy()
+            return predictions
+
+
+def train_dnn_model(X_train, y_train, X_val, y_val, input_dim,
+                    hidden_layers=[128, 64], learning_rate=0.001,
+                    epochs=100, batch_size=64, weight_decay=1e-5,
+                    patience=10, device='cpu'):
+    """训练DNN模型"""
+    print("开始训练DNN模型...")
+
+    model = SimpleDNN(input_dim=input_dim, hidden_layers=hidden_layers).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([len(y_train) / sum(y_train)], device=device))
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=patience // 2,
+                                                     verbose=True)
+
+    # 数据加载器
+    dataset_train = torch.utils.data.TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.float32)
+    )
+    loader_train = torch.utils.data.DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+
+    dataset_val = torch.utils.data.TensorDataset(
+        torch.tensor(X_val, dtype=torch.float32),
+        torch.tensor(y_val, dtype=torch.float32)
+    )
+    loader_val = torch.utils.data.DataLoader(dataset_val, batch_size=batch_size, shuffle=False)
+
+    best_loss = float('inf')
+    epochs_no_improve = 0
+
+    for epoch in range(epochs):
+        # Training phase
+        model.train()
+        total_train_loss = 0
+        for X_batch, y_batch in loader_train:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch).squeeze()
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item()
+
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in loader_val:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch).squeeze()
+                loss = criterion(outputs, y_batch)
+                total_val_loss += loss.item()
+
+        avg_train_loss = total_train_loss / len(loader_train)
+        avg_val_loss = total_val_loss / len(loader_val)
+
+        scheduler.step(avg_val_loss)
+
+        print(f"Epoch [{epoch + 1}/{epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+        # Early stopping check
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            epochs_no_improve = 0
+            # Save best model checkpoint
+            torch.save(model.state_dict(), "./tmp_best_dnn.pth")
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping triggered after {epoch + 1} epochs.")
+            break
+
+    # Load best model weights
+    model.load_state_dict(torch.load("./tmp_best_dnn.pth"))
+    os.remove("./tmp_best_dnn.pth")  # Clean up temporary file
+
+    print("DNN模型训练完成。")
+    return WrappedDNNPredictiveModel(model, device)
+
+
 # ======== 主程序入口及其它辅助函数 ========
 if __name__ == "__main__":
     print("=" * 60)
@@ -660,6 +787,7 @@ if __name__ == "__main__":
     print("- 为WGAN-GP生成的样本添加了质量过滤。")
     print("- 添加了基于特征重要性的动态特征交互构建。")
     print("- 添加了特征分级处理 (核心/次级/上下文)。")
+    print("- 替换主分类器为DNN。")
     print("=" * 60)
 
     # 配置区域
@@ -687,20 +815,17 @@ if __name__ == "__main__":
         'filter_threshold': 0.95  # 添加过滤阈值
     }
 
-    XGB_PARAMS = {
-        'max_depth': 4,
-        'learning_rate': 0.1,
-        'n_estimators': 500,
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'random_state': RANDOM_STATE,
-        'n_jobs': -1,
-        'tree_method': 'hist',
-        'predictor': 'cpu_predictor'
-    }
+    # DNN 配置参数
+    DNN_HIDDEN_LAYERS = [128, 64]
+    DNN_LEARNING_RATE = 0.001
+    DNN_EPOCHS = 200
+    DNN_BATCH_SIZE = 64
+    DNN_WEIGHT_DECAY = 1e-5
+    DNN_PATIENCE = 20
+    DNN_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     META_GBM_PARAMS = {
-        'n_estimators': 100,
+        'n_estimators': 500,
         'learning_rate': 0.1,
         'max_depth': 3,
         'subsample': 1.0,
@@ -904,40 +1029,28 @@ if __name__ == "__main__":
         print(f"WGAN-GP 异常失败: {wg_error}. 改为继续使用原始不平衡数据。")
         RESAMPLED_TRAIN_FEATURES, RESAMPLED_TRAIN_LABELS = TRAIN_INPUT_SPLIT, TRAIN_TARGET_SPLIT
 
-    print("建立主分类器 (XGBoost)...")
-    DMATRIX_RESAMPLED_TRAIN = xgb.DMatrix(RESAMPLED_TRAIN_FEATURES, label=RESAMPLED_TRAIN_LABELS)
-    DMATRIX_HOLDOUT_VALIDATION = xgb.DMatrix(HOLDOUT_EVAL_SPLIT, label=HOLDOUT_TARGET_SPLIT)
-
-    EVALUATION_METRICS_CONTAINER = {}
-    MODEL_TRAINED_USING_XGB_API = xgb.train(
-        XGB_PARAMS,
-        dtrain=DMATRIX_RESAMPLED_TRAIN,
-        num_boost_round=XGB_PARAMS['n_estimators'],
-        evals=[(DMATRIX_HOLDOUT_VALIDATION, 'validation')],
-        early_stopping_rounds=50,
-        verbose_eval=False,
-        evals_result=EVALUATION_METRICS_CONTAINER
+    print("建立主分类器 (DNN)...")
+    # Split training set further to get a validation set for DNN training
+    RESAMPLED_TRAIN_FEATURES_DNN, RESAMPLED_VAL_FEATURES_DNN, RESAMPLED_TRAIN_LABELS_DNN, RESAMPLED_VAL_LABELS_DNN = train_test_split(
+        RESAMPLED_TRAIN_FEATURES, RESAMPLED_TRAIN_LABELS, test_size=0.15, stratify=RESAMPLED_TRAIN_LABELS,
+        random_state=RANDOM_STATE
     )
 
+    WRAPPED_MODEL_WRAPPER_INSTANCE = train_dnn_model(
+        RESAMPLED_TRAIN_FEATURES_DNN, RESAMPLED_TRAIN_LABELS_DNN,
+        RESAMPLED_VAL_FEATURES_DNN, RESAMPLED_VAL_LABELS_DNN,
+        input_dim=RESAMPLED_TRAIN_FEATURES_DNN.shape[1],
+        hidden_layers=DNN_HIDDEN_LAYERS,
+        learning_rate=DNN_LEARNING_RATE,
+        epochs=DNN_EPOCHS,
+        batch_size=DNN_BATCH_SIZE,
+        weight_decay=DNN_WEIGHT_DECAY,
+        patience=DNN_PATIENCE,
+        device=DNN_DEVICE
+    )
 
-    class WrappedXGBPredictiveModel:
-        def __init__(self, booster_obj_ref):
-            self.booster_internal_reference = booster_obj_ref
-
-        def predict_proba(self, input_features_array_like):
-            dmatrix_format_input = xgb.DMatrix(input_features_array_like)
-            probabilities_positives_only = self.booster_internal_reference.predict(dmatrix_format_input)
-            return np.column_stack([1 - probabilities_positives_only, probabilities_positives_only])
-
-        def predict(self, input_features_array_like):
-            dmatrix_format_input = xgb.DMatrix(input_features_array_like)
-            predicted_probabilities = self.booster_internal_reference.predict(dmatrix_format_input)
-            return (predicted_probabilities > 0.5).astype(int)
-
-
-    WRAPPED_MODEL_WRAPPER_INSTANCE = WrappedXGBPredictiveModel(MODEL_TRAINED_USING_XGB_API)
-    save_object(WRAPPED_MODEL_WRAPPER_INSTANCE, "./base_model_xgboost.pkl")
-    print("基础学习器训练完毕并已存储。")
+    save_object(WRAPPED_MODEL_WRAPPER_INSTANCE, "./base_model_dnn.pkl")
+    print("基础学习器(DNN)训练完毕并已存储。")
 
     print("识别难以分类的例子以供二级修正层使用...")
     _, PROBABILITIES_ON_TRAIN_SET_PREDICTED_BY_BASELINE = cascade_predict_single_model(WRAPPED_MODEL_WRAPPER_INSTANCE,
@@ -978,7 +1091,7 @@ if __name__ == "__main__":
     RECALL_BEST, PRECISION_BEST, SPECIFICITY_BEST = METRICS_AT_OPTIMAL_POINT
 
     PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH = (
-                PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
+            PROBABILITIES_HOLDOUT_COMBINED_PIPELINE >= OPTIMAL_DECISION_BOUNDARY).astype(int)
 
     ROC_AREA_UNDER_CURVE = roc_auc_score(HOLDOUT_TARGET_SPLIT, PROBABILITIES_HOLDOUT_COMBINED_PIPELINE)
     ACCURACY_BEST = accuracy_score(HOLDOUT_TARGET_SPLIT, PREDICTIONS_HOLDOUT_AT_OPTIMAL_THRESH)
@@ -1012,7 +1125,7 @@ if __name__ == "__main__":
         "tree_feature_ranking": FULL_RANKINGS_INFO_ARRAY,
         "selected_feature_names": NAMES_FINAL_SELECTED_FEATURES,
         "base_models": WRAPPED_MODEL_WRAPPER_INSTANCE,
-        "base_types": ["XGBoost"],
+        "base_types": ["DNN"],  # Update type indicator
         "meta_nb": CORRECTIVE_LEARNER_SECONDARY,
         "threshold": float(OPTIMAL_DECISION_BOUNDARY),
         "use_rfa": USE_RFA,
@@ -1025,3 +1138,7 @@ if __name__ == "__main__":
     save_object(PIPELINE_ARTIFACT_DICTIONARY, "./model.pkl")
     print("\n完整的端到端建模产物已导出至 './model.pkl'")
     print("=" * 60)
+
+
+
+
