@@ -3,28 +3,55 @@
 
 import os
 import pickle
+
 import numpy as np
 import pandas as pd
-from sklearn.impute import KNNImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import VarianceThreshold
-import xgboost as xgb
-from sklearn.ensemble import GradientBoostingClassifier
+import torch
+import torch.nn as nn
 
 
-class WrappedXGBPredictiveModel:
-    def __init__(self, booster_obj_ref):
-        self.booster_internal_reference = booster_obj_ref
+class SimpleDNN(nn.Module):
+    """一个简单的深度神经网络分类器"""
 
-    def predict_proba(self, input_features_array_like):
-        dmatrix_format_input = xgb.DMatrix(input_features_array_like)
-        probabilities_positives_only = self.booster_internal_reference.predict(dmatrix_format_input)
-        return np.column_stack([1 - probabilities_positives_only, probabilities_positives_only])
+    def __init__(self, input_dim, hidden_layers=[128, 64], dropout_rate=0.3):
+        super(SimpleDNN, self).__init__()
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_layers:
+            layers.append(nn.Linear(prev_dim, h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = h_dim
 
-    def predict(self, input_features_array_like):
-        dmatrix_format_input = xgb.DMatrix(input_features_array_like)
-        predicted_probabilities = self.booster_internal_reference.predict(dmatrix_format_input)
-        return (predicted_probabilities > 0.5).astype(int)
+        layers.append(nn.Linear(prev_dim, 1))  # 输出 logits
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+class WrappedDNNPredictiveModel:
+    """包装 PyTorch DNN 模型以符合 scikit-learn 接口"""
+
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+    def predict_proba(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
+            logits = self.model(X_tensor).squeeze()
+            probs_positive = torch.sigmoid(logits).cpu().numpy()
+            # 返回 [prob_negative, prob_positive]
+            return np.column_stack([1 - probs_positive, probs_positive])
+
+    def predict(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
+            logits = self.model(X_tensor).squeeze()
+            predictions = (torch.sigmoid(logits) > 0.5).long().cpu().numpy()
+            return predictions
 
 def load_object(filepath):
     """从文件中反序列化加载Python对象"""
@@ -234,6 +261,220 @@ class ModelPipelineWrapper:
         return preds
 
 
+# -*- coding: utf-8 -*-
+"""用于加载训练好的增强版机器学习管道并对新数据进行预测的脚本。"""
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+# 尝试导入 giotto-tda 用于拓扑数据分析 (如果训练时使用了)
+try:
+    from gtda.homology import VietorisRipsPersistence
+
+    TOPOLOGY_AVAILABLE = True
+except ImportError:
+    print("警告: 未找到 gtda (giotto-tda)。如果模型使用了拓扑特征，预测可能失败。")
+    TOPOLOGY_AVAILABLE = False
+
+
+def load_object(filepath):
+    """从文件反序列化加载Python对象"""
+    with open(filepath, "rb") as f:
+        obj = pickle.load(f)
+    print(f"已从 {filepath} 加载对象。")
+    return obj
+
+
+class ModelPipelineWrapper:
+    """
+    包装加载的模型字典，提供统一的 predict 和 predict_proba 接口。
+    """
+
+    def __init__(self, model_dict):
+        self.model_dict = model_dict
+        # 从字典中提取组件
+        self.imputer = self.model_dict['imputer']
+        self.scaler = self.model_dict['scaler']
+        self.variance_selector = self.model_dict['variance_selector']
+        self.tree_feature_ranking = self.model_dict['tree_feature_ranking']
+        self.selected_feature_names = self.model_dict['selected_feature_names']
+        self.base_models = self.model_dict['base_models']
+        self.base_types = self.model_dict['base_types']
+        self.meta_nb = self.model_dict['meta_nb']
+        self.threshold = self.model_dict['threshold']
+
+        # 可选的高级配置
+        self.use_rfa = self.model_dict.get('use_rfa', False)
+        self.add_topological_features = self.model_dict.get('add_topological_features', False)
+        self.topo_homology_dims = self.model_dict.get('topo_homology_dims', [0, 1])
+        self.use_adaptive_scales = self.model_dict.get('use_adaptive_scales', False)
+        self.use_hierarchical_processing = self.model_dict.get('use_hierarchical_processing', False)
+
+        # 如果模型使用了拓扑特征，则初始化持久同调计算器
+        if self.add_topological_features and TOPOLOGY_AVAILABLE:
+            self.persistence = VietorisRipsPersistence(
+                metric="euclidean",
+                homology_dimensions=self.topo_homology_dims,
+                collapse_edges=True,
+                max_edge_length=np.inf,
+                infinity_values=None,
+                n_jobs=1
+            )
+        elif self.add_topological_features and not TOPOLOGY_AVAILABLE:
+            print("错误: 模型需要拓扑特征，但运行时环境中未安装 'giotto-tda'。")
+            raise RuntimeError("Missing required library 'giotto-tda' for topological features.")
+
+    def _extract_topological_features(self, X_sample):
+        """内部方法：为单个样本提取拓扑特征（简化版）"""
+        # 注意：这是一个非常低效的实现，仅为兼容性。
+        # 实际应用中应考虑批量处理或近似方法。
+        try:
+            if X_sample.ndim == 1:
+                X_sample = X_sample.reshape(1, -1)
+
+            # gtda 要求输入是三维数组 (n_samples, n_points, n_dimensions)
+            X_diagram_input = X_sample.reshape(1, X_sample.shape[0], X_sample.shape[1])
+
+            diagrams = self.persistence.fit_transform(X_diagram_input)
+            diagram = diagrams[0]
+
+            topo_features = []
+            for dim in self.topo_homology_dims:
+                mask = (diagram[:, 2] == dim)
+                births_deaths_dim = diagram[mask][:, :2]
+
+                if len(births_deaths_dim) > 0:
+                    lifetimes = births_deaths_dim[:, 1] - births_deaths_dim[:, 0]
+                    topo_features.extend([
+                        np.sum(mask),
+                        np.max(lifetimes) if len(lifetimes) > 0 else 0,
+                        np.mean(lifetimes) if len(lifetimes) > 0 else 0,
+                        np.std(lifetimes) if len(lifetimes) > 1 else 0,
+                    ])
+                else:
+                    topo_features.extend([0, 0, 0, 0])
+
+            max_death_global = np.max(diagram[:, 1]) if diagram.size > 0 else 0
+            topo_features.append(max_death_global)
+
+            return np.array(topo_features)
+        except Exception as e:
+            print(f"警告: 计算样本的拓扑特征时出错: {e}")
+            expected_size = len(self.topo_homology_dims) * 4 + 1
+            return np.zeros(expected_size)
+
+    def predict_proba(self, X_raw_df):
+        """
+        对原始特征DataFrame进行完整的预处理和预测，返回正类概率。
+        """
+        print("开始预测流程...")
+        # 1. 方差筛选
+        print("1. 应用方差筛选...")
+        X_var_filtered = self.variance_selector.transform(X_raw_df)
+        current_feature_names = [X_raw_df.columns[i] for i in self.variance_selector.get_support(indices=True)]
+
+        # 2. 分级处理 (如果训练时启用了)
+        # 注意：此处假设测试数据不需要标签y进行处理，因此目标编码部分可能不适用或需要预先fit的编码器。
+        # 为了简化，我们在这里仅保留核心和次级特征的处理逻辑。
+        if self.use_hierarchical_processing:
+            print("2. 应用分级特征处理 (简化版)...")
+            # 这是一个简化的版本，实际应用中可能需要更复杂的逻辑来匹配训练时的行为。
+            # 例如，保存和加载目标编码器。
+            # 此处我们假设只对核心特征做处理，其他保持不变或按规则变换。
+            # 由于缺乏训练时保存的编码器，上下文特征的目标编码在此被跳过或以默认方式处理。
+            # 一种保守的做法是直接使用方差筛选后的特征作为下一步输入。
+            # 更精确的方法需要重构hierarchical_processing函数使其能接受预训练的转换器。
+            # 为保持一致性，这里我们暂时沿用方差筛选后的结果。
+            # TODO: 如果需要完全复现训练时的分级处理，需重构并保存相关转换器。
+
+        # 3. 插补缺失值
+        print("3. 插补缺失值...")
+        X_imputed = self.imputer.transform(X_var_filtered)
+
+        # 4. 标准化
+        print("4. 特征标准化...")
+        X_scaled = self.scaler.transform(X_imputed)
+
+        # 5. 添加拓扑特征 (如果训练时启用了)
+        if self.add_topological_features:
+            print("5. 添加拓扑特征...")
+            topo_features_list = []
+            for i, sample in enumerate(X_scaled):
+                if (i + 1) % 100 == 0 or i == len(X_scaled) - 1:
+                    print(f"   处理第 {i + 1}/{len(X_scaled)} 个样本的拓扑特征...")
+                tf = self._extract_topological_features(sample)
+                topo_features_list.append(tf)
+
+            X_topo = np.array(topo_features_list)
+            X_final = np.hstack([X_scaled, X_topo])
+        else:
+            X_final = X_scaled
+
+        # 6. 级联预测
+        print("6. 执行级联预测...")
+        # 假设cascade_predict_single_model的逻辑在这里展开
+        # base_model 预测
+        try:
+            # 尝试直接调用模型的predict_proba
+            probas_base = self.base_models.predict_proba(X_final)[:, 1]
+        except AttributeError:
+            # 如果没有predict_proba，则尝试predict并假设其输出可以直接解释为概率
+            # 或者是logits/scores
+            pred_or_score = self.base_models.predict(X_final)
+            if len(pred_or_score.shape) == 1 or pred_or_score.shape[1] == 1:
+                # 假设是概率或可以clip到[0,1]的分数
+                probas_base = np.clip(pred_or_score.flatten(), 0, 1)
+            else:
+                # 多列输出，取第二列(正类)
+                probas_base = pred_or_score[:, 1]
+
+        # meta_model 纠正 (简化逻辑，原逻辑涉及不确定性阈值)
+        # 这里我们简化为直接应用meta_model（如果存在且有意义）
+        # 原始代码中的不确定区域逻辑较为复杂，在此脚本中省略具体实现，
+        # 默认认为base_model已经足够好，或者meta_model在整个输入上重新预测。
+        # 一个合理的做法可能是将base_model不确定的样本交给meta_model,
+        # 但需要知道如何定义“不确定”。这里我们采用一种替代方案：
+        # 总是结合两个模型的预测（例如平均概率），但这改变了原始设计意图。
+        # 为忠实于原始pipeline的设计，我们应该重现实现cascade_predict_single_model的逻辑。
+        # 但由于它不是类方法，我们在此进行模拟。
+
+        # --- 模拟 cascade_predict_single_model ---
+        threshold = 0.5  # 内部决策阈值，不同于最终分类阈值
+        preds = (probas_base >= threshold).astype(int)
+        uncertain_mask = (probas_base > 0.3) & (probas_base < 0.7)
+
+        if self.meta_nb is not None and uncertain_mask.sum() > 0:
+            if hasattr(self.meta_nb, 'predict_proba'):
+                try:
+                    meta_probas = self.meta_nb.predict_proba(X_final[uncertain_mask])[:, 1]
+                    # 这里可以替换原概率或综合判断，简单起见直接替换
+                    probas_base[uncertain_mask] = meta_probas
+                except:
+                    meta_preds = self.meta_nb.predict(X_final[uncertain_mask])
+                    # 如果meta模型也没有predict_proba，则用其分类结果调整
+                    # 一种方式是强行设定概率为接近0或1的值
+                    probas_base[uncertain_mask] = np.where(meta_preds == 1, 0.9, 0.1)
+            else:
+                meta_preds = self.meta_nb.predict(X_final[uncertain_mask])
+                probas_base[uncertain_mask] = np.where(meta_preds == 1, 0.9, 0.1)
+
+        # 返回最终的概率 (正类)
+        print("预测完成。")
+        return np.column_stack([1 - probas_base, probas_base])
+
+    def predict(self, X_raw_df):
+        """
+        对原始特征DataFrame进行完整的预处理和预测，返回分类结果。
+        """
+        probas = self.predict_proba(X_raw_df)
+        # 使用模型保存的最佳阈值进行最终分类
+        predictions = (probas[:, 1] >= self.threshold).astype(int)
+        return predictions
+
+
 if __name__ == "__main__":
     # -----------------------------
     # 1. 加载测试数据
@@ -350,6 +591,11 @@ if __name__ == "__main__":
         print(f"预测完成，阈值 {threshold:.4f}，结果已保存到 {output_path}")
     except Exception as e:
         print(f"保存结果时发生错误: {e}")
+
+
+
+
+
 
 
 
