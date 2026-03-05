@@ -225,3 +225,4 @@ data/predictions_gbdt.csv
 *.csv
 /UseBert/catboost_info
 *.parquet
+*.svg
