@@ -1,32 +1,22 @@
 # -*- coding: utf-8 -*-
-"""简单模型对比测试，分别测试XGBoost、AdaBoost、CatBoost和LGBM"""
+"""模型对比测试：决策树、KNN、随机森林（含类别不平衡处理）"""
 
 import os
 import pickle
 import warnings
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import AdaBoostClassifier
-from sklearn.metrics import roc_auc_score, accuracy_score, recall_score, fbeta_score, precision_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import KNNImputer
-import xgboost as xgb
-import lightgbm as lgb
-
-# 尝试导入CatBoost
-try:
-    from catboost import CatBoostClassifier
-
-    CATBOOST_AVAILABLE = True
-except ImportError:
-    print("警告: 未找到 catboost。将跳过CatBoost测试。")
-    CATBOOST_AVAILABLE = False
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
-
 
 def save_object(obj, filepath):
     """将Python对象序列化保存到文件"""
@@ -34,62 +24,38 @@ def save_object(obj, filepath):
         pickle.dump(obj, f)
     print(f"已保存对象至: {filepath}")
 
-
 if __name__ == "__main__":
     print("=" * 60)
-    print("简单模型对比测试启动:")
-    print("- 测试模型: XGBoost, AdaBoost, LGBM")
-    print("- 如果安装了CatBoost则也测试CatBoost")
+    print("模型对比测试启动:")
+    print("- 测试模型: 决策树, KNN (k=5), 随机森林 (100棵树)")
     print("- 数据预处理: 方差筛选 -> 缺失值填充 -> 标准化")
-    print("- 模型评估: AUC, Accuracy, Precision, Recall, F1-Score")
+    print("- 模型评估: Accuracy, Precision, Recall, F1-Score (重点关注F1)")
     print("=" * 60)
 
     # 配置区域
-    DATA_PATH = "./clean.csv"
+    DATA_PATH = "../clean.csv"
     TEST_SIZE = 0.20
     RANDOM_STATE = 42
     VARIANCE_THRESHOLD_VALUE = 0.0
 
-    # 模型参数配置
-    XGB_PARAMS = {
-        'n_estimators': 100,
-        'max_depth': 6,
-        'learning_rate': 0.3,
-        'subsample': 1.0,
-        'colsample_bytree': 1.0,
-        'reg_alpha': 0,
-        'reg_lambda': 1,
+    # 模型参数配置 (严格遵循论文设定)
+    DT_PARAMS = {
+        'criterion': 'gini',
+        'max_depth': None,
         'random_state': RANDOM_STATE
     }
 
-    ADA_PARAMS = {
-        'n_estimators': 100,
-        'learning_rate': 1.0,
-        'random_state': RANDOM_STATE
+    KNN_PARAMS = {
+        'n_neighbors': 5,
+        'weights': 'uniform'
     }
 
-    LGBM_PARAMS = {
+    RF_PARAMS = {
         'n_estimators': 100,
-        'max_depth': 6,
-        'learning_rate': 0.1,
-        'subsample': 1.0,
-        'colsample_bytree': 1.0,
-        'reg_alpha': 0,
-        'reg_lambda': 1,
+        'criterion': 'gini',
+        'max_depth': None,
         'random_state': RANDOM_STATE,
-        'verbose': -1
-    }
-
-    CAT_PARAMS = {
-        'iterations': 100,
-        'depth': 6,
-        'learning_rate': 0.1,
-        'subsample': 1.0,
-        'random_strength': 0.1,
-        'od_type': 'Iter',
-        'od_wait': 50,
-        'random_state': RANDOM_STATE,
-        'verbose': False
+        'n_jobs': -1
     }
 
     # 第一步：加载/创建数据集
@@ -171,16 +137,12 @@ if __name__ == "__main__":
     )
     print(f"分割为训练集 ({TRAIN_INPUT_SPLIT.shape}) 和留出验证集 ({HOLDOUT_EVAL_SPLIT.shape})。")
 
-    # 定义模型字典
+    # 定义模型字典（移除了SVM）
     models = {
-        'XGBoost': xgb.XGBClassifier(**XGB_PARAMS),
-        'AdaBoost': AdaBoostClassifier(**ADA_PARAMS),
-        'LGBM': lgb.LGBMClassifier(**LGBM_PARAMS)
+        'Decision Tree': DecisionTreeClassifier(**DT_PARAMS),
+        'KNN (k=5)': KNeighborsClassifier(**KNN_PARAMS),
+        'Random Forest': RandomForestClassifier(**RF_PARAMS)
     }
-
-    # 如果可用，添加CatBoost
-    if CATBOOST_AVAILABLE:
-        models['CatBoost'] = CatBoostClassifier(**CAT_PARAMS)
 
     # 存储结果
     results = {}
@@ -188,23 +150,16 @@ if __name__ == "__main__":
     # 训练和评估每个模型
     for model_name, model in models.items():
         print(f"\n训练 {model_name} 模型...")
-
-        # 训练模型
         model.fit(TRAIN_INPUT_SPLIT, TRAIN_TARGET_SPLIT)
-
-        # 预测
-        y_pred_proba = model.predict_proba(HOLDOUT_EVAL_SPLIT)[:, 1]
         y_pred = model.predict(HOLDOUT_EVAL_SPLIT)
 
-        # 计算指标
-        auc = roc_auc_score(HOLDOUT_TARGET_SPLIT, y_pred_proba)
+        # 计算指标（论文要求的四个指标）
         accuracy = accuracy_score(HOLDOUT_TARGET_SPLIT, y_pred)
         precision = precision_score(HOLDOUT_TARGET_SPLIT, y_pred, zero_division=0)
         recall = recall_score(HOLDOUT_TARGET_SPLIT, y_pred, zero_division=0)
-        f1 = fbeta_score(HOLDOUT_TARGET_SPLIT, y_pred, beta=1.0, zero_division=0)
+        f1 = f1_score(HOLDOUT_TARGET_SPLIT, y_pred, zero_division=0)
 
         results[model_name] = {
-            'AUC': auc,
             'Accuracy': accuracy,
             'Precision': precision,
             'Recall': recall,
@@ -212,33 +167,33 @@ if __name__ == "__main__":
         }
 
         print(f"{model_name} 结果:")
-        print(f"  AUC = {auc:.5f}")
         print(f"  Accuracy = {accuracy:.5f}")
         print(f"  Precision = {precision:.5f}")
         print(f"  Recall = {recall:.5f}")
         print(f"  F1-Score = {f1:.5f}")
+        save_object(model, f"./{model_name.replace(' ', '_').replace('(', '').replace(')', '').lower()}_model.pkl")
 
-        # 保存模型
-        save_object(model, f"./{model_name.lower()}_model.pkl")
-
-    # 汇总结果
+    # 汇总结果（突出F1-Score）
     print("\n" + "=" * 60)
-    print("模型对比汇总:")
+    print("模型对比汇总 (重点关注F1-Score):")
     print("-" * 60)
-    print(f"{'模型':<12} {'AUC':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10}")
+    print(f"{'模型':<15} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10}")
     print("-" * 60)
     for model_name, metrics in results.items():
-        print(f"{model_name:<12} {metrics['AUC']:<10.5f} {metrics['Accuracy']:<10.5f} "
-              f"{metrics['Precision']:<10.5f} {metrics['Recall']:<10.5f} {metrics['F1-Score']:<10.5f}")
+        print(f"{model_name:<15} {metrics['Accuracy']:<10.5f} {metrics['Precision']:<10.5f} "
+              f"{metrics['Recall']:<10.5f} {metrics['F1-Score']:<10.5f}")
 
     print("=" * 60)
 
-    # 找出最佳模型
-    best_auc_model = max(results.keys(), key=lambda x: results[x]['AUC'])
-    print(f"\nAUC 最佳模型: {best_auc_model} (AUC: {results[best_auc_model]['AUC']:.5f})")
+    # 找出最佳模型（以F1-Score为主要依据）
+    best_f1_model = max(results.items(), key=lambda x: x[1]['F1-Score'])
+    print(f"\n★ 最佳F1-Score模型: {best_f1_model[0]} (F1: {best_f1_model[1]['F1-Score']:.5f})")
 
-    best_f1_model = max(results.keys(), key=lambda x: results[x]['F1-Score'])
-    print(f"F1-Score 最佳模型: {best_f1_model} (F1-Score: {results[best_f1_model]['F1-Score']:.5f})")
+    # 按F1排序输出
+    print("\n模型F1-Score排名:")
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['F1-Score'], reverse=True)
+    for model_name, metrics in sorted_results:
+        print(f"  {model_name:<15}: {metrics['F1-Score']:.5f}")
 
-    print("\n所有模型已训练并评估完成。")
+    print("\n所有基线模型已训练并评估完成。")
     print("=" * 60)
