@@ -915,8 +915,8 @@ def main():
     """主函数"""
     # --- 配置区域 ---
     # 请根据实际情况修改以下路径
-    model_path = '../UseBert/advanced_feature_engineering_ensemble_model.pkl'  # 训练脚本保存的模型文件路径
-    test_data_path = '../UseBert/test_bert_embedded.parquet'  # 待分类的 parquet 文件路径
+    model_path = '../data/processed/advanced_feature_engineering_ensemble_model.pkl'  # 训练脚本保存的模型文件路径
+    test_data_path = '../data/processed/test_bert_embedded.parquet'  # 待分类的 parquet 文件路径
     output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'  # 预测结果保存路径
     # --- 配置区域结束 ---
 
