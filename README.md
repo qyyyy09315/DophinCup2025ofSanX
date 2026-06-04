@@ -184,7 +184,7 @@ python src/evaluation/plotting/figure1.py
 
 ## 🙏 致谢
 本项目在开发过程中得到了多位同学和老师的大力支持：
-- 感谢 **Z. Xia、M. Yu、Z. Liu、H. Tao** 同学在数据标注、模型调试、实验验证等环节提供的支持与帮助
+- 感谢 **[Z. Xia](https://github.com/xiaziyi1314)、M. Yu、Z. Liu、H. Tao** 同学在数据标注、模型调试、实验验证等环节提供的支持与帮助
 - 特别感谢 **Chao Li教授** 在项目选题、技术路线设计、学术方法指导等方面提供的宝贵建议与帮助
 
 ---
