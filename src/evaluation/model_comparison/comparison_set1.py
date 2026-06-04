@@ -33,7 +33,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 配置区域
-    DATA_PATH = "../clean.csv"
+    DATA_PATH = "../../../data/processed/clean.csv"
     TEST_SIZE = 0.20
     RANDOM_STATE = 42
     VARIANCE_THRESHOLD_VALUE = 0.0
