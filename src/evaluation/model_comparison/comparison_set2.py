@@ -385,7 +385,7 @@ def print_ablation_results(results_df):
 if __name__ == "__main__":
     # Read and preprocess data
     try:
-        data = pd.read_csv('../clean.csv')
+        data = pd.read_csv('../../../data/processed/clean.csv')
         print("Data loaded successfully")
         print(f"Data shape: {data.shape}")
     except:

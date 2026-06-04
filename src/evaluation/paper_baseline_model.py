@@ -70,7 +70,7 @@ class CascadeForestWrapper(ClassifierMixin):
 
 
 # 读取数据
-data = pd.read_csv('../clean.csv')
+data = pd.read_csv('../../data/processed/clean.csv')
 
 # 对字符串列进行标签编码
 label_encoders = {}

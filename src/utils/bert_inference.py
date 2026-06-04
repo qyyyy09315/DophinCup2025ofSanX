@@ -415,33 +415,33 @@ class AdvancedFeatureEngineer:
         if isinstance(X, pd.DataFrame):
             self.original_feature_names = X.columns.tolist()
 
-            # Step 1: Identify embedding groups
+            # 步骤1：识别嵌入特征组
             self._identify_embedding_groups(self.original_feature_names)
 
-            # Step 2: Process embeddings (Fit specific logic)
+            # 步骤2：处理嵌入特征（Fit阶段专属逻辑）
             X_processed_df = self._process_embedding_features_fit(X)
 
-            # Record names after processing embeddings but before expanding vectors
+            # 记录处理完嵌入特征后、展开向量前的特征名
             post_emb_processing_names = X_processed_df.columns.tolist()
 
-            # Step 3: Impute vector columns
+            # 步骤3：填充向量列缺失值
             X_imputed_df = self._impute_vector_columns(X_processed_df)
 
-            # Step 4: Expand vector features into individual numeric columns
+            # 步骤4：将向量特征展开为独立数值列
             expanded_dfs = []
             other_cols = []
 
             print(f"  -> 开始展开向量特征...")
             for col in post_emb_processing_names:
-                if col in self.vector_expanded_feature_map:  # It's a vector column to expand
+                if col in self.vector_expanded_feature_map:  # 这是需要展开的向量列
                     print(f"    -> 展开向量列 '{col}'...")
                     vec_data = X_imputed_df[col]
                     expected_dims = self.vector_expanded_feature_map[col]
                     expected_dim_count = len(expected_dims)
 
                     if len(vec_data) > 0:
-                        # Convert list of arrays/vectors to a list of lists for DataFrame constructor
-                        # Ensure all vectors have the correct length
+                        # 将数组/向量列表转换为列表的列表，用于DataFrame构造
+                        # 确保所有向量长度正确
                         validated_vectors = []
                         for i, vec in enumerate(vec_data):
                             try:
@@ -915,8 +915,8 @@ def main():
     """主函数"""
     # --- 配置区域 ---
     # 请根据实际情况修改以下路径
-    model_path = '../UseBert/advanced_feature_engineering_ensemble_model.pkl'  # 训练脚本保存的模型文件路径
-    test_data_path = '../UseBert/test_bert_embedded.parquet'  # 待分类的 parquet 文件路径
+    model_path = '../../data/processed/advanced_feature_engineering_ensemble_model.pkl'  # 训练脚本保存的模型文件路径
+    test_data_path = '../../data/processed/test_bert_embedded.parquet'  # 待分类的 parquet 文件路径
     output_path = r'C:\Users\YKSHb\Desktop\submit_template.csv'  # 预测结果保存路径
     # --- 配置区域结束 ---
 
